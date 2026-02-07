@@ -118,6 +118,27 @@ capture_and_notify() {
     else
         result_info="실행됨"
     fi
+
+    # Send Telegram notification if helper exists and env vars are configured.
+    local notifier="./send_telegram_notification.sh"
+    local telegram_message="[$(date '+%Y-%m-%d %H:%M:%S')] Scenario ${scenario_num} (${scenario_name}) ${status} - ${result_info}"
+    if [ -f "$notifier" ]; then
+        if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+            if [ -f "$screenshot" ]; then
+                if ! bash "$notifier" "$telegram_message" "$screenshot" >/dev/null 2>&1; then
+                    echo "Warning: Telegram notification failed for scenario ${scenario_num}" >&2
+                fi
+            else
+                if ! bash "$notifier" "$telegram_message" >/dev/null 2>&1; then
+                    echo "Warning: Telegram notification failed for scenario ${scenario_num}" >&2
+                fi
+            fi
+        else
+            echo "Warning: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set; skipped Telegram notification." >&2
+        fi
+    else
+        echo "Warning: send_telegram_notification.sh not found; skipped Telegram notification." >&2
+    fi
     
     echo "Scenario ${scenario_num} finished with status: ${status}"
 }
