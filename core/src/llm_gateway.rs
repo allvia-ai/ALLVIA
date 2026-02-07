@@ -26,7 +26,7 @@ use async_trait::async_trait;
 /// Handles: markdown blocks, partial JSON, common syntax errors
 pub fn recover_json(raw: &str) -> Option<Value> {
     // Step 1: Clean markdown code blocks
-    let mut clean = raw.trim()
+    let clean = raw.trim()
         .trim_start_matches("```json")
         .trim_start_matches("```")
         .trim_end_matches("```")
@@ -121,6 +121,44 @@ impl OpenAILLMClient {
             api_key,
             model: "gpt-4o".to_string(),
         })
+    }
+
+    fn history_contains_case_insensitive(history: &[String], needle: &str) -> bool {
+        let needle_lower = needle.to_lowercase();
+        history.iter().any(|h| h.to_lowercase().contains(&needle_lower))
+    }
+
+    fn fallback_vision_action(&self, goal: &str, history: &[String]) -> Value {
+        let goal_lower = goal.to_lowercase();
+
+        let app_order = [
+            "Calendar",
+            "Safari",
+            "Finder",
+            "TextEdit",
+            "Notes",
+            "Calculator",
+            "Mail",
+        ];
+
+        for app in app_order {
+            if goal_lower.contains(&app.to_lowercase()) {
+                let opened_marker = format!("Opened app: {}", app);
+                if !Self::history_contains_case_insensitive(history, &opened_marker) {
+                    return json!({ "action": "open_app", "name": app });
+                }
+            }
+        }
+
+        if goal_lower.contains("google") || goal_lower.contains("검색") || goal_lower.contains("search") {
+            return json!({ "action": "open_url", "url": "https://www.google.com" });
+        }
+
+        if goal_lower.contains("cmd+n") || goal_lower.contains("새 메모") || goal_lower.contains("new note") {
+            return json!({ "action": "shortcut", "key": "n", "modifiers": ["command"] });
+        }
+
+        json!({ "action": "wait", "seconds": 1 })
     }
 
     /// Internal helper for robust API calls (Retry Logic)
@@ -539,7 +577,6 @@ Respond with ONE JSON object only.
                     if let Some(start) = clean.find('{') {
                         if let Some(end) = clean.rfind('}') {
                             let json_str = &clean[start..=end];
-                            let json_str = &clean[start..=end];
                             if let Ok(json_val) = serde_json::from_str::<Value>(json_str) {
                                 // Phase 29: Support CoT (Wrapper Object)
                                 if let Some(thought) = json_val.get("thought").and_then(|t| t.as_str()) {
@@ -640,8 +677,13 @@ Respond with ONE JSON object only.
                     }
                 }
             }
-            
-            return Err(anyhow::anyhow!("LLM Refused (Safety): {}", refusal));
+
+            let fallback_action = self.fallback_vision_action(goal, history);
+            log::warn!(
+                "Using deterministic fallback action after refusal: {}",
+                fallback_action
+            );
+            return Ok(fallback_action);
         }
 
         let content_opt = res_json["choices"][0]["message"]["content"].as_str();

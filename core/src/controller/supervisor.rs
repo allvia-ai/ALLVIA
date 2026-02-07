@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use anyhow::Result;
-use crate::llm_gateway::LLMClient;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorDecision {
@@ -14,6 +13,49 @@ pub struct SupervisorDecision {
 pub struct Supervisor;
 
 impl Supervisor {
+    fn fallback_review(reason: String, notes: String) -> SupervisorDecision {
+        SupervisorDecision {
+            action: "review".to_string(),
+            reason,
+            focus_keywords: Vec::new(),
+            notes,
+        }
+    }
+
+    fn parse_decision(content: &str) -> Result<SupervisorDecision> {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return Ok(Self::fallback_review(
+                "Supervisor returned empty response".to_string(),
+                "Empty response from LLM".to_string(),
+            ));
+        }
+
+        if let Ok(decision) = serde_json::from_str::<SupervisorDecision>(trimmed) {
+            return Ok(decision);
+        }
+
+        if let Some(recovered) = crate::llm_gateway::recover_json(trimmed) {
+            if let Ok(decision) = serde_json::from_value::<SupervisorDecision>(recovered.clone()) {
+                return Ok(decision);
+            }
+
+            if let Some(inner) = recovered.get("action") {
+                if inner.is_object() {
+                    if let Ok(decision) = serde_json::from_value::<SupervisorDecision>(inner.clone()) {
+                        return Ok(decision);
+                    }
+                }
+            }
+        }
+
+        let preview = trimmed.chars().take(160).collect::<String>();
+        Ok(Self::fallback_review(
+            "Supervisor response was not valid JSON".to_string(),
+            format!("Unparseable supervisor output: {}", preview),
+        ))
+    }
+
     pub async fn consult(
         llm: &dyn crate::llm_gateway::LLMClient,
         goal: &str,
@@ -39,8 +81,6 @@ impl Supervisor {
         ];
 
         let content = llm.chat_completion(messages).await?;
-
-        let decision: SupervisorDecision = serde_json::from_str(&content)?;
-        Ok(decision)
+        Self::parse_decision(&content)
     }
 }
