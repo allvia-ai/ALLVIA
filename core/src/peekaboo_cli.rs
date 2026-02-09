@@ -45,13 +45,19 @@ pub fn check_permissions() -> Result<PeekabooPermissions> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: Value = serde_json::from_str(&stdout)
-        .context("peekaboo permissions returned non-JSON output")?;
+    let json: Value =
+        serde_json::from_str(&stdout).context("peekaboo permissions returned non-JSON output")?;
 
-    let screen_recording = find_bool_any(&json, &["screenRecording", "screen_recording", "screen-recording"]);
+    let screen_recording = find_bool_any(
+        &json,
+        &["screenRecording", "screen_recording", "screen-recording"],
+    );
     let accessibility = find_bool_any(&json, &["accessibility"]);
 
-    Ok(PeekabooPermissions { screen_recording, accessibility })
+    Ok(PeekabooPermissions {
+        screen_recording,
+        accessibility,
+    })
 }
 
 pub fn take_snapshot(app: Option<&str>) -> Result<PeekabooSnapshot> {
@@ -71,13 +77,16 @@ pub fn take_snapshot(app: Option<&str>) -> Result<PeekabooSnapshot> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: Value = serde_json::from_str(&stdout)
-        .context("peekaboo see returned non-JSON output")?;
+    let json: Value =
+        serde_json::from_str(&stdout).context("peekaboo see returned non-JSON output")?;
 
     let snapshot_id = find_string_any(&json, &["snapshotId", "snapshot_id", "snapshot", "id"]);
     let elements = parse_elements(&json);
 
-    Ok(PeekabooSnapshot { snapshot_id, elements })
+    Ok(PeekabooSnapshot {
+        snapshot_id,
+        elements,
+    })
 }
 
 pub fn click(ref_id: &str, snapshot_id: Option<&str>, app: Option<&str>) -> Result<()> {
@@ -209,11 +218,18 @@ fn find_elements_array(value: &Value) -> Option<&Vec<Value>> {
 fn parse_element(value: &Value) -> Option<PeekabooElement> {
     let obj = value.as_object()?;
     let id = find_string_in_obj(obj, &["id", "ref", "elementId", "element_id"])?;
-    let role = find_string_in_obj(obj, &["role", "type", "kind"]).unwrap_or_else(|| "unknown".to_string());
-    let name = find_string_in_obj(obj, &["name", "title", "label", "text", "value"]).unwrap_or_default();
+    let role =
+        find_string_in_obj(obj, &["role", "type", "kind"]).unwrap_or_else(|| "unknown".to_string());
+    let name =
+        find_string_in_obj(obj, &["name", "title", "label", "text", "value"]).unwrap_or_default();
     let bounds = parse_bounds(obj);
 
-    Some(PeekabooElement { id, role, name, bounds })
+    Some(PeekabooElement {
+        id,
+        role,
+        name,
+        bounds,
+    })
 }
 
 fn find_string_in_obj(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
@@ -236,10 +252,22 @@ fn parse_bounds(obj: &serde_json::Map<String, Value>) -> Option<(i32, i32, i32, 
 
     let bounds = candidate?.as_object()?;
 
-    let x = bounds.get("x").or_else(|| bounds.get("left")).and_then(|v| v.as_f64())? as i32;
-    let y = bounds.get("y").or_else(|| bounds.get("top")).and_then(|v| v.as_f64())? as i32;
-    let width = bounds.get("width").or_else(|| bounds.get("w")).and_then(|v| v.as_f64())? as i32;
-    let height = bounds.get("height").or_else(|| bounds.get("h")).and_then(|v| v.as_f64())? as i32;
+    let x = bounds
+        .get("x")
+        .or_else(|| bounds.get("left"))
+        .and_then(|v| v.as_f64())? as i32;
+    let y = bounds
+        .get("y")
+        .or_else(|| bounds.get("top"))
+        .and_then(|v| v.as_f64())? as i32;
+    let width = bounds
+        .get("width")
+        .or_else(|| bounds.get("w"))
+        .and_then(|v| v.as_f64())? as i32;
+    let height = bounds
+        .get("height")
+        .or_else(|| bounds.get("h"))
+        .and_then(|v| v.as_f64())? as i32;
 
     Some((x, y, width, height))
 }

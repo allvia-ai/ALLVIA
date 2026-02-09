@@ -60,11 +60,8 @@ pub fn evaluate_judgment(req: JudgmentRequest) -> JudgmentResponse {
 
     let failure = !reasons.is_empty();
 
-    let (project_hash, no_progress, consecutive_no_progress) = detect_no_progress(
-        req.workdir.as_deref(),
-        req.max_files,
-        failure,
-    );
+    let (project_hash, no_progress, consecutive_no_progress) =
+        detect_no_progress(req.workdir.as_deref(), req.max_files, failure);
 
     let status = if no_progress && consecutive_no_progress >= 2 {
         "stop"
@@ -93,7 +90,10 @@ fn detect_no_progress(
     let hash = scanner.compute_state_hash(max_files);
 
     let mut consecutive = 0;
-    let last_hash = db::get_judgment_state().ok().flatten().and_then(|s| s.last_hash);
+    let last_hash = db::get_judgment_state()
+        .ok()
+        .flatten()
+        .and_then(|s| s.last_hash);
     let no_progress = if failure {
         match (&hash, &last_hash) {
             (Some(current), Some(prev)) => current == prev,

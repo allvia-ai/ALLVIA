@@ -49,7 +49,7 @@ pub struct Template {
     pub id: &'static str,
     pub title: &'static str,
     pub trigger_type: crate::pattern_detector::PatternType, // Filter by pattern type
-    pub required_keywords: Vec<&'static str>, // Apps or Keywords
+    pub required_keywords: Vec<&'static str>,               // Apps or Keywords
     pub min_keyword_matches: usize,
     pub n8n_prompt: &'static str,
     pub base_confidence: f64,
@@ -62,7 +62,7 @@ pub struct TemplateMatcher {
 impl TemplateMatcher {
     pub fn new() -> Self {
         use crate::pattern_detector::PatternType::*;
-        
+
         Self {
             templates: vec![
                 // T1. Daily App Report
@@ -169,16 +169,23 @@ impl TemplateMatcher {
         }
     }
 
-    pub fn match_pattern(&self, pattern: &crate::pattern_detector::DetectedPattern) -> Option<AutomationProposal> {
+    pub fn match_pattern(
+        &self,
+        pattern: &crate::pattern_detector::DetectedPattern,
+    ) -> Option<AutomationProposal> {
         // 1. Filter by type
-        let candidates: Vec<&Template> = self.templates.iter()
+        let candidates: Vec<&Template> = self
+            .templates
+            .iter()
             .filter(|t| t.trigger_type == pattern.pattern_type)
             .collect();
 
         // 2. Score match
         let tokens = extract_tokens_from_pattern(pattern);
         for tmpl in candidates {
-            let match_count = tmpl.required_keywords.iter()
+            let match_count = tmpl
+                .required_keywords
+                .iter()
                 .filter(|k| tokens.contains(&k.to_lowercase()))
                 .count();
 
@@ -186,12 +193,15 @@ impl TemplateMatcher {
                 // Found a match!
                 // Boost confidence based on pattern strength + keyword matches
                 let match_bonus = (0.1 * match_count as f64).min(0.3);
-                let final_confidence = (tmpl.base_confidence * (0.7 + match_bonus)) + (pattern.similarity_score * 0.2);
-                let matched_keywords: Vec<String> = tmpl.required_keywords.iter()
+                let final_confidence =
+                    (tmpl.base_confidence * (0.7 + match_bonus)) + (pattern.similarity_score * 0.2);
+                let matched_keywords: Vec<String> = tmpl
+                    .required_keywords
+                    .iter()
                     .filter(|k| tokens.contains(&k.to_lowercase()))
                     .map(|k| k.to_string())
                     .collect();
-                
+
                 // Construct Evidence (The Trust UX part)
                 let evidence = vec![
                     format!("Pattern: {}", pattern.description),
@@ -211,12 +221,14 @@ impl TemplateMatcher {
                 });
             }
         }
-        
+
         None
     }
 }
 
-fn extract_tokens_from_pattern(pattern: &crate::pattern_detector::DetectedPattern) -> HashSet<String> {
+fn extract_tokens_from_pattern(
+    pattern: &crate::pattern_detector::DetectedPattern,
+) -> HashSet<String> {
     let mut tokens = HashSet::new();
 
     // 1) Description tokens
@@ -230,7 +242,8 @@ fn extract_tokens_from_pattern(pattern: &crate::pattern_detector::DetectedPatter
     for ev in &pattern.sample_events {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(ev) {
             // app
-            if let Some(app) = val.get("payload")
+            if let Some(app) = val
+                .get("payload")
                 .or_else(|| val.get("data"))
                 .and_then(|p| p.get("app").and_then(|v| v.as_str()))
                 .or_else(|| val.get("app").and_then(|v| v.as_str()))
@@ -239,7 +252,8 @@ fn extract_tokens_from_pattern(pattern: &crate::pattern_detector::DetectedPatter
             }
 
             // keyword text
-            if let Some(text) = val.get("payload")
+            if let Some(text) = val
+                .get("payload")
                 .or_else(|| val.get("data"))
                 .and_then(|p| p.get("text").and_then(|v| v.as_str()))
             {
@@ -251,9 +265,14 @@ fn extract_tokens_from_pattern(pattern: &crate::pattern_detector::DetectedPatter
             }
 
             // file extension
-            if let Some(path) = val.get("payload")
+            if let Some(path) = val
+                .get("payload")
                 .or_else(|| val.get("data"))
-                .and_then(|p| p.get("path").and_then(|v| v.as_str()).or_else(|| p.as_str()))
+                .and_then(|p| {
+                    p.get("path")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| p.as_str())
+                })
             {
                 if let Some(ext) = std::path::Path::new(path)
                     .extension()
@@ -298,12 +317,12 @@ mod tests {
     #[test]
     fn test_template_matching_logic() {
         let matcher = TemplateMatcher::new();
-        
+
         // Scenario 1: Exact Match for "Email Follow-Up" (Requires "invoice", "urgent", etc.)
-        // T5 required: invoice, follow-up, urgent. min_match: 1? No, T5 in code has min_match=1? 
+        // T5 required: invoice, follow-up, urgent. min_match: 1? No, T5 in code has min_match=1?
         // Let's check T5 in the actual file. It has ["invoice", "follow-up", "urgent"].
         // This test assumes T5 Logic.
-        
+
         let pattern = DetectedPattern {
             pattern_id: "p1".to_string(),
             pattern_type: PatternType::KeywordRepeat,
@@ -311,7 +330,7 @@ mod tests {
             occurrences: 10,
             similarity_score: 0.9,
             sample_events: vec![
-               json!({"type": "ui.type", "data": {"text": "sending invoice"}}).to_string()
+                json!({"type": "ui.type", "data": {"text": "sending invoice"}}).to_string(),
             ],
             detected_at: Utc::now(),
         };

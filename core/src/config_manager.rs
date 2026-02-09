@@ -1,7 +1,6 @@
-use std::env;
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::collections::HashMap;
 
 pub struct ConfigManager {
     env_path: PathBuf,
@@ -17,7 +16,7 @@ impl ConfigManager {
         // Better to use a config file in ~/.steer_config?
         // But the legacy code uses .env.
         // We will try CWD .env first.
-        
+
         let env_path = PathBuf::from(".env");
         ConfigManager { env_path }
     }
@@ -31,7 +30,7 @@ impl ConfigManager {
                 }
             }
         }
-        // Also overlay real env vars? 
+        // Also overlay real env vars?
         // No, we want the file content specifically for editing.
         map
     }
@@ -39,9 +38,9 @@ impl ConfigManager {
     pub fn update(&self, key: &str, value: &str) -> Result<(), String> {
         let mut lines = Vec::new();
         let mut found = false;
-        
+
         let content = fs::read_to_string(&self.env_path).unwrap_or_default();
-        
+
         for line in content.lines() {
             if line.starts_with(key) && line.contains('=') {
                 lines.push(format!("{}={}", key, value));

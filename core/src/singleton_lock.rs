@@ -34,7 +34,11 @@ pub fn acquire_lock() -> Result<Option<LockGuard>, String> {
 
     let stale_secs = env_i64("STEER_LOCK_STALE_SECS").unwrap_or(900);
 
-    match fs::OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
         Ok(mut file) => {
             let payload = LockPayload {
                 pid: std::process::id(),
@@ -75,7 +79,9 @@ fn is_stale(payload: &LockPayload, stale_secs: i64) -> bool {
     let created = chrono::DateTime::parse_from_rfc3339(&payload.created_at)
         .map(|ts| ts.with_timezone(&chrono::Utc))
         .unwrap_or_else(|_| chrono::Utc::now());
-    let age = chrono::Utc::now().signed_duration_since(created).num_seconds();
+    let age = chrono::Utc::now()
+        .signed_duration_since(created)
+        .num_seconds();
     age > stale_secs
 }
 
@@ -87,7 +93,12 @@ fn resolve_lock_path() -> PathBuf {
 fn env_flag(key: &str) -> bool {
     std::env::var(key)
         .ok()
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 

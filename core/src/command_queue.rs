@@ -44,7 +44,12 @@ impl CommandQueue {
         }
     }
 
-    async fn enqueue_in_lane(&self, lane: &str, task: CommandTask, warn_after_ms: u64) -> CommandResult {
+    async fn enqueue_in_lane(
+        &self,
+        lane: &str,
+        task: CommandTask,
+        warn_after_ms: u64,
+    ) -> CommandResult {
         let (tx, rx) = oneshot::channel();
         let entry = QueueEntry {
             task,
@@ -144,7 +149,10 @@ impl CommandQueue {
     #[allow(dead_code)]
     async fn get_lane_size(&self, lane: &str) -> usize {
         let lanes = self.lanes.lock().expect("command queue lock poisoned");
-        lanes.get(lane).map(|s| s.queue.len() + s.active).unwrap_or(0)
+        lanes
+            .get(lane)
+            .map(|s| s.queue.len() + s.active)
+            .unwrap_or(0)
     }
 }
 
@@ -168,7 +176,9 @@ pub async fn enqueue_command_in_lane(
 
 #[allow(dead_code)]
 pub async fn set_lane_concurrency(lane: &str, max_concurrent: usize) {
-    COMMAND_QUEUE.set_lane_concurrency(lane, max_concurrent).await
+    COMMAND_QUEUE
+        .set_lane_concurrency(lane, max_concurrent)
+        .await
 }
 
 #[allow(dead_code)]
@@ -179,7 +189,10 @@ pub async fn get_lane_size(lane: &str) -> usize {
 /// [Phase 25] Cancel all pending tasks in a lane
 #[allow(dead_code)]
 pub async fn cancel_lane(lane: &str) {
-    let mut lanes = COMMAND_QUEUE.lanes.lock().expect("command queue lock poisoned");
+    let mut lanes = COMMAND_QUEUE
+        .lanes
+        .lock()
+        .expect("command queue lock poisoned");
     if let Some(state) = lanes.get_mut(lane) {
         let count = state.queue.len();
         state.queue.clear();

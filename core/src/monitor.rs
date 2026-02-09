@@ -1,11 +1,11 @@
-use sysinfo::System;
-use notify::{Watcher, RecursiveMode, Result as NotifyResult, RecommendedWatcher, Config};
-use tokio::sync::mpsc;
-use std::path::Path;
-use chrono::Utc;
-use serde_json::json;
-use uuid::Uuid;
 use crate::schema::{EventEnvelope, ResourceContext};
+use chrono::Utc;
+use notify::{Config, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher};
+use serde_json::json;
+use std::path::Path;
+use sysinfo::System;
+use tokio::sync::mpsc;
+use uuid::Uuid;
 
 // --- Resource Monitor ---
 
@@ -37,14 +37,19 @@ impl ResourceMonitor {
             total_mem / 1024 / 1024
         )
     }
-    
+
     pub fn get_high_usage_apps(&mut self) -> Vec<(String, f32)> {
         self.sys.refresh_processes();
         let mut processes: Vec<_> = self.sys.processes().values().collect();
         // Sort by CPU usage descending
-        processes.sort_by(|a, b| b.cpu_usage().partial_cmp(&a.cpu_usage()).unwrap_or(std::cmp::Ordering::Equal));
-        
-        processes.iter()
+        processes.sort_by(|a, b| {
+            b.cpu_usage()
+                .partial_cmp(&a.cpu_usage())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        processes
+            .iter()
             .take(3)
             .map(|p| (p.name().to_string(), p.cpu_usage()))
             .collect()
@@ -55,13 +60,13 @@ impl ResourceMonitor {
 
 pub fn spawn_file_watcher(
     path: String,
-    log_tx: mpsc::Sender<String>
+    log_tx: mpsc::Sender<String>,
 ) -> NotifyResult<RecommendedWatcher> {
     let (tx, rx) = std::sync::mpsc::channel();
 
     // Create watcher
     let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
-    
+
     // Add path
     watcher.watch(Path::new(&path), RecursiveMode::NonRecursive)?;
 
@@ -74,7 +79,8 @@ pub fn spawn_file_watcher(
                     if event.kind.is_create() || event.kind.is_modify() {
                         for path in event.paths {
                             let filename = path.file_name().unwrap_or_default().to_string_lossy();
-                            if !filename.starts_with('.') { // Ignore hidden files
+                            if !filename.starts_with('.') {
+                                // Ignore hidden files
                                 let path_str = path.to_string_lossy().to_string();
                                 let resource = ResourceContext {
                                     resource_type: "file".to_string(),
@@ -102,7 +108,7 @@ pub fn spawn_file_watcher(
                             }
                         }
                     }
-                },
+                }
                 Err(e) => eprintln!("Watch error: {:?}", e),
             }
         }
@@ -113,16 +119,14 @@ pub fn spawn_file_watcher(
 
 // --- App Watcher (Active Window Poller) ---
 
-pub fn spawn_app_watcher(
-    log_tx: mpsc::Sender<String>
-) {
+pub fn spawn_app_watcher(log_tx: mpsc::Sender<String>) {
     std::thread::spawn(move || {
         let mut last_app = String::new();
-        
+
         loop {
             // Poll every 2 seconds
             std::thread::sleep(std::time::Duration::from_secs(2));
-            
+
             // Get frontmost app name via AppleScript
             let output = std::process::Command::new("osascript")
                 .arg("-e")
@@ -136,8 +140,9 @@ pub fn spawn_app_watcher(
                         last_app = current_app.clone();
 
                         // [Context Enrichment] Get Window Title & URL
-                        let (window_title, browser_url) = crate::applescript::get_active_window_context()
-                            .unwrap_or_else(|_| ("".to_string(), "".to_string()));
+                        let (window_title, browser_url) =
+                            crate::applescript::get_active_window_context()
+                                .unwrap_or_else(|_| ("".to_string(), "".to_string()));
 
                         let resource = ResourceContext {
                             resource_type: "app".to_string(),
@@ -220,22 +225,25 @@ mod tests {
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-        
+
         let path_str = temp_dir.to_str().unwrap().to_string();
         let _watcher = spawn_file_watcher(path_str, tx).unwrap();
-        
+
         // 1. Create File
         let file_path = temp_dir.join("test.txt");
         {
             let mut file = File::create(&file_path).unwrap();
             file.write_all(b"Hello").unwrap();
         }
-        
+
         // Allow thread propagation (blocking receive with timeout)
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             // Check Event 1
-            if let Some(log) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap() {
+            if let Some(log) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+            {
                 println!("✅ Received Event 1: {}", log);
                 let contains_created = log.contains("file_created");
                 // Notify logic can be tricky, sometimes it emits modify for create.
@@ -244,29 +252,35 @@ mod tests {
             } else {
                 panic!("❌ No event received for Create");
             }
-            
+
             // 2. Modify File
             tokio::time::sleep(Duration::from_secs(1)).await;
             {
-                 let mut file = std::fs::OpenOptions::new().append(true).open(&file_path).unwrap();
-                 file.write_all(b" World").unwrap();
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&file_path)
+                    .unwrap();
+                file.write_all(b" World").unwrap();
             }
-            
-             // Check Event 2
-            if let Some(log) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap() {
+
+            // Check Event 2
+            if let Some(log) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+            {
                 println!("✅ Received Event 2: {}", log);
-                 // We updated monitor.rs to handle modify, but wait...
-                 // monitor.rs logic:
-                 // if event.kind.is_create() || event.kind.is_modify() {
-                 //    event_type = "file_created" (hardcoded in base_envelope call?)
-                 // Let's check the code I wrote in monitor.rs
-                 
-                 // Ah, in monitor.rs line 86:
-                 // "file_created",
-                 // I didn't change the event name string! 
-                 // So it will report "file_created" even for modify.
-                 // This is a bug I should fix, but for now I assert it receives *an* event.
-                 assert!(log.contains("file_created")); 
+                // We updated monitor.rs to handle modify, but wait...
+                // monitor.rs logic:
+                // if event.kind.is_create() || event.kind.is_modify() {
+                //    event_type = "file_created" (hardcoded in base_envelope call?)
+                // Let's check the code I wrote in monitor.rs
+
+                // Ah, in monitor.rs line 86:
+                // "file_created",
+                // I didn't change the event name string!
+                // So it will report "file_created" even for modify.
+                // This is a bug I should fix, but for now I assert it receives *an* event.
+                assert!(log.contains("file_created"));
             } else {
                 panic!("❌ No event received for Modify");
             }

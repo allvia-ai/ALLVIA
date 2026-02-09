@@ -1,15 +1,14 @@
-use local_os_agent::llm_gateway::LLMClient;
 // use local_os_agent::dynamic_controller::DynamicController;
 use std::error::Error;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     println!("🧪 Starting Macro Recorder Test...");
-    
+
     // 1. Initialize
     local_os_agent::db::init()?; // Initialize DB
     let llm = std::sync::Arc::new(local_os_agent::llm_gateway::OpenAILLMClient::new()?);
-    let mut planner = local_os_agent::controller::planner::Planner::new(llm, None);
+    let planner = local_os_agent::controller::planner::Planner::new(llm, None);
 
     // 2. Goal: Record
     println!("🎥 Phase 1: Recording 'test_routine'");
@@ -21,7 +20,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // 3. Goal: Replay
     println!("▶️ Phase 2: Replaying 'test_routine'");
-    planner.run_goal("Replay the routine named 'test_routine'. Then click done.", None).await?;
+    planner
+        .run_goal(
+            "Replay the routine named 'test_routine'. Then click done.",
+            None,
+        )
+        .await?;
 
     println!("✅ Test Execution Complete. Check logs for 'Saved Routine' and 'Replayed Routine'.");
     Ok(())

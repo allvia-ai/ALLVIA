@@ -21,9 +21,15 @@ pub struct VisualVerifyResult {
     pub verdicts: Vec<VisualVerdict>,
 }
 
-pub async fn verify_screen(llm: &dyn LLMClient, req: VisualVerifyRequest) -> Result<VisualVerifyResult> {
+pub async fn verify_screen(
+    llm: &dyn LLMClient,
+    req: VisualVerifyRequest,
+) -> Result<VisualVerifyResult> {
     if req.prompts.is_empty() {
-        return Ok(VisualVerifyResult { ok: true, verdicts: vec![] });
+        return Ok(VisualVerifyResult {
+            ok: true,
+            verdicts: vec![],
+        });
     }
 
     let (b64, _scale) = VisualDriver::capture_screen()?;

@@ -1,13 +1,13 @@
 //! Retry Logic - Clawdbot-style robust execution
-//! 
+//!
 //! Ported from: clawdbot-main/src/agents/pi-embedded-runner/run.ts
-//! 
+//!
 //! Features:
 //! - Multi-attempt with exponential backoff
 //! - Context overflow detection
 //! - Auth profile rotation (stub)
 
-use anyhow::{Result, Context};
+use anyhow::Result;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -51,7 +51,7 @@ pub enum FailoverReason {
 /// Classify an error message to determine retry strategy
 pub fn classify_error(message: &str) -> FailoverReason {
     let msg_lower = message.to_lowercase();
-    
+
     // Rate limit detection (from clawdbot)
     if msg_lower.contains("rate limit")
         || msg_lower.contains("429")
@@ -60,7 +60,7 @@ pub fn classify_error(message: &str) -> FailoverReason {
     {
         return FailoverReason::RateLimit;
     }
-    
+
     // Auth errors
     if msg_lower.contains("unauthorized")
         || msg_lower.contains("401")
@@ -69,7 +69,7 @@ pub fn classify_error(message: &str) -> FailoverReason {
     {
         return FailoverReason::Auth;
     }
-    
+
     // Timeout
     if msg_lower.contains("timeout")
         || msg_lower.contains("timed out")
@@ -77,7 +77,7 @@ pub fn classify_error(message: &str) -> FailoverReason {
     {
         return FailoverReason::Timeout;
     }
-    
+
     // Context overflow
     if msg_lower.contains("context length")
         || msg_lower.contains("context window")
@@ -87,7 +87,7 @@ pub fn classify_error(message: &str) -> FailoverReason {
     {
         return FailoverReason::ContextOverflow;
     }
-    
+
     // Network errors
     if msg_lower.contains("connection")
         || msg_lower.contains("network")
@@ -96,19 +96,19 @@ pub fn classify_error(message: &str) -> FailoverReason {
     {
         return FailoverReason::NetworkError;
     }
-    
+
     FailoverReason::Unknown
 }
 
 /// Determine if an error is retryable
 pub fn is_retryable(reason: &FailoverReason) -> bool {
     match reason {
-        FailoverReason::RateLimit => true,   // Retry after backoff
-        FailoverReason::Timeout => true,      // Retry immediately
-        FailoverReason::NetworkError => true, // Retry with delay
-        FailoverReason::Auth => false,        // Don't retry (need new key)
+        FailoverReason::RateLimit => true,        // Retry after backoff
+        FailoverReason::Timeout => true,          // Retry immediately
+        FailoverReason::NetworkError => true,     // Retry with delay
+        FailoverReason::Auth => false,            // Don't retry (need new key)
         FailoverReason::ContextOverflow => false, // Need compaction
-        FailoverReason::Unknown => true,      // Try once more
+        FailoverReason::Unknown => true,          // Try once more
     }
 }
 
@@ -134,19 +134,23 @@ where
     Fut: std::future::Future<Output = Result<T>>,
 {
     let mut last_error = None;
-    
+
     for attempt in 0..config.max_attempts {
         match operation().await {
             Ok(result) => {
                 if attempt > 0 {
-                    println!("✅ [Retry] {} succeeded on attempt {}", operation_name, attempt + 1);
+                    println!(
+                        "✅ [Retry] {} succeeded on attempt {}",
+                        operation_name,
+                        attempt + 1
+                    );
                 }
                 return Ok(result);
             }
             Err(e) => {
                 let error_msg = e.to_string();
                 let reason = classify_error(&error_msg);
-                
+
                 println!(
                     "⚠️ [Retry] {} failed (attempt {}/{}): {:?} - {}",
                     operation_name,
@@ -155,22 +159,22 @@ where
                     reason,
                     &error_msg[..error_msg.len().min(100)]
                 );
-                
+
                 if !is_retryable(&reason) || attempt + 1 >= config.max_attempts {
                     last_error = Some(e);
                     break;
                 }
-                
+
                 // Apply backoff
                 let delay = calculate_delay(config, attempt);
                 println!("   ⏳ Waiting {}ms before retry...", delay.as_millis());
                 sleep(delay).await;
-                
+
                 last_error = Some(e);
             }
         }
     }
-    
+
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Retry failed without error")))
 }
 
@@ -195,29 +199,27 @@ impl ContextWindowInfo {
             hard_limit: (max_tokens as f64 * 0.95) as usize,
         }
     }
-    
+
     /// Estimate tokens from text (rough: 1 token ≈ 4 chars)
     pub fn estimate_tokens(text: &str) -> usize {
         text.len() / 4
     }
-    
+
     /// Update current token count
     pub fn update(&mut self, messages: &[String]) {
-        self.current_tokens = messages.iter()
-            .map(|m| Self::estimate_tokens(m))
-            .sum();
+        self.current_tokens = messages.iter().map(|m| Self::estimate_tokens(m)).sum();
     }
-    
+
     /// Check if we're approaching the limit
     pub fn should_warn(&self) -> bool {
         self.current_tokens >= self.warn_threshold
     }
-    
+
     /// Check if we've exceeded the limit
     pub fn should_compact(&self) -> bool {
         self.current_tokens >= self.hard_limit
     }
-    
+
     /// Get remaining capacity
     pub fn remaining(&self) -> usize {
         self.max_tokens.saturating_sub(self.current_tokens)
@@ -233,22 +235,23 @@ pub fn compact_history(messages: &[String], keep_recent: usize) -> Vec<String> {
     if messages.len() <= keep_recent + 1 {
         return messages.to_vec();
     }
-    
+
     let split_point = messages.len() - keep_recent;
     let old_messages = &messages[..split_point];
     let recent_messages = &messages[split_point..];
-    
+
     // Create a summary of old messages
     let summary = format!(
         "[Compacted History: {} previous actions including: {}]",
         old_messages.len(),
-        old_messages.iter()
+        old_messages
+            .iter()
             .take(3)
             .cloned()
             .collect::<Vec<_>>()
             .join(", ")
     );
-    
+
     let mut result = vec![summary];
     result.extend(recent_messages.iter().cloned());
     result
@@ -261,17 +264,29 @@ pub fn compact_history(messages: &[String], keep_recent: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_classify_error() {
-        assert_eq!(classify_error("Rate limit exceeded"), FailoverReason::RateLimit);
-        assert_eq!(classify_error("HTTP 429 Too Many Requests"), FailoverReason::RateLimit);
+        assert_eq!(
+            classify_error("Rate limit exceeded"),
+            FailoverReason::RateLimit
+        );
+        assert_eq!(
+            classify_error("HTTP 429 Too Many Requests"),
+            FailoverReason::RateLimit
+        );
         assert_eq!(classify_error("Invalid API key"), FailoverReason::Auth);
-        assert_eq!(classify_error("Connection timeout"), FailoverReason::Timeout);
-        assert_eq!(classify_error("Context length exceeded"), FailoverReason::ContextOverflow);
+        assert_eq!(
+            classify_error("Connection timeout"),
+            FailoverReason::Timeout
+        );
+        assert_eq!(
+            classify_error("Context length exceeded"),
+            FailoverReason::ContextOverflow
+        );
         assert_eq!(classify_error("Random error"), FailoverReason::Unknown);
     }
-    
+
     #[test]
     fn test_calculate_delay() {
         let config = RetryConfig::default();
@@ -279,19 +294,19 @@ mod tests {
         assert_eq!(calculate_delay(&config, 1), Duration::from_millis(2000));
         assert_eq!(calculate_delay(&config, 2), Duration::from_millis(4000));
     }
-    
+
     #[test]
     fn test_context_window() {
         let mut ctx = ContextWindowInfo::new(4096);
         assert!(!ctx.should_warn());
-        
+
         ctx.current_tokens = 3500;
         assert!(ctx.should_warn());
-        
+
         ctx.current_tokens = 4000;
         assert!(ctx.should_compact());
     }
-    
+
     #[test]
     fn test_compact_history() {
         let history = vec![
@@ -301,7 +316,7 @@ mod tests {
             "Step 4".to_string(),
             "Step 5".to_string(),
         ];
-        
+
         let compacted = compact_history(&history, 2);
         assert_eq!(compacted.len(), 3); // 1 summary + 2 recent
         assert!(compacted[0].contains("Compacted History"));

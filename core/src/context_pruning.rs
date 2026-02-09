@@ -60,7 +60,11 @@ pub fn prune_chat_history(history: &[ChatMessage]) -> Vec<ChatMessage> {
             .filter(|msg| {
                 DateTime::parse_from_rfc3339(&msg.created_at)
                     .ok()
-                    .map(|ts| now.signed_duration_since(ts.with_timezone(&Utc)).num_seconds() <= ttl)
+                    .map(|ts| {
+                        now.signed_duration_since(ts.with_timezone(&Utc))
+                            .num_seconds()
+                            <= ttl
+                    })
                     .unwrap_or(true)
             })
             .collect();
@@ -95,7 +99,9 @@ impl SessionResetConfig {
         let mode = match raw_mode.trim().to_lowercase().as_str() {
             "daily" => SessionResetMode::Daily,
             "idle" => SessionResetMode::Idle,
-            "both" | "daily_idle" | "daily-or-idle" | "daily_or_idle" => SessionResetMode::DailyOrIdle,
+            "both" | "daily_idle" | "daily-or-idle" | "daily_or_idle" => {
+                SessionResetMode::DailyOrIdle
+            }
             _ => SessionResetMode::Off,
         };
 
@@ -191,6 +197,9 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CONTEXT_PRUNE_MAX_MESSAGES", "2");
         std::env::remove_var("CONTEXT_PRUNE_TTL_SECONDS");
+        std::env::set_var("SESSION_RESET_MODE", "off");
+        std::env::remove_var("SESSION_RESET_IDLE_MINUTES");
+        std::env::remove_var("SESSION_RESET_AT_HOUR");
 
         let history = vec![
             make_message("user", "a", "2024-01-01T00:00:00Z"),

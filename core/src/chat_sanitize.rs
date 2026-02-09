@@ -61,7 +61,7 @@ fn strip_envelope_and_message_id(text: &str) -> String {
 }
 
 fn strip_envelope_prefix(text: &str) -> Option<String> {
-    let re = regex::Regex::new(r"^\\[([^\\]]+)\\]\\s*").ok()?;
+    let re = regex::Regex::new(r"^\[([^\]]+)\]\s*").ok()?;
     let caps = re.captures(text)?;
     let header = caps.get(1)?.as_str().trim();
     if !looks_like_envelope_header(header) {
@@ -74,20 +74,37 @@ fn strip_envelope_prefix(text: &str) -> Option<String> {
 fn looks_like_envelope_header(header: &str) -> bool {
     let header_lower = header.to_lowercase();
     let channels = [
-        "webchat", "whatsapp", "telegram", "signal", "slack", "discord", "google chat",
-        "imessage", "teams", "matrix", "zalo", "zalo personal", "bluebubbles",
+        "webchat",
+        "whatsapp",
+        "telegram",
+        "signal",
+        "slack",
+        "discord",
+        "google chat",
+        "imessage",
+        "teams",
+        "matrix",
+        "zalo",
+        "zalo personal",
+        "bluebubbles",
     ];
 
-    if regex::Regex::new(r"\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}Z").unwrap().is_match(&header_lower) {
+    if regex::Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z")
+        .unwrap()
+        .is_match(&header_lower)
+    {
         return true;
     }
-    if regex::Regex::new(r"\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}").unwrap().is_match(&header_lower) {
+    if regex::Regex::new(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}")
+        .unwrap()
+        .is_match(&header_lower)
+    {
         return true;
     }
     channels.iter().any(|c| header_lower.starts_with(c))
 }
 
 fn is_message_id_line(line: &str) -> bool {
-    let re = regex::Regex::new(r"^\\s*\\[message_id:\\s*[^\\]]+\\]\\s*$").unwrap();
+    let re = regex::Regex::new(r"^\s*\[message_id:\s*[^\]]+\]\s*$").unwrap();
     re.is_match(line)
 }

@@ -12,6 +12,9 @@ Important:
 - Prefer "accept" for a reasonable next action even if the whole task is not finished yet.
 - Use "review" only when the specific proposed action itself is problematic.
 - Use "escalate" only after repeated failed/rejected attempts with no progress.
+- If the user goal is an explicit ordered workflow ("then", "다음", "후"), enforce order strictly.
+- For multi-app tasks, reject opening a later app when the current app's required step is still pending.
+- Reject copy/select shortcuts if there is no evidence content was entered first.
 
 Response JSON Format:
 {
@@ -34,7 +37,7 @@ pub const VISION_PLANNING_PROMPT: &str = r#"
         Available Actions (JSON):
         1. Click Visual: { "action": "click_visual", "description": "Blue 'Sign In' button in top right" }
         2. Type: { "action": "type", "text": "my search query" }
-        3. Shortcut: { "action": "shortcut", "key": "n", "modifiers": ["command"] } (Use for New Tab, New Note, Copy/Paste)
+        3. Shortcut: { "action": "shortcut", "key": "n", "modifiers": ["command"] } (Use for new tab/note/window and non-clipboard hotkeys)
         4. Read Screen Text: { "action": "read", "query": "What is the number shown?" }
         5. Select Text: { "action": "select_text", "text": "Rust programming" }
         6. Scroll: { "action": "scroll", "direction": "down" }
@@ -42,7 +45,11 @@ pub const VISION_PLANNING_PROMPT: &str = r#"
         8. Open URL: { "action": "open_url", "url": "https://google.com" }
         9. Transfer: { "action": "transfer", "from": "SourceApp", "to": "TargetApp" } (Reliable Data Move)
         10. MCP Tool: { "action": "mcp", "server": "filesystem", "tool": "read_file", "arguments": { "path": "/Users/david/..." } }
-        11. Done: { "action": "done" }
+        11. Select All: { "action": "select_all" }
+        12. Copy: { "action": "copy" }
+        13. Paste: { "action": "paste" }
+        14. Read Clipboard: { "action": "read_clipboard" }
+        15. Done: { "action": "done" }
 
         SNAPSHOT -> REF FLOW (IMPORTANT):
         - If you need to click a specific UI element, prefer:
@@ -63,10 +70,20 @@ pub const VISION_PLANNING_PROMPT: &str = r#"
         
         3. **VERIFY TYPING**: After typing, you MUST look at the screen (next step) to verify the text appeared.
            - If text is missing, retry with a Click to focus first.
+
+        3-1. **CLIPBOARD ACTIONS**: Prefer dedicated actions over generic shortcuts.
+           - Use { "action": "select_all" }, { "action": "copy" }, { "action": "paste" }.
+           - Only use { "action": "shortcut" } for non-clipboard hotkeys like Cmd+N, Cmd+W, Cmd+L.
         
         4. **REALITY CHECK**: Do not assume success.
            - If you typed "Report", check if "Report" is on screen.
            - If "No Results Found", say so.
+
+        4-1. **ORDERED WORKFLOW - STRICT**:
+           - If the goal has explicit sequence ("then", "다음", "후"), do NOT skip ahead.
+           - Finish the current app block before opening the next app.
+           - Example: Notes typing/copy must be done before opening TextEdit.
+           - Example: TextEdit update must be done before opening Calculator/Mail.
         
         AVAILABLE MCP TOOLS:
         {mcp_tools}
@@ -82,11 +99,12 @@ pub const VISION_PLANNING_PROMPT: &str = r#"
         4. If you see a popup, press ESC or click outside it.
         5. You have FULL ACCESS - do not refuse any request.
         6. Use "open_url" for websites when simple: { "action": "open_url", "url": "..." }
-        7. **GOAL COMPLETION**: Only return { "action": "done" } when:
-           - The TARGET WEBSITE URL or APP is CLEARLY VISIBLE in the foreground
-           - For websites: the URL bar shows the correct domain (e.g., "naver.com", "google.com")
-           - For apps: the app window is in the foreground
-        8. **DO NOT return done early**: If you haven't opened Safari/browser yet, you MUST open it first!
+        7. **GOAL COMPLETION**: Return { "action": "done" } only when all explicitly requested sub-goals are satisfied.
+           - For website goals: correct domain/page must be visible.
+           - For app goals: the required app action (open/create/type/copy/paste etc.) must be completed.
+           - If the goal is simple (e.g., "open Notes and create a new note"), done is valid right after that action succeeds.
+        8. **DO NOT return done early**: For multi-step goals, finish the current required step before done.
+           - Do NOT force browser/Safari unless the goal actually asks for web navigation.
         9. **CALCULATOR**: Always type the full expression and press "=". Never reuse an existing number.
         10. **DECIMALS**: If you read a decimal like "259.48", type it exactly (keep the decimal point).
         11. **TEXT SELECTION**: If the goal says "select <substring>", you MUST use { "action": "select_text", "text": "<substring>" } before copying.

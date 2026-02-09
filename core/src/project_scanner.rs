@@ -187,7 +187,8 @@ impl ProjectScanner {
             return ProjectType::Rust;
         }
 
-        if self.root.join("requirements.txt").exists() || self.root.join("pyproject.toml").exists() {
+        if self.root.join("requirements.txt").exists() || self.root.join("pyproject.toml").exists()
+        {
             return ProjectType::Python;
         }
 

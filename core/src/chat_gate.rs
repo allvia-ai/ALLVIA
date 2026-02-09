@@ -23,7 +23,9 @@ impl ChatGateConfig {
             enabled: env_flag("CHAT_GATE_ENABLED", false),
             require_mention: env_flag("CHAT_REQUIRE_MENTION", false),
             allowed_channels: parse_list(&env::var("CHAT_ALLOWED_CHANNELS").unwrap_or_default()),
-            allowed_chat_types: parse_list(&env::var("CHAT_ALLOWED_CHAT_TYPES").unwrap_or_default()),
+            allowed_chat_types: parse_list(
+                &env::var("CHAT_ALLOWED_CHAT_TYPES").unwrap_or_default(),
+            ),
             allowed_senders: parse_list(&env::var("CHAT_ALLOWED_SENDERS").unwrap_or_default()),
         }
     }
@@ -68,7 +70,10 @@ impl ChatGateConfig {
 
 fn env_flag(key: &str, default_val: bool) -> bool {
     match env::var(key) {
-        Ok(v) => matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Ok(v) => matches!(
+            v.trim().to_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
         Err(_) => default_val,
     }
 }

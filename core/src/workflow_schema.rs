@@ -37,7 +37,7 @@ impl RecommendationStatus {
 /// Trigger specification for a workflow
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TriggerSpec {
-    pub trigger_type: String,  // gmail, schedule, webhook, file_watch
+    pub trigger_type: String,   // gmail, schedule, webhook, file_watch
     pub filter: Option<String>, // e.g., "subject:미팅"
     pub params: serde_json::Value,
 }
@@ -45,7 +45,7 @@ pub struct TriggerSpec {
 /// Action specification for a workflow
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionSpec {
-    pub action_type: String,  // calendar_add, telegram_notify, notion_create, etc.
+    pub action_type: String, // calendar_add, telegram_notify, notion_create, etc.
     pub params: serde_json::Value,
     pub on_error: Option<String>, // continue, stop, retry
 }
@@ -130,7 +130,7 @@ impl WorkflowRecommendation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectedPattern {
     pub pattern_id: String,
-    pub pattern_type: String,  // app_sequence, keyword, file_pattern
+    pub pattern_type: String, // app_sequence, keyword, file_pattern
     pub occurrences: u32,
     pub similarity_score: f64,
     pub sample_events: Vec<String>,
@@ -161,7 +161,7 @@ mod tests {
             params: json!({}),
             on_error: None,
         };
-        
+
         let mut rec = WorkflowRecommendation::new(
             "Test Workflow".to_string(),
             "Summary".to_string(),
@@ -185,7 +185,10 @@ mod tests {
         rec.mark_failed("API Error".to_string());
         assert_eq!(rec.status, RecommendationStatus::Failed);
         assert!(rec.feedback.is_some());
-        assert_eq!(rec.feedback.unwrap().error_message, Some("API Error".to_string()));
+        assert_eq!(
+            rec.feedback.unwrap().error_message,
+            Some("API Error".to_string())
+        );
     }
 
     #[test]
@@ -193,7 +196,7 @@ mod tests {
         let status = RecommendationStatus::Approved;
         let json = serde_json::to_string(&status).unwrap();
         assert_eq!(json, "\"Approved\"");
-        
+
         let deserialized: RecommendationStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, status);
     }

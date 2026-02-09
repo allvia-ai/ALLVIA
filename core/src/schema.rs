@@ -9,17 +9,20 @@ pub enum AgentAction {
     UiSnapshot { scope: Option<String> },
     #[serde(rename = "ui.find")]
     UiFind { query: String },
-    
+
     // Act
     #[serde(rename = "ui.click")]
-    UiClick { element_id: String, double_click: bool },
+    UiClick {
+        element_id: String,
+        double_click: bool,
+    },
     #[serde(rename = "ui.click_text")]
     UiClickText { text: String },
     #[serde(rename = "ui.type")]
     UiType { text: String },
     #[serde(rename = "keyboard.type")]
     KeyboardType { text: String, submit: bool },
-    
+
     // System
     #[serde(rename = "system.open")]
     SystemOpen { app: String },
@@ -56,27 +59,27 @@ pub struct ResourceContext {
 pub struct EventEnvelope {
     pub schema_version: String,
     pub event_id: String,
-    pub ts: String, // ISO 8601
+    pub ts: String,     // ISO 8601
     pub source: String, // e.g., "macos_monitor"
     pub app: String,
     pub event_type: String,
     pub priority: String, // P0, P1, P2
-    
+
     #[serde(default)]
     pub resource: Option<ResourceContext>,
-    
+
     pub payload: serde_json::Value,
-    
+
     #[serde(default)]
     pub privacy: Option<PrivacyContext>,
-    
+
     pub pid: Option<u32>,
     pub window_id: Option<String>,
-    
+
     // [Context Enrichment]
     pub window_title: Option<String>,
     pub browser_url: Option<String>,
-    
+
     #[serde(default)]
     pub raw: Option<serde_json::Value>,
 }

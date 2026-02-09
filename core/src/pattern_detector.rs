@@ -1,9 +1,9 @@
 #![allow(dead_code)]
-use chrono::{DateTime, Utc, Timelike, Datelike};
+use crate::db;
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use crate::db;
 
 /// Detected pattern from user behavior logs
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,10 +19,10 @@ pub struct DetectedPattern {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum PatternType {
-    AppSequence,      // 앱 전환 시퀀스 (예: Chrome → Slack → Gmail)
-    KeywordRepeat,    // 반복 키워드 입력
-    FilePattern,      // 파일 작업 패턴
-    TimeBasedAction,  // 시간 기반 반복 작업
+    AppSequence,     // 앱 전환 시퀀스 (예: Chrome → Slack → Gmail)
+    KeywordRepeat,   // 반복 키워드 입력
+    FilePattern,     // 파일 작업 패턴
+    TimeBasedAction, // 시간 기반 반복 작업
 }
 
 impl PatternType {
@@ -38,9 +38,9 @@ impl PatternType {
 
 /// Pattern detection configuration
 pub struct PatternConfig {
-    pub min_occurrences: u32,       // 최소 반복 횟수 (기본: 3)
-    pub min_similarity: f64,         // 최소 유사도 (기본: 0.8)
-    pub lookback_days: i64,          // 분석 기간 (기본: 7일)
+    pub min_occurrences: u32, // 최소 반복 횟수 (기본: 3)
+    pub min_similarity: f64,  // 최소 유사도 (기본: 0.8)
+    pub lookback_days: i64,   // 분석 기간 (기본: 7일)
 }
 
 impl Default for PatternConfig {
@@ -63,7 +63,9 @@ pub struct PatternDetector {
 
 impl PatternDetector {
     pub fn new() -> Self {
-        let llm_client = crate::llm_gateway::OpenAILLMClient::new().ok().map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn LLMClient>);
+        let llm_client = crate::llm_gateway::OpenAILLMClient::new()
+            .ok()
+            .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn LLMClient>);
         Self {
             config: PatternConfig::default(),
             llm_client,
@@ -71,7 +73,9 @@ impl PatternDetector {
     }
 
     pub fn with_config(config: PatternConfig) -> Self {
-        let llm_client = crate::llm_gateway::OpenAILLMClient::new().ok().map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn LLMClient>);
+        let llm_client = crate::llm_gateway::OpenAILLMClient::new()
+            .ok()
+            .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn LLMClient>);
         Self { config, llm_client }
     }
 
@@ -83,7 +87,7 @@ impl PatternDetector {
             Ok(e) => e,
             Err(_) => return Vec::new(),
         };
-        
+
         self.analyze_with_events(&events)
     }
 
@@ -100,11 +104,11 @@ impl PatternDetector {
         patterns.extend(self.detect_keyword_patterns(events));
         patterns.extend(self.detect_file_patterns(events));
         patterns.extend(self.detect_time_patterns(events)); // New Logic
-        
+
         // Filter by configuration thresholds
         patterns.retain(|p| {
-            p.occurrences >= self.config.min_occurrences 
-            && p.similarity_score >= self.config.min_similarity
+            p.occurrences >= self.config.min_occurrences
+                && p.similarity_score >= self.config.min_similarity
         });
 
         patterns
@@ -121,32 +125,37 @@ impl PatternDetector {
     fn detect_app_sequences(&self, events: &[String]) -> Vec<DetectedPattern> {
         let mut sequences: HashMap<String, (u32, Vec<String>)> = HashMap::new();
         let mut app_history: Vec<String> = Vec::new();
-        
+
         for event_str in events {
-             // Try parsing as Value to handle both new and old schemas flexibly
-             if let Ok(val) = serde_json::from_str::<serde_json::Value>(event_str) {
-                 // Check for "event_type" (New) or "type" (Old)
-                 let event_type = val.get("event_type")
-                     .or_else(|| val.get("type"))
-                     .and_then(|v| v.as_str())
-                     .unwrap_or("");
-                 
-                 // Check for "payload" (New) or "data" (Old)
-                 // Note: payload/data might be an object
-                 let payload = val.get("payload").or_else(|| val.get("data"));
+            // Try parsing as Value to handle both new and old schemas flexibly
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(event_str) {
+                // Check for "event_type" (New) or "type" (Old)
+                let event_type = val
+                    .get("event_type")
+                    .or_else(|| val.get("type"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
 
-                 if event_type == "app_switch" || event_type == "system.open" {
-                      let app_name = if let Some(p) = payload {
-                          p.get("app").and_then(|v| v.as_str()).unwrap_or("")
-                      } else { "" };
+                // Check for "payload" (New) or "data" (Old)
+                // Note: payload/data might be an object
+                let payload = val.get("payload").or_else(|| val.get("data"));
 
-                      if !app_name.is_empty() {
+                if event_type == "app_switch" || event_type == "system.open" {
+                    let app_name = if let Some(p) = payload {
+                        p.get("app").and_then(|v| v.as_str()).unwrap_or("")
+                    } else {
+                        ""
+                    };
+
+                    if !app_name.is_empty() {
                         let app = app_name.to_string();
                         // 1. Single App Repeats
                         let key = format!("app:{}", app);
                         let entry = sequences.entry(key.clone()).or_insert((0, vec![]));
                         entry.0 += 1;
-                        if entry.1.len() < 3 { entry.1.push(event_str.clone()); }
+                        if entry.1.len() < 3 {
+                            entry.1.push(event_str.clone());
+                        }
 
                         // 2. Interleaved Sequences (Bigrams)
                         if let Some(last_app) = app_history.last() {
@@ -155,23 +164,33 @@ impl PatternDetector {
                                 let pair_entry = sequences.entry(pair_key).or_insert((0, vec![]));
                                 pair_entry.0 += 1;
                                 // Store the transition as a sample
-                                if pair_entry.1.len() < 3 { pair_entry.1.push(event_str.clone()); }
+                                if pair_entry.1.len() < 3 {
+                                    pair_entry.1.push(event_str.clone());
+                                }
                             }
                         }
                         app_history.push(app);
-                      }
-                 }
+                    }
+                }
             }
         }
 
-        sequences.into_iter()
+        sequences
+            .into_iter()
             .filter(|(k, (count, _))| {
-                if k.starts_with("flow:") { *count >= self.config.min_occurrences } else { *count >= self.config.min_occurrences }
+                if k.starts_with("flow:") {
+                    *count >= self.config.min_occurrences
+                } else {
+                    *count >= self.config.min_occurrences
+                }
             })
             .map(|(key, (count, samples))| {
                 let is_flow = key.starts_with("flow:");
                 let description = if is_flow {
-                    format!("Workflow Cycle: {}", key.replace("flow:", "").replace("->", " → "))
+                    format!(
+                        "Workflow Cycle: {}",
+                        key.replace("flow:", "").replace("->", " → ")
+                    )
                 } else {
                     format!("Heavy usage: {}", key.replace("app:", ""))
                 };
@@ -194,35 +213,43 @@ impl PatternDetector {
     /// Detect repeated keyword/text input patterns
     fn detect_keyword_patterns(&self, events: &[String]) -> Vec<DetectedPattern> {
         let mut keywords: HashMap<String, (u32, Vec<String>)> = HashMap::new();
-        
+
         for event_str in events {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(event_str) {
-                 let event_type = val.get("event_type")
-                     .or_else(|| val.get("type"))
-                     .and_then(|v| v.as_str())
-                     .unwrap_or("");
+                let event_type = val
+                    .get("event_type")
+                    .or_else(|| val.get("type"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
 
-                 if event_type == "key_input" || event_type == "ui.type" || event_type == "keyboard.type" {
-                     let text = val.get("payload")
+                if event_type == "key_input"
+                    || event_type == "ui.type"
+                    || event_type == "keyboard.type"
+                {
+                    let text = val
+                        .get("payload")
                         .or_else(|| val.get("data"))
                         .and_then(|d| d.get("text"))
                         .and_then(|t| t.as_str());
-                    
-                     if let Some(t) = text {
+
+                    if let Some(t) = text {
                         for word in t.split_whitespace() {
                             if word.len() >= 3 {
                                 let key = word.to_lowercase();
                                 let entry = keywords.entry(key).or_insert((0, vec![]));
                                 entry.0 += 1;
-                                if entry.1.len() < 3 { entry.1.push(event_str.clone()); }
+                                if entry.1.len() < 3 {
+                                    entry.1.push(event_str.clone());
+                                }
                             }
                         }
-                     }
-                 }
+                    }
+                }
             }
         }
 
-        keywords.into_iter()
+        keywords
+            .into_iter()
             .filter(|(_, (count, _))| *count >= 5) // Keywords need more occurrences
             .map(|(keyword, (count, samples))| {
                 let description = format!("Repeated keyword: '{}'", keyword);
@@ -243,25 +270,34 @@ impl PatternDetector {
     /// Detect file operation patterns
     fn detect_file_patterns(&self, events: &[String]) -> Vec<DetectedPattern> {
         let mut file_ops: HashMap<String, (u32, Vec<String>)> = HashMap::new();
-        
+
         for event_str in events {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(event_str) {
-                 let event_type = val.get("event_type")
-                     .or_else(|| val.get("type"))
-                     .and_then(|v| v.as_str())
-                     .unwrap_or("");
-                 
-                 // Support simple string data or object payload
-                 let path_opt = val.get("payload").or_else(|| val.get("data")).and_then(|d| {
-                     if d.is_string() { d.as_str() }
-                     else { d.get("path").and_then(|p| p.as_str()).or_else(|| d.as_str()) }
-                 });
+                let event_type = val
+                    .get("event_type")
+                    .or_else(|| val.get("type"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
 
-                 if event_type == "file_created" || event_type == "file_modified" {
+                // Support simple string data or object payload
+                let path_opt = val
+                    .get("payload")
+                    .or_else(|| val.get("data"))
+                    .and_then(|d| {
+                        if d.is_string() {
+                            d.as_str()
+                        } else {
+                            d.get("path")
+                                .and_then(|p| p.as_str())
+                                .or_else(|| d.as_str())
+                        }
+                    });
+
+                if event_type == "file_created" || event_type == "file_modified" {
                     if let Some(path) = path_opt {
-                         if let Some(ext) = std::path::Path::new(path)
+                        if let Some(ext) = std::path::Path::new(path)
                             .extension()
-                            .and_then(|e| e.to_str()) 
+                            .and_then(|e| e.to_str())
                         {
                             let key = format!("ext:{}", ext);
                             let entry = file_ops.entry(key).or_insert((0, vec![]));
@@ -271,11 +307,12 @@ impl PatternDetector {
                             }
                         }
                     }
-                 }
+                }
             }
         }
 
-        file_ops.into_iter()
+        file_ops
+            .into_iter()
             .filter(|(_, (count, _))| *count >= 3)
             .map(|(pattern, (count, samples))| {
                 let description = format!("File pattern: {}", pattern.replace("ext:", "."));
@@ -302,50 +339,69 @@ impl PatternDetector {
         for event_str in events {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(event_str) {
                 // 1. Extract Metadata (Time & Type)
-                let timestamp_str = val.get("ts")
+                let timestamp_str = val
+                    .get("ts")
                     .or_else(|| val.get("timestamp"))
                     .and_then(|v| v.as_str());
-                
-                let event_type = val.get("event_type")
+
+                let event_type = val
+                    .get("event_type")
                     .or_else(|| val.get("type"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                
+
                 // 2. Filter for App Switches
-                if (event_type == "app_switch" || event_type == "system.open") && timestamp_str.is_some() {
-                     let app_name = val.get("payload").or_else(|| val.get("data"))
+                if (event_type == "app_switch" || event_type == "system.open")
+                    && timestamp_str.is_some()
+                {
+                    let app_name = val
+                        .get("payload")
+                        .or_else(|| val.get("data"))
                         .and_then(|p| p.get("app"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
 
-                     if !app_name.is_empty() {
-                         if let Ok(dt) = DateTime::parse_from_rfc3339(timestamp_str.unwrap()) {
-                             let dt_utc: DateTime<Utc> = dt.with_timezone(&Utc);
-                             let weekday = dt_utc.weekday().num_days_from_monday(); // 0=Mon
-                             let hour = dt_utc.hour();
+                    if !app_name.is_empty() {
+                        if let Ok(dt) = DateTime::parse_from_rfc3339(timestamp_str.unwrap()) {
+                            let dt_utc: DateTime<Utc> = dt.with_timezone(&Utc);
+                            let weekday = dt_utc.weekday().num_days_from_monday(); // 0=Mon
+                            let hour = dt_utc.hour();
 
-                             let key = (app_name.to_string(), weekday, hour);
-                             let entry = time_map.entry(key).or_insert((0, vec![]));
-                             entry.0 += 1;
-                             if entry.1.len() < 3 { entry.1.push(event_str.clone()); }
-                         }
-                     }
+                            let key = (app_name.to_string(), weekday, hour);
+                            let entry = time_map.entry(key).or_insert((0, vec![]));
+                            entry.0 += 1;
+                            if entry.1.len() < 3 {
+                                entry.1.push(event_str.clone());
+                            }
+                        }
+                    }
                 }
             }
         }
 
         // 3. Generate Patterns
-        time_map.into_iter()
+        time_map
+            .into_iter()
             .filter(|(_, (count, _))| *count >= self.config.min_occurrences) // Threshold
             .map(|((app, weekday, hour), (count, samples))| {
                 let day_str = match weekday {
-                    0 => "Monday", 1 => "Tuesday", 2 => "Wednesday", 3 => "Thursday",
-                    4 => "Friday", 5 => "Saturday", 6 => "Sunday", _ => "Day"
+                    0 => "Monday",
+                    1 => "Tuesday",
+                    2 => "Wednesday",
+                    3 => "Thursday",
+                    4 => "Friday",
+                    5 => "Saturday",
+                    6 => "Sunday",
+                    _ => "Day",
                 };
 
-                let description = format!("Weekly routine: Uses {} on {}s around {}:00", app, day_str, hour);
-                let pattern_id = self.stable_pattern_id(&PatternType::TimeBasedAction, &description);
-                
+                let description = format!(
+                    "Weekly routine: Uses {} on {}s around {}:00",
+                    app, day_str, hour
+                );
+                let pattern_id =
+                    self.stable_pattern_id(&PatternType::TimeBasedAction, &description);
+
                 DetectedPattern {
                     pattern_id,
                     pattern_type: PatternType::TimeBasedAction,
@@ -361,11 +417,15 @@ impl PatternDetector {
 
     /// Check if a pattern should generate a recommendation
     pub fn cosine_similarity(v1: &[f32], v2: &[f32]) -> f32 {
-        if v1.len() != v2.len() { return 0.0; }
+        if v1.len() != v2.len() {
+            return 0.0;
+        }
         let dot_product: f32 = v1.iter().zip(v2.iter()).map(|(a, b)| a * b).sum();
         let norm_a: f32 = v1.iter().map(|x| x * x).sum::<f32>().sqrt();
         let norm_b: f32 = v2.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm_a == 0.0 || norm_b == 0.0 { return 0.0; }
+        if norm_a == 0.0 || norm_b == 0.0 {
+            return 0.0;
+        }
         dot_product / (norm_a * norm_b)
     }
 
@@ -376,23 +436,28 @@ impl PatternDetector {
             Ok(e) => e,
             Err(_) => return Vec::new(),
         };
-        
+
         // 1. First get standard string-based patterns
         let patterns = self.analyze_with_events(&events);
-        
+
         // 2. Enhance with semantic clustering if LLM is available
         if self.llm_client.is_some() {
-             return self.merge_similar_patterns(patterns).await;
+            return self.merge_similar_patterns(patterns).await;
         }
-        
+
         patterns
     }
 
     /// Merge patterns that are semantically similar (e.g. "Open Chrome" vs "Launch Chrome")
-    pub async fn merge_similar_patterns(&self, patterns: Vec<DetectedPattern>) -> Vec<DetectedPattern> {
-        if self.llm_client.is_none() { return patterns; }
+    pub async fn merge_similar_patterns(
+        &self,
+        patterns: Vec<DetectedPattern>,
+    ) -> Vec<DetectedPattern> {
+        if self.llm_client.is_none() {
+            return patterns;
+        }
         let client = self.llm_client.as_ref().unwrap();
-        
+
         let mut final_patterns = Vec::new();
         let mut handled_indices = std::collections::HashSet::new();
 
@@ -407,20 +472,27 @@ impl PatternDetector {
         }
 
         for i in 0..patterns.len() {
-            if handled_indices.contains(&i) { continue; }
+            if handled_indices.contains(&i) {
+                continue;
+            }
             let mut current_group = patterns[i].clone();
             handled_indices.insert(i);
-            
+
             if let Some(emb_i) = &embeddings[i] {
                 for j in (i + 1)..patterns.len() {
-                    if handled_indices.contains(&j) { continue; }
-                    
+                    if handled_indices.contains(&j) {
+                        continue;
+                    }
+
                     if let Some(emb_j) = &embeddings[j] {
                         let sim = Self::cosine_similarity(emb_i, emb_j);
-                        if sim > 0.92 { // High similarity threshold
+                        if sim > 0.92 {
+                            // High similarity threshold
                             // Merge j into i
                             current_group.occurrences += patterns[j].occurrences;
-                            current_group.sample_events.extend(patterns[j].sample_events.clone());
+                            current_group
+                                .sample_events
+                                .extend(patterns[j].sample_events.clone());
                             // Keep description of the most frequent one
                             handled_indices.insert(j);
                         }
@@ -432,7 +504,7 @@ impl PatternDetector {
 
         final_patterns
     }
-    
+
     pub fn should_recommend(&self, pattern: &DetectedPattern) -> bool {
         pattern.occurrences >= self.config.min_occurrences
             && pattern.similarity_score >= self.config.min_similarity
@@ -462,7 +534,7 @@ mod tests {
         ];
 
         let patterns = detector.analyze_with_events(&events);
-        
+
         assert_eq!(patterns.len(), 1);
         let p = &patterns[0];
         assert_eq!(p.pattern_type, PatternType::AppSequence);
@@ -483,9 +555,12 @@ mod tests {
         ];
 
         let patterns = detector.analyze_with_events(&events);
-        
+
         assert!(!patterns.is_empty());
-        let p = patterns.iter().find(|p| p.description.contains("invoice")).expect("Pattern not found in test");
+        let p = patterns
+            .iter()
+            .find(|p| p.description.contains("invoice"))
+            .expect("Pattern not found in test");
         assert_eq!(p.occurrences, 5);
         assert_eq!(p.pattern_type, PatternType::KeywordRepeat);
     }
@@ -500,7 +575,7 @@ mod tests {
         ];
 
         let patterns = detector.analyze_with_events(&events);
-        
+
         assert_eq!(patterns.len(), 1);
         let p = &patterns[0];
         assert_eq!(p.pattern_type, PatternType::FilePattern);
@@ -512,14 +587,18 @@ mod tests {
         let detector = PatternDetector::new();
         // Simulate 3 events on Monday (Day 0) at 9:00 AM
         let events = vec![
-            json!({"type": "app_switch", "ts": "2023-10-02T09:00:00Z", "data": {"app": "Slack"}}).to_string(), // Mon
-            json!({"type": "app_switch", "ts": "2023-10-09T09:15:00Z", "data": {"app": "Slack"}}).to_string(), // Mon
-            json!({"type": "app_switch", "ts": "2023-10-16T09:05:00Z", "data": {"app": "Slack"}}).to_string(), // Mon
-            json!({"type": "app_switch", "ts": "2023-10-02T10:00:00Z", "data": {"app": "Chrome"}}).to_string(),
+            json!({"type": "app_switch", "ts": "2023-10-02T09:00:00Z", "data": {"app": "Slack"}})
+                .to_string(), // Mon
+            json!({"type": "app_switch", "ts": "2023-10-09T09:15:00Z", "data": {"app": "Slack"}})
+                .to_string(), // Mon
+            json!({"type": "app_switch", "ts": "2023-10-16T09:05:00Z", "data": {"app": "Slack"}})
+                .to_string(), // Mon
+            json!({"type": "app_switch", "ts": "2023-10-02T10:00:00Z", "data": {"app": "Chrome"}})
+                .to_string(),
         ];
 
         let patterns = detector.detect_time_patterns(&events);
-        
+
         // Should find 1 pattern: Slack on Mondays ~9AM
         assert_eq!(patterns.len(), 1);
         let p = &patterns[0];

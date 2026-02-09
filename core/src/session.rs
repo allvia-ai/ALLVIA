@@ -42,7 +42,7 @@ impl Sessionizer {
 
         for event in events {
             let ts = parse_iso(&event.ts).unwrap_or(0);
-            
+
             // Gap Check
             if let Some(last) = last_ts_val {
                 if ts - last >= self.gap_seconds {
@@ -55,12 +55,12 @@ impl Sessionizer {
 
             // Idle Check (Break session on idle)
             if event.event_type == "os.idle_start" {
-                 if !current_chunk.is_empty() {
-                        sessions.push(self.build_session(&current_chunk));
-                        current_chunk.clear();
-                 }
-                 last_ts_val = None; // Reset
-                 continue;
+                if !current_chunk.is_empty() {
+                    sessions.push(self.build_session(&current_chunk));
+                    current_chunk.clear();
+                }
+                last_ts_val = None; // Reset
+                continue;
             }
 
             current_chunk.push(event);
@@ -76,9 +76,13 @@ impl Sessionizer {
     }
 
     fn build_session(&self, chunk: &[&EventEnvelope]) -> SessionRecord {
-        let start = chunk.first().expect("Chunk is explicitly checked to be non-empty");
-        let end = chunk.last().expect("Chunk is explicitly checked to be non-empty");
-        
+        let start = chunk
+            .first()
+            .expect("Chunk is explicitly checked to be non-empty");
+        let end = chunk
+            .last()
+            .expect("Chunk is explicitly checked to be non-empty");
+
         let start_ts = parse_iso(&start.ts).unwrap_or(0);
         let end_ts = parse_iso(&end.ts).unwrap_or(0);
         let duration = end_ts - start_ts;
@@ -93,7 +97,7 @@ impl Sessionizer {
         for event in chunk {
             let curr_ts = parse_iso(&event.ts).unwrap_or(0);
             let delta = curr_ts - last_event_ts;
-            
+
             // Attribute delta to previous app
             *app_durations.entry(last_app.clone()).or_insert(0) += delta;
 
@@ -102,7 +106,9 @@ impl Sessionizer {
 
             // Key events (minimal, explainable signals)
             if event.event_type == "app_switch" || event.event_type == "system.open" {
-                let app = event.payload.get("app")
+                let app = event
+                    .payload
+                    .get("app")
                     .and_then(|v| v.as_str())
                     .unwrap_or(&event.app);
                 if !app.is_empty() {
@@ -133,7 +139,8 @@ impl Sessionizer {
         }
 
         // Find top app
-        let top_app = app_durations.iter()
+        let top_app = app_durations
+            .iter()
             .max_by_key(|entry| entry.1)
             .map(|(k, _)| k.clone())
             .unwrap_or_else(|| "unknown".to_string());
@@ -150,13 +157,15 @@ impl Sessionizer {
                 key_events: to_sorted_vec(key_events),
                 resources: to_sorted_vec(resources),
                 domains: to_sorted_vec(domains),
-            }
+            },
         }
     }
 }
 
 fn parse_iso(iso: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(iso).ok().map(|dt| dt.timestamp())
+    chrono::DateTime::parse_from_rfc3339(iso)
+        .ok()
+        .map(|dt| dt.timestamp())
 }
 
 fn to_sorted_vec(values: HashSet<String>) -> Vec<String> {

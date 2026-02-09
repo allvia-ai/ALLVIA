@@ -1,6 +1,6 @@
 use crate::nl_automation::{IntentResult, IntentType, SlotMap};
-use regex::Regex;
 use chrono::{Datelike, Duration, Local, Weekday};
+use regex::Regex;
 
 pub fn classify_intent(text: &str) -> IntentResult {
     let lower = text.to_lowercase();
@@ -9,16 +9,48 @@ pub fn classify_intent(text: &str) -> IntentResult {
     let mut slots = SlotMap::new();
 
     let route_hint = parse_route(text).is_some();
-    if route_hint || contains_any(&lower, &["flight", "air", "항공", "비행기", "호텔", "숙박", "항공권", "항공편", "편도", "왕복", "출발", "도착"]) {
+    if route_hint
+        || contains_any(
+            &lower,
+            &[
+                "flight",
+                "air",
+                "항공",
+                "비행기",
+                "호텔",
+                "숙박",
+                "항공권",
+                "항공편",
+                "편도",
+                "왕복",
+                "출발",
+                "도착",
+            ],
+        )
+    {
         intent = IntentType::FlightSearch;
         confidence = 0.65;
         slots = extract_flight_slots(text);
-    } else if contains_any(&lower, &["shopping", "price", "최저가", "가격", "쇼핑", "구매", "상품"])
-        || looks_like_product(&lower) {
+    } else if contains_any(
+        &lower,
+        &[
+            "shopping",
+            "price",
+            "최저가",
+            "가격",
+            "쇼핑",
+            "구매",
+            "상품",
+        ],
+    ) || looks_like_product(&lower)
+    {
         intent = IntentType::ShoppingCompare;
         confidence = 0.6;
         slots = extract_shopping_slots(text);
-    } else if contains_any(&lower, &["form", "가입", "신청", "작성", "폼", "입력", "예약"]) {
+    } else if contains_any(
+        &lower,
+        &["form", "가입", "신청", "작성", "폼", "입력", "예약"],
+    ) {
         intent = IntentType::FormFill;
         confidence = 0.55;
         slots = extract_form_slots(text);
@@ -37,16 +69,24 @@ fn contains_any(text: &str, keywords: &[&str]) -> bool {
 
 fn looks_like_product(text: &str) -> bool {
     let product_keywords = [
-        "아이폰", "에어팟", "갤럭시", "맥북", "아이패드", "노트북", "청소기",
-        "프로", "울트라", "맥스", "미니", "에디션",
+        "아이폰",
+        "에어팟",
+        "갤럭시",
+        "맥북",
+        "아이패드",
+        "노트북",
+        "청소기",
+        "프로",
+        "울트라",
+        "맥스",
+        "미니",
+        "에디션",
     ];
     if contains_any(text, &product_keywords) {
         return true;
     }
     let model_regex = Regex::new(r"(?i)\b\d+\s*(gb|tb|세대|gen)\b").ok();
-    model_regex
-        .and_then(|re| re.find(text))
-        .is_some()
+    model_regex.and_then(|re| re.find(text)).is_some()
 }
 
 fn extract_flight_slots(text: &str) -> SlotMap {
@@ -169,7 +209,14 @@ fn normalize_place(value: &str) -> String {
         cleaned = cleaned[..idx].to_string();
     }
     let lowered = cleaned.to_lowercase();
-    let en_tokens = ["round trip", "one way", "flight", "flights", "ticket", "search"];
+    let en_tokens = [
+        "round trip",
+        "one way",
+        "flight",
+        "flights",
+        "ticket",
+        "search",
+    ];
     for token in en_tokens {
         if let Some(idx) = lowered.find(token) {
             cleaned = cleaned[..idx].to_string();
@@ -205,8 +252,7 @@ fn normalize_place(value: &str) -> String {
 fn is_noise_token(token: &str) -> bool {
     matches!(
         token,
-        "일"
-            | "월"
+        "일" | "월"
             | "년"
             | "오늘"
             | "내일"
@@ -252,14 +298,23 @@ fn parse_date(text: &str) -> Option<String> {
 }
 
 fn parse_relative_weekday(text: &str) -> Option<String> {
-    let weekday = if text.contains("월요일") { Weekday::Mon }
-        else if text.contains("화요일") { Weekday::Tue }
-        else if text.contains("수요일") { Weekday::Wed }
-        else if text.contains("목요일") { Weekday::Thu }
-        else if text.contains("금요일") { Weekday::Fri }
-        else if text.contains("토요일") { Weekday::Sat }
-        else if text.contains("일요일") { Weekday::Sun }
-        else { return None };
+    let weekday = if text.contains("월요일") {
+        Weekday::Mon
+    } else if text.contains("화요일") {
+        Weekday::Tue
+    } else if text.contains("수요일") {
+        Weekday::Wed
+    } else if text.contains("목요일") {
+        Weekday::Thu
+    } else if text.contains("금요일") {
+        Weekday::Fri
+    } else if text.contains("토요일") {
+        Weekday::Sat
+    } else if text.contains("일요일") {
+        Weekday::Sun
+    } else {
+        return None;
+    };
 
     let today = Local::now().date_naive();
     let today_wd = today.weekday().num_days_from_monday() as i64;
@@ -281,7 +336,11 @@ fn parse_budget(text: &str) -> Option<String> {
         let raw = caps.get(1)?.as_str().replace(',', "");
         let unit = caps.get(2)?.as_str();
         let amount: i64 = raw.parse().ok()?;
-        let total = if unit == "만원" { amount * 10_000 } else { amount };
+        let total = if unit == "만원" {
+            amount * 10_000
+        } else {
+            amount
+        };
         return Some(total.to_string());
     }
     let usd_regex = Regex::new(r"\$(\d+)").ok()?;

@@ -20,7 +20,11 @@ impl ToolPolicy {
             return false;
         }
 
-        if self.deny.iter().any(|pattern| matches_pattern(pattern, &tool)) {
+        if self
+            .deny
+            .iter()
+            .any(|pattern| matches_pattern(pattern, &tool))
+        {
             return false;
         }
 
@@ -28,7 +32,9 @@ impl ToolPolicy {
             return true;
         }
 
-        self.allow.iter().any(|pattern| matches_pattern(pattern, &tool))
+        self.allow
+            .iter()
+            .any(|pattern| matches_pattern(pattern, &tool))
     }
 }
 

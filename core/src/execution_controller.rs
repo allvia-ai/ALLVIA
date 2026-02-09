@@ -1,8 +1,8 @@
-use crate::nl_automation::{ApprovalContext, ExecutionResult, Plan, StepType};
 use crate::approval_gate;
+use crate::nl_automation::{ApprovalContext, ExecutionResult, Plan, StepType};
 
-use crate::visual_driver::{SmartStep, UiAction, VisualDriver};
 use crate::browser_automation;
+use crate::visual_driver::{SmartStep, UiAction, VisualDriver};
 use serde_json::Value;
 
 pub async fn execute_plan(plan: &Plan, start_index: usize) -> ExecutionResult {
@@ -14,11 +14,20 @@ pub async fn execute_plan(plan: &Plan, start_index: usize) -> ExecutionResult {
     let mut approval_context: Option<ApprovalContext> = None;
     let mut resume_from: Option<usize> = None;
 
-    logs.push(format!("Start plan {} ({})", plan.plan_id, plan.intent.as_str()));
+    logs.push(format!(
+        "Start plan {} ({})",
+        plan.plan_id,
+        plan.intent.as_str()
+    ));
     logs.push(summary_for_plan(plan));
 
     for (idx, step) in plan.steps.iter().enumerate().skip(start_index) {
-        logs.push(format!("Step {}: {} ({:?})", idx + 1, step.description, step.step_type));
+        logs.push(format!(
+            "Step {}: {} ({:?})",
+            idx + 1,
+            step.description,
+            step.step_type
+        ));
         match step.step_type {
             StepType::Navigate => {
                 if let Some(url) = step.data.get("url").and_then(|v| v.as_str()) {
@@ -39,7 +48,11 @@ pub async fn execute_plan(plan: &Plan, start_index: usize) -> ExecutionResult {
                 }
             }
             StepType::Wait => {
-                let seconds = step.data.get("seconds").and_then(|v| v.as_u64()).unwrap_or(1);
+                let seconds = step
+                    .data
+                    .get("seconds")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1);
                 tokio::time::sleep(tokio::time::Duration::from_secs(seconds)).await;
             }
             StepType::Select => {
@@ -53,7 +66,11 @@ pub async fn execute_plan(plan: &Plan, start_index: usize) -> ExecutionResult {
                                 logs.push("No flight filters to apply".to_string());
                                 continue;
                             }
-                            browser_automation::apply_flight_filters(budget, time_window, direct_only)
+                            browser_automation::apply_flight_filters(
+                                budget,
+                                time_window,
+                                direct_only,
+                            )
                         }
                         crate::nl_automation::IntentType::ShoppingCompare => {
                             let brand = step.data.get("brand").and_then(|v| v.as_str());
@@ -73,7 +90,10 @@ pub async fn execute_plan(plan: &Plan, start_index: usize) -> ExecutionResult {
                         Ok(false) => {
                             manual_required = true;
                             manual_steps.push(step.description.clone());
-                            logs.push(format!("Manual filters required for step '{}'", step.description));
+                            logs.push(format!(
+                                "Manual filters required for step '{}'",
+                                step.description
+                            ));
                         }
                         Err(err) => {
                             manual_required = true;
@@ -84,7 +104,10 @@ pub async fn execute_plan(plan: &Plan, start_index: usize) -> ExecutionResult {
                 } else {
                     manual_required = true;
                     manual_steps.push(step.description.clone());
-                    logs.push(format!("Manual filters required for step '{}'", step.description));
+                    logs.push(format!(
+                        "Manual filters required for step '{}'",
+                        step.description
+                    ));
                 }
             }
             StepType::Fill | StepType::Click => {
@@ -100,28 +123,33 @@ pub async fn execute_plan(plan: &Plan, start_index: usize) -> ExecutionResult {
                                         break;
                                     }
                                     Ok(false) => {
-                                        logs.push(format!("Search button not found (attempt {})", attempt + 1));
+                                        logs.push(format!(
+                                            "Search button not found (attempt {})",
+                                            attempt + 1
+                                        ));
                                         if attempt == 0 {
                                             let _ = browser_automation::scroll_page(600);
-                                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                                            tokio::time::sleep(tokio::time::Duration::from_secs(1))
+                                                .await;
                                         }
                                     }
                                     Err(err) => {
                                         logs.push(format!("Search click failed: {}", err));
                                         if attempt == 0 {
                                             let _ = browser_automation::scroll_page(600);
-                                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                                            tokio::time::sleep(tokio::time::Duration::from_secs(1))
+                                                .await;
                                         }
                                     }
                                 }
                             }
-                        if !clicked {
-                            if let Ok(ctx) = browser_automation::get_page_context() {
-                                logs.push(format!("Page context: {}", ctx));
+                            if !clicked {
+                                if let Ok(ctx) = browser_automation::get_page_context() {
+                                    logs.push(format!("Page context: {}", ctx));
+                                }
+                                manual_required = true;
+                                manual_steps.push(step.description.clone());
                             }
-                            manual_required = true;
-                            manual_steps.push(step.description.clone());
-                        }
                             continue;
                         }
                     }
@@ -135,17 +163,27 @@ pub async fn execute_plan(plan: &Plan, start_index: usize) -> ExecutionResult {
                                     break;
                                 }
                                 Ok(false) => {
-                                    logs.push(format!("Auto fill skipped (no match) for {} (attempt {})", field, attempt + 1));
+                                    logs.push(format!(
+                                        "Auto fill skipped (no match) for {} (attempt {})",
+                                        field,
+                                        attempt + 1
+                                    ));
                                     if attempt == 0 {
                                         let _ = browser_automation::scroll_page(400);
-                                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                                        tokio::time::sleep(tokio::time::Duration::from_secs(1))
+                                            .await;
                                     }
                                 }
                                 Err(err) => {
-                                    logs.push(format!("Auto fill failed: {} (attempt {})", err, attempt + 1));
+                                    logs.push(format!(
+                                        "Auto fill failed: {} (attempt {})",
+                                        err,
+                                        attempt + 1
+                                    ));
                                     if attempt == 0 {
                                         let _ = browser_automation::scroll_page(400);
-                                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                                        tokio::time::sleep(tokio::time::Duration::from_secs(1))
+                                            .await;
                                     }
                                 }
                             }
@@ -161,7 +199,10 @@ pub async fn execute_plan(plan: &Plan, start_index: usize) -> ExecutionResult {
                     }
                     if let Some(value) = step.data.get("value").and_then(|v| v.as_str()) {
                         let mut driver = VisualDriver::new();
-                        driver.add_step(SmartStep::new(UiAction::Type(value.to_string()), "Type value"));
+                        driver.add_step(SmartStep::new(
+                            UiAction::Type(value.to_string()),
+                            "Type value",
+                        ));
                         if let Err(err) = driver.execute(None).await {
                             logs.push(format!("Auto input failed: {}", err));
                             manual_required = true;
@@ -171,7 +212,10 @@ pub async fn execute_plan(plan: &Plan, start_index: usize) -> ExecutionResult {
                         }
                     } else if let Some(query) = step.data.get("query").and_then(|v| v.as_str()) {
                         let mut driver = VisualDriver::new();
-                        driver.add_step(SmartStep::new(UiAction::Type(query.to_string()), "Type query"));
+                        driver.add_step(SmartStep::new(
+                            UiAction::Type(query.to_string()),
+                            "Type query",
+                        ));
                         if let Err(err) = driver.execute(None).await {
                             logs.push(format!("Auto input failed: {}", err));
                             manual_required = true;
@@ -182,12 +226,18 @@ pub async fn execute_plan(plan: &Plan, start_index: usize) -> ExecutionResult {
                     } else {
                         manual_required = true;
                         manual_steps.push(step.description.clone());
-                        logs.push(format!("Manual input required for step '{}'", step.description));
+                        logs.push(format!(
+                            "Manual input required for step '{}'",
+                            step.description
+                        ));
                     }
                 } else {
                     manual_required = true;
                     manual_steps.push(step.description.clone());
-                    logs.push(format!("Manual input required for step '{}'", step.description));
+                    logs.push(format!(
+                        "Manual input required for step '{}'",
+                        step.description
+                    ));
                 }
             }
             StepType::Approve => {
@@ -285,12 +335,20 @@ fn try_browser_autofill(plan: &Plan, field: &str) -> anyhow::Result<bool> {
             }
             let from = plan.slots.get("from").map(|v| v.as_str()).unwrap_or("");
             let to = plan.slots.get("to").map(|v| v.as_str()).unwrap_or("");
-            let date_start = plan.slots.get("date_start").map(|v| v.as_str()).unwrap_or("");
+            let date_start = plan
+                .slots
+                .get("date_start")
+                .map(|v| v.as_str())
+                .unwrap_or("");
             let date_end = plan.slots.get("date_end").map(|v| v.as_str());
             browser_automation::fill_flight_fields(from, to, date_start, date_end)
         }
         crate::nl_automation::IntentType::ShoppingCompare => {
-            let query = plan.slots.get("product_name").map(|v| v.as_str()).unwrap_or("");
+            let query = plan
+                .slots
+                .get("product_name")
+                .map(|v| v.as_str())
+                .unwrap_or("");
             browser_automation::fill_search_query(query)
         }
         crate::nl_automation::IntentType::FormFill => {
@@ -332,19 +390,46 @@ fn summary_for_plan(plan: &Plan) -> String {
     let slots = &plan.slots;
     match plan.intent {
         crate::nl_automation::IntentType::FlightSearch => {
-            let from = slots.get("from").cloned().unwrap_or_else(|| "unknown".to_string());
-            let to = slots.get("to").cloned().unwrap_or_else(|| "unknown".to_string());
-            let date = slots.get("date_start").cloned().unwrap_or_else(|| "unknown".to_string());
-            let budget = slots.get("budget_max").cloned().unwrap_or_else(|| "no budget".to_string());
-            format!("Summary: search flights {} → {} on {} (budget {})", from, to, date, budget)
+            let from = slots
+                .get("from")
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+            let to = slots
+                .get("to")
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+            let date = slots
+                .get("date_start")
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+            let budget = slots
+                .get("budget_max")
+                .cloned()
+                .unwrap_or_else(|| "no budget".to_string());
+            format!(
+                "Summary: search flights {} → {} on {} (budget {})",
+                from, to, date, budget
+            )
         }
         crate::nl_automation::IntentType::ShoppingCompare => {
-            let product = slots.get("product_name").cloned().unwrap_or_else(|| "unknown".to_string());
-            let max_price = slots.get("price_max").cloned().unwrap_or_else(|| "no max".to_string());
-            format!("Summary: compare prices for {} (max {})", product, max_price)
+            let product = slots
+                .get("product_name")
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+            let max_price = slots
+                .get("price_max")
+                .cloned()
+                .unwrap_or_else(|| "no max".to_string());
+            format!(
+                "Summary: compare prices for {} (max {})",
+                product, max_price
+            )
         }
         crate::nl_automation::IntentType::FormFill => {
-            let purpose = slots.get("form_purpose").cloned().unwrap_or_else(|| "unknown".to_string());
+            let purpose = slots
+                .get("form_purpose")
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
             format!("Summary: fill form for {}", purpose)
         }
         crate::nl_automation::IntentType::GenericTask => "Summary: need more details".to_string(),

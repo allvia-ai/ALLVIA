@@ -1,19 +1,19 @@
 //! Advanced Bash Executor - Clawdbot-style shell execution
-//! 
+//!
 //! Ported from: clawdbot-main/src/agents/bash-tools.exec.ts
-//! 
+//!
 //! Features:
 //! - PTY-like interactive shell support
 //! - Background process tracking
 //! - Approval workflow integration
 //! - Process registry for long-running commands
 
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::process::{Command, Stdio, Child};
+use std::io::Write;
+use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use std::io::{BufRead, BufReader, Write};
 
 // =====================================================
 // PROCESS REGISTRY (from bash-process-registry.ts)
@@ -53,7 +53,7 @@ pub fn register_process(id: &str, pid: u32, command: &str) {
         output: Vec::new(),
         exit_code: None,
     };
-    
+
     if let Ok(mut registry) = PROCESS_REGISTRY.lock() {
         registry.insert(id.to_string(), info);
         println!("📋 [Process] Registered: {} (PID {})", id, pid);
@@ -61,7 +61,12 @@ pub fn register_process(id: &str, pid: u32, command: &str) {
 }
 
 /// Update process status
-pub fn update_process(id: &str, status: ProcessStatus, exit_code: Option<i32>, output: Option<Vec<String>>) {
+pub fn update_process(
+    id: &str,
+    status: ProcessStatus,
+    exit_code: Option<i32>,
+    output: Option<Vec<String>>,
+) {
     if let Ok(mut registry) = PROCESS_REGISTRY.lock() {
         if let Some(info) = registry.get_mut(id) {
             info.status = status;
@@ -80,24 +85,27 @@ pub fn get_process(id: &str) -> Option<ProcessInfo> {
 
 /// List all active processes
 pub fn list_active_processes() -> Vec<ProcessInfo> {
-    PROCESS_REGISTRY.lock()
+    PROCESS_REGISTRY
+        .lock()
         .ok()
-        .map(|r| r.values()
-            .filter(|p| p.status == ProcessStatus::Running)
-            .cloned()
-            .collect())
+        .map(|r| {
+            r.values()
+                .filter(|p| p.status == ProcessStatus::Running)
+                .cloned()
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 /// Kill a process by ID
 pub fn kill_process(id: &str) -> Result<bool> {
     let info = get_process(id).ok_or_else(|| anyhow::anyhow!("Process not found"))?;
-    
+
     // Send SIGTERM
     let kill_result = Command::new("kill")
         .args(["-15", &info.pid.to_string()])
         .status()?;
-    
+
     if kill_result.success() {
         update_process(id, ProcessStatus::Killed, None, None);
         println!("🔪 [Process] Killed: {} (PID {})", id, info.pid);
@@ -145,9 +153,9 @@ pub struct BashExecResult {
 /// Execute a bash command with advanced options
 pub fn execute_bash(cmd: &str, config: &BashExecConfig) -> Result<BashExecResult> {
     use crate::approval_gate::{ApprovalGate, ApprovalLevel};
-    
+
     let start = Instant::now();
-    
+
     // Check approval
     if config.approval_required {
         match ApprovalGate::check_command(cmd) {
@@ -169,36 +177,37 @@ pub fn execute_bash(cmd: &str, config: &BashExecConfig) -> Result<BashExecResult
             ApprovalLevel::AutoApprove => {}
         }
     }
-    
+
     // Background execution
     if config.background {
         return execute_background(cmd, config);
     }
-    
+
     // Foreground execution with timeout
     let mut command = Command::new("/bin/bash");
     command.arg("-c").arg(cmd);
-    
+
     if let Some(dir) = &config.working_dir {
         command.current_dir(dir);
     }
-    
+
     for (key, value) in &config.env_vars {
         command.env(key, value);
     }
-    
+
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    
-    let child = command.spawn()
+
+    let child = command
+        .spawn()
         .context(format!("Failed to spawn command: {}", cmd))?;
-    
+
     // Wait with timeout
     let output = wait_with_timeout(child, Duration::from_millis(config.timeout_ms))
         .context("Command execution failed")?;
-    
+
     let duration = start.elapsed().as_millis() as u64;
-    
+
     Ok(BashExecResult {
         success: output.0,
         stdout: output.1,
@@ -213,22 +222,23 @@ pub fn execute_bash(cmd: &str, config: &BashExecConfig) -> Result<BashExecResult
 fn execute_background(cmd: &str, config: &BashExecConfig) -> Result<BashExecResult> {
     let mut command = Command::new("/bin/bash");
     command.arg("-c").arg(cmd);
-    
+
     if let Some(dir) = &config.working_dir {
         command.current_dir(dir);
     }
-    
+
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    
-    let child = command.spawn()
+
+    let child = command
+        .spawn()
         .context(format!("Failed to spawn background command: {}", cmd))?;
-    
+
     let pid = child.id();
     let process_id = format!("bg_{}", uuid::Uuid::new_v4().to_string()[..8].to_string());
-    
+
     register_process(&process_id, pid, cmd);
-    
+
     // Spawn a thread to wait for completion
     let proc_id = process_id.clone();
     std::thread::spawn(move || {
@@ -251,7 +261,7 @@ fn execute_background(cmd: &str, config: &BashExecConfig) -> Result<BashExecResu
             }
         }
     });
-    
+
     Ok(BashExecResult {
         success: true,
         stdout: format!("Background process started: {}", process_id),
@@ -263,17 +273,17 @@ fn execute_background(cmd: &str, config: &BashExecConfig) -> Result<BashExecResu
 }
 
 /// Wait for child process with timeout
-fn wait_with_timeout(mut child: Child, timeout: Duration) -> Result<(bool, String, String, i32)> {
-    use std::thread;
+fn wait_with_timeout(child: Child, timeout: Duration) -> Result<(bool, String, String, i32)> {
     use std::sync::mpsc;
-    
+    use std::thread;
+
     let (tx, rx) = mpsc::channel();
-    
+
     thread::spawn(move || {
         let result = child.wait_with_output();
         let _ = tx.send(result);
     });
-    
+
     match rx.recv_timeout(timeout) {
         Ok(result) => {
             let output = result?;
@@ -284,7 +294,10 @@ fn wait_with_timeout(mut child: Child, timeout: Duration) -> Result<(bool, Strin
         }
         Err(_) => {
             // Timeout - try to kill the process (but child is moved, so we can't)
-            Err(anyhow::anyhow!("Command timed out after {}ms", timeout.as_millis()))
+            Err(anyhow::anyhow!(
+                "Command timed out after {}ms",
+                timeout.as_millis()
+            ))
         }
     }
 }
@@ -308,34 +321,38 @@ impl InteractiveSession {
             .stderr(Stdio::piped())
             .spawn()
             .context("Failed to start interactive bash session")?;
-        
+
         let session_id = format!("pty_{}", uuid::Uuid::new_v4().to_string()[..8].to_string());
-        
+
         println!("🖥️ [PTY] Started interactive session: {}", session_id);
-        
+
         Ok(Self {
             child: Some(child),
             session_id,
         })
     }
-    
+
     /// Send a command to the interactive session
     pub fn send(&mut self, input: &str) -> Result<String> {
-        let child = self.child.as_mut()
+        let child = self
+            .child
+            .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Session not running"))?;
-        
-        let stdin = child.stdin.as_mut()
+
+        let stdin = child
+            .stdin
+            .as_mut()
             .ok_or_else(|| anyhow::anyhow!("No stdin available"))?;
-        
+
         writeln!(stdin, "{}", input)?;
         stdin.flush()?;
-        
+
         // Read some output (non-blocking would be better but this is a simple version)
         std::thread::sleep(Duration::from_millis(100));
-        
+
         Ok(format!("Sent: {}", input))
     }
-    
+
     /// Close the interactive session
     pub fn close(&mut self) -> Result<()> {
         if let Some(mut child) = self.child.take() {
@@ -362,9 +379,9 @@ pub fn exec(cmd: &str) -> Result<String> {
         approval_required: true,
         ..Default::default()
     };
-    
+
     let result = execute_bash(cmd, &config)?;
-    
+
     if result.success {
         Ok(result.stdout)
     } else {
@@ -379,9 +396,9 @@ pub fn exec_timeout(cmd: &str, timeout_ms: u64) -> Result<String> {
         approval_required: true,
         ..Default::default()
     };
-    
+
     let result = execute_bash(cmd, &config)?;
-    
+
     if result.success {
         Ok(result.stdout)
     } else {
@@ -396,9 +413,9 @@ pub fn exec_background(cmd: &str) -> Result<String> {
         approval_required: true,
         ..Default::default()
     };
-    
+
     let result = execute_bash(cmd, &config)?;
-    
+
     if let Some(id) = result.process_id {
         Ok(format!("Background process started: {}", id))
     } else {
@@ -413,7 +430,7 @@ pub fn exec_background(cmd: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_simple_exec() {
         let result = execute_bash("echo hello", &BashExecConfig::default());
@@ -422,7 +439,7 @@ mod tests {
         assert!(res.success);
         assert!(res.stdout.contains("hello"));
     }
-    
+
     #[test]
     fn test_process_registry() {
         register_process("test1", 12345, "sleep 100");

@@ -1,6 +1,6 @@
 use crate::nl_automation::{IntentType, Plan, PlanStep, SlotMap, StepType};
-use uuid::Uuid;
 use serde_json::json;
+use uuid::Uuid;
 
 pub fn build_plan(intent: &IntentType, slots: &SlotMap) -> Plan {
     let plan_id = Uuid::new_v4().to_string();
@@ -8,7 +8,8 @@ pub fn build_plan(intent: &IntentType, slots: &SlotMap) -> Plan {
 
     match intent {
         IntentType::FlightSearch => {
-            let url = build_flight_url(slots).unwrap_or_else(|| "https://www.google.com/travel/flights".to_string());
+            let url = build_flight_url(slots)
+                .unwrap_or_else(|| "https://www.google.com/travel/flights".to_string());
             steps.push(step(
                 StepType::Navigate,
                 "Open Google Flights",
@@ -51,7 +52,8 @@ pub fn build_plan(intent: &IntentType, slots: &SlotMap) -> Plan {
             ));
         }
         IntentType::ShoppingCompare => {
-            let url = build_shopping_url(slots).unwrap_or_else(|| "https://shopping.naver.com".to_string());
+            let url = build_shopping_url(slots)
+                .unwrap_or_else(|| "https://shopping.naver.com".to_string());
             steps.push(step(
                 StepType::Navigate,
                 "Open price comparison site",
@@ -89,7 +91,10 @@ pub fn build_plan(intent: &IntentType, slots: &SlotMap) -> Plan {
             ));
         }
         IntentType::FormFill => {
-            let url = slots.get("target_url").cloned().unwrap_or_else(|| "".to_string());
+            let url = slots
+                .get("target_url")
+                .cloned()
+                .unwrap_or_else(|| "".to_string());
             steps.push(step(
                 StepType::Navigate,
                 "Open target form",
@@ -145,7 +150,10 @@ fn build_flight_url(slots: &SlotMap) -> Option<String> {
         return None;
     }
     let query = format!("Flights from {} to {} on {}", from, to, date);
-    Some(format!("https://www.google.com/travel/flights?q={}", urlencoding::encode(&query)))
+    Some(format!(
+        "https://www.google.com/travel/flights?q={}",
+        urlencoding::encode(&query)
+    ))
 }
 
 fn build_shopping_url(slots: &SlotMap) -> Option<String> {

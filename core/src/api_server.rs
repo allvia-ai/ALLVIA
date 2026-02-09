@@ -1,18 +1,24 @@
 use axum::{
-    extract::{State, Query, Path},
-    http::{StatusCode, HeaderValue},
-    routing::{get, post},
+    extract::{Path, Query, State},
+    http::{HeaderValue, StatusCode},
     response::IntoResponse,
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::{consistency_check, db, llm_gateway, monitor, pattern_detector, feedback_collector, integrations, n8n_api, chat_sanitize, context_pruning, project_scanner, runtime_verification, quality_scorer, visual_verification, semantic_verification, performance_verification, judgment, release_gate, tool_result_guard, intent_router, slot_filler, plan_builder, execution_controller, verification_engine, approval_gate, nl_store};
-use sysinfo::System;
+use crate::{
+    approval_gate, chat_sanitize, consistency_check, context_pruning, db, execution_controller,
+    feedback_collector, integrations, intent_router, judgment, llm_gateway, monitor, n8n_api,
+    nl_store, pattern_detector, performance_verification, plan_builder, project_scanner,
+    quality_scorer, release_gate, runtime_verification, semantic_verification, slot_filler,
+    tool_result_guard, verification_engine, visual_verification,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use sysinfo::System;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -279,17 +285,19 @@ async fn auth_middleware(
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, StatusCode> {
     let api_key = std::env::var("STEER_API_KEY").unwrap_or_default();
-    
+
     // If no key configured, allow all (Localhost Dev Mode)
     if api_key.is_empty() {
         return Ok(next.run(req).await);
     }
 
     // Check Header
-    let auth_header = req.headers().get("Authorization")
+    let auth_header = req
+        .headers()
+        .get("Authorization")
         .and_then(|h| h.to_str().ok())
         .map(|s| s.replace("Bearer ", ""));
-        
+
     match auth_header {
         Some(key) if key == api_key => Ok(next.run(req).await),
         _ => Err(StatusCode::UNAUTHORIZED),
@@ -297,22 +305,36 @@ async fn auth_middleware(
 }
 
 /// Start the HTTP API server for desktop GUI
-pub async fn start_api_server(llm_client: Option<std::sync::Arc<dyn llm_gateway::LLMClient>>) -> anyhow::Result<()> {
+pub async fn start_api_server(
+    llm_client: Option<std::sync::Arc<dyn llm_gateway::LLMClient>>,
+) -> anyhow::Result<()> {
     let state = AppState {
         llm_client,
         current_goal: Arc::new(Mutex::new(None)),
     };
-    
+
     // SECURITY: Restrict CORS to localhost only (Tauri/Dev Server)
     let allowed_origins = [
-        "http://localhost:5173".parse::<HeaderValue>().expect("Invalid CORS origin"),
-        "http://localhost:5174".parse::<HeaderValue>().expect("Invalid CORS origin"),
-        "http://localhost:5680".parse::<HeaderValue>().expect("Invalid CORS origin"),
-        "tauri://localhost".parse::<HeaderValue>().expect("Invalid CORS origin"),
-        "http://127.0.0.1:5173".parse::<HeaderValue>().expect("Invalid CORS origin"),
-        "http://127.0.0.1:5174".parse::<HeaderValue>().expect("Invalid CORS origin"),
+        "http://localhost:5173"
+            .parse::<HeaderValue>()
+            .expect("Invalid CORS origin"),
+        "http://localhost:5174"
+            .parse::<HeaderValue>()
+            .expect("Invalid CORS origin"),
+        "http://localhost:5680"
+            .parse::<HeaderValue>()
+            .expect("Invalid CORS origin"),
+        "tauri://localhost"
+            .parse::<HeaderValue>()
+            .expect("Invalid CORS origin"),
+        "http://127.0.0.1:5173"
+            .parse::<HeaderValue>()
+            .expect("Invalid CORS origin"),
+        "http://127.0.0.1:5174"
+            .parse::<HeaderValue>()
+            .expect("Invalid CORS origin"),
     ];
-    
+
     let cors = CorsLayer::new()
         .allow_origin(allowed_origins)
         .allow_methods(Any)
@@ -329,34 +351,76 @@ pub async fn start_api_server(llm_client: Option<std::sync::Arc<dyn llm_gateway:
         .route("/events", post(ingest_events))
         .route("/api/chat", post(handle_chat))
         .route("/api/recommendations", get(list_recommendations))
-        .route("/api/recommendations/:id/approve", post(approve_recommendation))
-        .route("/api/recommendations/:id/reject", post(reject_recommendation))
+        .route(
+            "/api/recommendations/:id/approve",
+            post(approve_recommendation),
+        )
+        .route(
+            "/api/recommendations/:id/reject",
+            post(reject_recommendation),
+        )
         .route("/api/recommendations/:id/later", post(later_recommendation))
-        .route("/api/recommendations/:id/restore", post(restore_recommendation))
+        .route(
+            "/api/recommendations/:id/restore",
+            post(restore_recommendation),
+        )
         .route("/api/exec-approvals", get(list_exec_approvals))
-        .route("/api/exec-approvals/:id/approve", post(approve_exec_approval))
+        .route(
+            "/api/exec-approvals/:id/approve",
+            post(approve_exec_approval),
+        )
         .route("/api/exec-approvals/:id/reject", post(reject_exec_approval))
-        .route("/api/exec-allowlist", get(list_exec_allowlist).post(add_exec_allowlist))
-        .route("/api/exec-allowlist/:id", axum::routing::delete(remove_exec_allowlist))
+        .route(
+            "/api/exec-allowlist",
+            get(list_exec_allowlist).post(add_exec_allowlist),
+        )
+        .route(
+            "/api/exec-allowlist/:id",
+            axum::routing::delete(remove_exec_allowlist),
+        )
         .route("/api/exec-results", get(list_exec_results))
         .route("/api/project/scan", get(scan_project_handler))
-        .route("/api/verify/runtime", post(run_runtime_verification_handler))
+        .route(
+            "/api/verify/runtime",
+            post(run_runtime_verification_handler),
+        )
         .route("/api/verify/visual", post(run_visual_verification_handler))
-        .route("/api/verify/semantic", post(run_semantic_verification_handler))
-        .route("/api/verify/performance", post(run_performance_verification_handler))
-        .route("/api/verify/consistency", post(run_consistency_verification_handler))
+        .route(
+            "/api/verify/semantic",
+            post(run_semantic_verification_handler),
+        )
+        .route(
+            "/api/verify/performance",
+            post(run_performance_verification_handler),
+        )
+        .route(
+            "/api/verify/consistency",
+            post(run_consistency_verification_handler),
+        )
         .route("/api/verify/runs", get(list_verification_runs))
         .route("/api/judgment", post(run_judgment_handler))
         .route("/api/release/baseline", post(set_release_baseline_handler))
         .route("/api/release/gate", post(run_release_gate_handler))
-        .route("/api/exec-results/guard", post(run_exec_results_guard_handler))
+        .route(
+            "/api/exec-results/guard",
+            post(run_exec_results_guard_handler),
+        )
         .route("/api/quality/score", post(score_quality_handler))
         .route("/api/quality/latest", get(latest_quality_handler))
         .route("/api/patterns/analyze", post(analyze_patterns))
         .route("/api/quality", get(get_quality_metrics))
-        .route("/api/recommendations/metrics", get(get_recommendation_metrics))
-        .route("/api/routines", get(list_routines).post(create_routine_handler))
-        .route("/api/routines/:id", axum::routing::patch(toggle_routine_handler))
+        .route(
+            "/api/recommendations/metrics",
+            get(get_recommendation_metrics),
+        )
+        .route(
+            "/api/routines",
+            get(list_routines).post(create_routine_handler),
+        )
+        .route(
+            "/api/routines/:id",
+            axum::routing::patch(toggle_routine_handler),
+        )
         .route("/api/routine-runs", get(list_routine_runs))
         .route("/api/agent/intent", post(agent_intent_handler))
         .route("/api/agent/plan", post(agent_plan_handler))
@@ -379,7 +443,10 @@ pub async fn start_api_server(llm_client: Option<std::sync::Arc<dyn llm_gateway:
         .route("/api/context/selection", get(get_selection_context))
         // Session Management (Clawdbot-ported)
         .route("/api/sessions", get(list_sessions_handler))
-        .route("/api/sessions/:id", get(get_session_handler).delete(delete_session_handler))
+        .route(
+            "/api/sessions/:id",
+            get(get_session_handler).delete(delete_session_handler),
+        )
         .route("/api/sessions/:id/resume", post(resume_session_handler))
         .layer(axum::middleware::from_fn(auth_middleware)) // Apply Auth Middleware
         .layer(cors)
@@ -390,12 +457,14 @@ pub async fn start_api_server(llm_client: Option<std::sync::Arc<dyn llm_gateway:
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(5680);
     println!("🌐 Desktop API server running on http://localhost:{}", port);
-    
+
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
         .await
         .map_err(|e| anyhow::anyhow!("Failed to bind port {}: {}", port, e))?;
-        
-    axum::serve(listener, app).await.map_err(|e| anyhow::anyhow!("Server error: {}", e))?;
+
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| anyhow::anyhow!("Server error: {}", e))?;
     Ok(())
 }
 
@@ -448,7 +517,7 @@ async fn get_recent_logs() -> Json<Vec<LogEntry>> {
             // Sort by timestamp desc
             logs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
             Json(logs)
-        },
+        }
         Err(_) => Json(vec![]),
     }
 }
@@ -458,12 +527,13 @@ async fn get_system_health() -> Json<crate::dependency_check::SystemHealth> {
     Json(health)
 }
 
-async fn scan_project_handler(
-    Query(query): Query<ProjectScanQuery>,
-) -> Json<ProjectScanResponse> {
-    let workdir = query
-        .workdir
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().to_string_lossy().to_string());
+async fn scan_project_handler(Query(query): Query<ProjectScanQuery>) -> Json<ProjectScanResponse> {
+    let workdir = query.workdir.unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string()
+    });
     let scanner = project_scanner::ProjectScanner::new(&workdir);
     let result = scanner.scan(query.max_files);
     let project_type = scanner.get_project_type();
@@ -498,7 +568,9 @@ async fn run_runtime_verification_handler(
         "runtime",
         result.issues.is_empty(),
         &summary,
-        Some(json!({ "issues": result.issues, "backend_health": result.backend_health, "frontend_health": result.frontend_health })),
+        Some(
+            json!({ "issues": result.issues, "backend_health": result.backend_health, "frontend_health": result.frontend_health }),
+        ),
     );
     Json(result)
 }
@@ -508,29 +580,43 @@ async fn run_visual_verification_handler(
     Json(payload): Json<visual_verification::VisualVerifyRequest>,
 ) -> Json<visual_verification::VisualVerifyResult> {
     let Some(llm) = &state.llm_client else {
-        return Json(visual_verification::VisualVerifyResult { ok: false, verdicts: vec![] });
+        return Json(visual_verification::VisualVerifyResult {
+            ok: false,
+            verdicts: vec![],
+        });
     };
     match visual_verification::verify_screen(llm.as_ref(), payload).await {
         Ok(result) => {
-            let summary = if result.ok { "Visual verification passed" } else { "Visual verification failed" };
+            let summary = if result.ok {
+                "Visual verification passed"
+            } else {
+                "Visual verification failed"
+            };
             let details = json!({
                 "verdicts": result.verdicts.iter().map(|v| json!({ "prompt": v.prompt, "ok": v.ok })).collect::<Vec<_>>()
             });
             log_verification_run("visual", result.ok, summary, Some(details));
             Json(result)
         }
-        Err(_) => Json(visual_verification::VisualVerifyResult { ok: false, verdicts: vec![] }),
+        Err(_) => Json(visual_verification::VisualVerifyResult {
+            ok: false,
+            verdicts: vec![],
+        }),
     }
 }
 
 async fn run_semantic_verification_handler(
     Json(payload): Json<SemanticVerifyRequest>,
 ) -> Json<semantic_verification::SemanticVerificationResult> {
-    let workdir = payload
-        .workdir
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().to_string_lossy().to_string());
+    let workdir = payload.workdir.unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string()
+    });
     let max_files = payload.max_files.unwrap_or(200);
-    let result = semantic_verification::semantic_consistency(std::path::Path::new(&workdir), max_files);
+    let result =
+        semantic_verification::semantic_consistency(std::path::Path::new(&workdir), max_files);
     let details = json!({
         "issues": result.issues.iter().take(10).map(|i| json!({"file": i.file, "severity": i.severity, "reason": i.reason})).collect::<Vec<_>>()
     });
@@ -541,11 +627,15 @@ async fn run_semantic_verification_handler(
 async fn run_performance_verification_handler(
     Json(payload): Json<PerformanceVerifyRequest>,
 ) -> Json<performance_verification::PerformanceVerificationResult> {
-    let workdir = payload
-        .workdir
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().to_string_lossy().to_string());
+    let workdir = payload.workdir.unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string()
+    });
     let max_files = payload.max_files.unwrap_or(300);
-    let result = performance_verification::performance_baseline(std::path::Path::new(&workdir), max_files);
+    let result =
+        performance_verification::performance_baseline(std::path::Path::new(&workdir), max_files);
     let details = json!({
         "metrics": result.metrics.iter().map(|m| json!({"name": m.name, "value": m.value, "threshold": m.threshold, "ok": m.ok})).collect::<Vec<_>>()
     });
@@ -584,7 +674,11 @@ async fn run_release_gate_handler(
     Json(payload): Json<release_gate::ReleaseGateRequest>,
 ) -> Json<release_gate::ReleaseGateResult> {
     let result = release_gate::run_release_gate(payload);
-    let summary = if result.ok { "Release gate passed" } else { "Release gate failed" };
+    let summary = if result.ok {
+        "Release gate passed"
+    } else {
+        "Release gate failed"
+    };
     let details = json!({
         "regressions": result.regressions.iter().take(10).cloned().collect::<Vec<_>>(),
         "warnings": result.warnings.iter().take(10).cloned().collect::<Vec<_>>()
@@ -644,7 +738,9 @@ async fn score_quality_handler(
             .await
             {
                 Ok(score) => score,
-                Err(_) => quality_scorer::score_quality(Some(&runtime), payload.code_review.as_ref()),
+                Err(_) => {
+                    quality_scorer::score_quality(Some(&runtime), payload.code_review.as_ref())
+                }
             }
         } else {
             quality_scorer::score_quality(Some(&runtime), payload.code_review.as_ref())
@@ -686,12 +782,12 @@ async fn latest_quality_handler() -> Json<Option<QualityScoreResponse>> {
 }
 
 // Ingest Handler (Replaces Python main.py)
-async fn ingest_events(
-    Json(payload): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+async fn ingest_events(Json(payload): Json<serde_json::Value>) -> Json<serde_json::Value> {
     // 1. Normalize
     let events: Vec<crate::schema::EventEnvelope> = if let Some(arr) = payload.as_array() {
-        arr.iter().filter_map(|v| serde_json::from_value(v.clone()).ok()).collect()
+        arr.iter()
+            .filter_map(|v| serde_json::from_value(v.clone()).ok())
+            .collect()
     } else if let Ok(single) = serde_json::from_value(payload.clone()) {
         vec![single]
     } else {
@@ -699,15 +795,15 @@ async fn ingest_events(
     };
 
     let count = events.len();
-    
+
     // 2. Process & Insert
     // In a real high-perf scenario, we would push to a channel (EventBus).
     // For now, direct DB insert is fast enough for direct migration.
-    
+
     // Initialize Privacy Guard (Salt should come from env in prod)
     let salt = std::env::var("PRIVACY_SALT").unwrap_or_else(|_| "default_salt".to_string());
     let guard = crate::privacy::PrivacyGuard::new(salt);
-    
+
     let mut success = 0;
     for event in events {
         // [Privacy] Apply masking
@@ -767,14 +863,18 @@ async fn handle_chat(
 
     // 1. Intercept explicit system commands (Bypass LLM)
     if message == "analyze_patterns" || message == "패턴 분석" {
-         let results = run_analysis_internal();
-         let response_text = if results.is_empty() {
-             "🔍 분석 완료! 새로운 패턴을 찾지 못했습니다.\n(하지만 시연을 위해 데모 항목을 생성했습니다. 오른쪽을 확인하세요!)".to_string()
-         } else {
-             format!("🔍 분석 완료! {}개의 패턴을 찾았습니다:\n{}", results.len(), results.join("\n"))
-         };
+        let results = run_analysis_internal();
+        let response_text = if results.is_empty() {
+            "🔍 분석 완료! 새로운 패턴을 찾지 못했습니다.\n(하지만 시연을 위해 데모 항목을 생성했습니다. 오른쪽을 확인하세요!)".to_string()
+        } else {
+            format!(
+                "🔍 분석 완료! {}개의 패턴을 찾았습니다:\n{}",
+                results.len(),
+                results.join("\n")
+            )
+        };
 
-         return Json(ChatResponse {
+        return Json(ChatResponse {
             response: response_text,
             command: Some("analyze_patterns".to_string()),
         });
@@ -785,7 +885,8 @@ async fn handle_chat(
         match std::process::Command::new("pkill")
             .arg("-f")
             .arg("n8n")
-            .output() {
+            .output()
+        {
             Ok(_) => {
                 // Try to start n8n again
                 let _ = std::process::Command::new("npx")
@@ -795,7 +896,7 @@ async fn handle_chat(
                     response: "🔄 n8n 서버를 재시작했습니다.".to_string(),
                     command: Some("n8n_restart".to_string()),
                 });
-            },
+            }
             Err(e) => {
                 return Json(ChatResponse {
                     response: format!("❌ n8n 재시작 실패: {}", e),
@@ -807,35 +908,61 @@ async fn handle_chat(
 
     // 2. Vision Command (Explicit Only)
     // Prevent accidental capture on "screen" mention. Require explicit command.
-    if message.trim() == "/capture" || message.contains("화면 분석해줘") || message.contains("analyze screen") {
-         if let Some(llm) = &state.llm_client {
-             match crate::visual_driver::VisualDriver::capture_screen() {
-                 Ok((b64, _scale)) => {
-                     let prompt = "Describe what is on the user's screen briefly. Identify active applications and context.";
-                     match llm.analyze_screen(prompt, &b64).await {
-                         Ok(desc) => return Json(ChatResponse { response: format!("👁️ 화면 분석 결과:\n{}", desc), command: None }),
-                         Err(e) => return Json(ChatResponse { response: format!("❌ Vision API 오류: {}", e), command: None }),
-                     }
-                 },
-                 Err(e) => return Json(ChatResponse { response: format!("❌ 화면 캡처 실패: {}", e), command: None }),
-             }
-         } else {
-             return Json(ChatResponse { response: "❌ LLM 클라이언트가 초기화되지 않았습니다.".to_string(), command: None });
-         }
+    if message.trim() == "/capture"
+        || message.contains("화면 분석해줘")
+        || message.contains("analyze screen")
+    {
+        if let Some(llm) = &state.llm_client {
+            match crate::visual_driver::VisualDriver::capture_screen() {
+                Ok((b64, _scale)) => {
+                    let prompt = "Describe what is on the user's screen briefly. Identify active applications and context.";
+                    match llm.analyze_screen(prompt, &b64).await {
+                        Ok(desc) => {
+                            return Json(ChatResponse {
+                                response: format!("👁️ 화면 분석 결과:\n{}", desc),
+                                command: None,
+                            })
+                        }
+                        Err(e) => {
+                            return Json(ChatResponse {
+                                response: format!("❌ Vision API 오류: {}", e),
+                                command: None,
+                            })
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Json(ChatResponse {
+                        response: format!("❌ 화면 캡처 실패: {}", e),
+                        command: None,
+                    })
+                }
+            }
+        } else {
+            return Json(ChatResponse {
+                response: "❌ LLM 클라이언트가 초기화되지 않았습니다.".to_string(),
+                command: None,
+            });
+        }
     }
 
     // 3. Demo Vision Workflow Trigger
     if message == "demo_vision" {
         if let Some(llm) = &state.llm_client {
             let llm_clone = llm.clone(); // Clone for async task
-            
+
             tokio::spawn(async move {
                 let mut driver = crate::visual_driver::VisualDriver::new();
-                use crate::visual_driver::{UiAction, SmartStep};
-                
+                use crate::visual_driver::{SmartStep, UiAction};
+
                 // Step 1: Open Google
-                driver.add_step(SmartStep::new(UiAction::OpenUrl("https://www.google.com".to_string()), "Open Google")
-                    .with_post_check("Is the Google search homepage visible?"));
+                driver.add_step(
+                    SmartStep::new(
+                        UiAction::OpenUrl("https://www.google.com".to_string()),
+                        "Open Google",
+                    )
+                    .with_post_check("Is the Google search homepage visible?"),
+                );
 
                 // Step 2: Wait for load
                 driver.add_step(SmartStep::new(UiAction::Wait(3), "Wait for Load"));
@@ -843,40 +970,46 @@ async fn handle_chat(
                 // Step 3: Type 'Hello World'
                 // Pre-check: Ensure search bar exists
                 // Post-check: Ensure text appears
-                driver.add_step(SmartStep::new(UiAction::Type("Hello World".to_string()), "Type Search Query")
+                driver.add_step(
+                    SmartStep::new(
+                        UiAction::Type("Hello World".to_string()),
+                        "Type Search Query",
+                    )
                     .with_pre_check("Is there a search input field visible?")
-                    .with_post_check("Is the text 'Hello World' visible in the search bar?"));
-                      
+                    .with_post_check("Is the text 'Hello World' visible in the search bar?"),
+                );
+
                 if let Err(e) = driver.execute(Some(llm_clone.as_ref())).await {
                     eprintln!("❌ Vision Demo Failed: {}", e);
                 } else {
                     println!("✅ Vision Demo Completed Successfully.");
                 }
             });
-            
+
             return Json(ChatResponse { 
                 response: "🚀 Vision 검증 데모(Smart Mode)를 시작합니다.\n(Google 접속 -> [검증] -> 키 입력 -> [검증])".to_string(), 
                 command: None 
             });
         }
     }
-    
+
     if let Some(brain) = &state.llm_client {
         // [Context] Fetch recent history
-        let history = db::get_recent_chat_history(context_pruning::history_fetch_limit()).unwrap_or_default();
-        
+        let history =
+            db::get_recent_chat_history(context_pruning::history_fetch_limit()).unwrap_or_default();
+
         match brain.parse_intent_with_history(&message, &history).await {
             Ok(intent) => {
                 let command = intent["command"].as_str().unwrap_or("unknown").to_string();
                 let confidence = intent["confidence"].as_f64().unwrap_or(0.0);
-                
+
                 if confidence < 0.5 {
                     return Json(ChatResponse {
                         response: "❓ 무슨 말인지 잘 모르겠어요. 다시 말씀해주세요.".to_string(),
                         command: None,
                     });
                 }
-                
+
                 let response = match command.as_str() {
                     "analyze_patterns" => {
                          let results = run_analysis_internal();
@@ -1025,8 +1158,8 @@ async fn handle_chat(
                     "help" => "💡 사용 가능한 명령:\n• '이메일 보여줘'\n• '오늘 일정 뭐야?'\n• '매일 아침 9시 뉴스 요약해줘' (New!)".to_string(),
                     _ => format!("✅ '{}' 명령을 실행합니다.", command),
                 };
-                
-                 let final_response = ChatResponse {
+
+                let final_response = ChatResponse {
                     response: response.clone(),
                     command: Some(command),
                 };
@@ -1071,7 +1204,9 @@ struct CreateRoutineRequest {
     prompt: String,
 }
 
-async fn create_routine_handler(Json(payload): Json<CreateRoutineRequest>) -> Json<serde_json::Value> {
+async fn create_routine_handler(
+    Json(payload): Json<CreateRoutineRequest>,
+) -> Json<serde_json::Value> {
     match crate::db::create_routine(&payload.name, &payload.cron, &payload.prompt) {
         Ok(id) => Json(serde_json::json!({ "status": "ok", "id": id })),
         Err(e) => Json(serde_json::json!({ "status": "error", "message": e.to_string() })),
@@ -1121,7 +1256,7 @@ async fn list_recommendations(
                     evidence: r.evidence, // [NEW] Pass evidence
                     last_error: r.last_error,
                 })
-                .collect()
+                .collect(),
         ),
         Err(_) => Json(vec![]),
     }
@@ -1138,26 +1273,33 @@ async fn approve_recommendation(
         Ok(Some(r)) => r,
         _ => {
             eprintln!("❌ Recommendation #{} not found in DB", id);
-            return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Recommendation not found"}))));
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Recommendation not found"})),
+            ));
         }
     };
 
     let n8n_client = match n8n_api::N8nApi::from_env() {
         Ok(c) => c,
         Err(e) => {
-             return Err((
-                 StatusCode::INTERNAL_SERVER_ERROR, 
-                 Json(serde_json::json!({ "error": "n8n Client Init Failed", "details": e.to_string() }))
-             ));
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    serde_json::json!({ "error": "n8n Client Init Failed", "details": e.to_string() }),
+                ),
+            ));
         }
     };
-    
+
     // Ensure n8n is running first
     if let Err(e) = n8n_client.ensure_server_running().await {
         eprintln!("❌ Failed to start n8n: {}", e);
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "n8n Server Unavailable", "details": e.to_string() }))
+            Json(
+                serde_json::json!({ "error": "n8n Server Unavailable", "details": e.to_string() }),
+            ),
         ));
     }
 
@@ -1166,8 +1308,14 @@ async fn approve_recommendation(
     let cred_context = if credentials.is_empty() {
         "NOTE: No credentials found in n8n. Do NOT use nodes requiring authentication (like Gmail, Slack) unless you are sure.".to_string()
     } else {
-        let list = credentials.iter()
-            .map(|c| format!("- Name: '{}', ID: '{}', Type: '{}'", c.name, c.id, c.type_name))
+        let list = credentials
+            .iter()
+            .map(|c| {
+                format!(
+                    "- Name: '{}', ID: '{}', Type: '{}'",
+                    c.name, c.id, c.type_name
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
         format!("IMPORTANT: You MUST use these exact Credential IDs for authentication:\n{}\nIf a required credential is missing, do not hallucinate an ID. Use a placeholder and add a comment.", list)
@@ -1178,21 +1326,28 @@ async fn approve_recommendation(
     } else {
         // Initial Generation with Credential Context
         if let Some(llm) = &state.llm_client {
-             let full_prompt = format!("{}\n\n{}", rec.n8n_prompt, cred_context);
-             println!("🧠 Generating workflow with context: {} credentials", credentials.len());
-             
-             match llm.build_n8n_workflow(&full_prompt).await {
+            let full_prompt = format!("{}\n\n{}", rec.n8n_prompt, cred_context);
+            println!(
+                "🧠 Generating workflow with context: {} credentials",
+                credentials.len()
+            );
+
+            match llm.build_n8n_workflow(&full_prompt).await {
                 Ok(json) => json,
-                Err(e) => return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": "LLM Generation Failed", "details": e.to_string() }))
-                )),
-             }
+                Err(e) => {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(
+                            serde_json::json!({ "error": "LLM Generation Failed", "details": e.to_string() }),
+                        ),
+                    ))
+                }
+            }
         } else {
-             return Err((
-                 StatusCode::SERVICE_UNAVAILABLE,
-                 Json(serde_json::json!({ "error": "LLM Client Unavailable" }))
-             ));
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "LLM Client Unavailable" })),
+            ));
         }
     };
 
@@ -1202,14 +1357,20 @@ async fn approve_recommendation(
 
     while attempts < max_attempts {
         attempts += 1;
-        
+
         // Repair JSON if this is a retry
         if attempts > 1 {
             if let Some(llm) = &state.llm_client {
-                println!("🔧 Attempting to fix workflow JSON (Try {}/{})", attempts, max_attempts);
+                println!(
+                    "🔧 Attempting to fix workflow JSON (Try {}/{})",
+                    attempts, max_attempts
+                );
                 // Also pass credential context during fix
                 let fix_prompt = format!("{}\n\n{}", rec.n8n_prompt, cred_context);
-                match llm.fix_n8n_workflow(&fix_prompt, &current_json, &last_error).await {
+                match llm
+                    .fix_n8n_workflow(&fix_prompt, &current_json, &last_error)
+                    .await
+                {
                     Ok(fixed) => current_json = fixed,
                     Err(e) => println!("Failed to fix JSON: {}", e),
                 }
@@ -1217,24 +1378,30 @@ async fn approve_recommendation(
         }
 
         // Parse JSON to Value
-        let workflow_data: serde_json::Value = match serde_json::from_str(&current_json)
-            .or_else(|_| {
+        let workflow_data: serde_json::Value =
+            match serde_json::from_str(&current_json).or_else(|_| {
                 let cleaned = extract_json_object(&current_json);
                 serde_json::from_str(&cleaned)
             }) {
-            Ok(v) => v,
-            Err(e) => {
-                last_error = format!("Invalid JSON Syntax: {}", e);
-                continue; 
-            }
-        };
+                Ok(v) => v,
+                Err(e) => {
+                    last_error = format!("Invalid JSON Syntax: {}", e);
+                    continue;
+                }
+            };
 
         // Extract name
-        let name = workflow_data["name"].as_str().unwrap_or(&rec.title).to_string();
-        
+        let name = workflow_data["name"]
+            .as_str()
+            .unwrap_or(&rec.title)
+            .to_string();
+
         // Try create
         // SAFETY: Created as inactive (false) to prevent broken loops. User must enable manually.
-        match n8n_client.create_workflow(&name, &workflow_data, false).await {
+        match n8n_client
+            .create_workflow(&name, &workflow_data, false)
+            .await
+        {
             Ok(workflow_id) => {
                 // Success!
                 println!("✅ Workflow created successfully on attempt {}", attempts);
@@ -1246,24 +1413,27 @@ async fn approve_recommendation(
                     "id": workflow_id,
                     "message": "Workflow created successfully"
                 })));
-            },
+            }
             Err(e) => {
                 last_error = e.to_string();
                 println!("❌ Creation failed: {}", last_error);
             }
         }
     }
-    
+
     // If we get here, all attempts failed
-    let error_msg = format!("❌ All {} attempts to create workflow failed. Last Error: {}", max_attempts, last_error);
+    let error_msg = format!(
+        "❌ All {} attempts to create workflow failed. Last Error: {}",
+        max_attempts, last_error
+    );
     eprintln!("{}", error_msg);
     if let Err(db_err) = db::mark_recommendation_failed(id, &last_error) {
         eprintln!("Failed to mark recommendation as failed: {}", db_err);
     }
-    
+
     Err((
         StatusCode::BAD_GATEWAY,
-        Json(serde_json::json!({ "error": error_msg, "details": last_error }))
+        Json(serde_json::json!({ "error": error_msg, "details": last_error })),
     ))
 }
 
@@ -1276,27 +1446,21 @@ fn extract_json_object(input: &str) -> String {
     }
 }
 
-async fn reject_recommendation(
-    axum::extract::Path(id): axum::extract::Path<i64>,
-) -> StatusCode {
+async fn reject_recommendation(axum::extract::Path(id): axum::extract::Path<i64>) -> StatusCode {
     match db::update_recommendation_status(id, "rejected") {
         Ok(_) => StatusCode::OK,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
-async fn later_recommendation(
-    axum::extract::Path(id): axum::extract::Path<i64>,
-) -> StatusCode {
+async fn later_recommendation(axum::extract::Path(id): axum::extract::Path<i64>) -> StatusCode {
     match db::update_recommendation_status(id, "later") {
         Ok(_) => StatusCode::OK,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
-async fn restore_recommendation(
-    axum::extract::Path(id): axum::extract::Path<i64>,
-) -> StatusCode {
+async fn restore_recommendation(axum::extract::Path(id): axum::extract::Path<i64>) -> StatusCode {
     match db::update_recommendation_status(id, "pending") {
         Ok(_) => StatusCode::OK,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -1348,9 +1512,7 @@ async fn reject_exec_approval(
     }
 }
 
-async fn list_routine_runs(
-    Query(query): Query<RoutineRunsQuery>,
-) -> Json<Vec<db::RoutineRun>> {
+async fn list_routine_runs(Query(query): Query<RoutineRunsQuery>) -> Json<Vec<db::RoutineRun>> {
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let runs = db::list_routine_runs(limit).unwrap_or_default();
     Json(runs)
@@ -1364,9 +1526,7 @@ async fn list_exec_allowlist(
     Json(entries)
 }
 
-async fn list_exec_results(
-    Query(query): Query<ExecResultsQuery>,
-) -> Json<Vec<db::ExecResult>> {
+async fn list_exec_results(Query(query): Query<ExecResultsQuery>) -> Json<Vec<db::ExecResult>> {
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
     let status = query.status.as_deref();
     let results = db::list_exec_results(status, limit).unwrap_or_default();
@@ -1381,17 +1541,13 @@ async fn list_verification_runs(
     Json(runs)
 }
 
-async fn list_nl_runs_handler(
-    Query(query): Query<NLRunQuery>,
-) -> Json<Vec<db::NLRun>> {
+async fn list_nl_runs_handler(Query(query): Query<NLRunQuery>) -> Json<Vec<db::NLRun>> {
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let runs = db::list_nl_runs(limit).unwrap_or_default();
     Json(runs)
 }
 
-async fn nl_run_metrics_handler(
-    Query(query): Query<NLRunMetricsQuery>,
-) -> Json<db::NLRunMetrics> {
+async fn nl_run_metrics_handler(Query(query): Query<NLRunMetricsQuery>) -> Json<db::NLRunMetrics> {
     let limit = query.limit.unwrap_or(50).clamp(1, 500);
     let metrics = db::get_nl_run_metrics(limit).unwrap_or(db::NLRunMetrics {
         total: 0,
@@ -1421,9 +1577,7 @@ async fn list_nl_approval_policies(
     Json(mapped)
 }
 
-async fn set_nl_approval_policy(
-    Json(payload): Json<ApprovalPolicyRequest>,
-) -> StatusCode {
+async fn set_nl_approval_policy(Json(payload): Json<ApprovalPolicyRequest>) -> StatusCode {
     if payload.policy_key.trim().is_empty() || payload.decision.trim().is_empty() {
         return StatusCode::BAD_REQUEST;
     }
@@ -1433,9 +1587,7 @@ async fn set_nl_approval_policy(
     }
 }
 
-async fn remove_nl_approval_policy(
-    Path(key): Path<String>,
-) -> StatusCode {
+async fn remove_nl_approval_policy(Path(key): Path<String>) -> StatusCode {
     if key.trim().is_empty() {
         return StatusCode::BAD_REQUEST;
     }
@@ -1450,9 +1602,7 @@ fn log_verification_run(kind: &str, ok: bool, summary: &str, details: Option<ser
     let _ = db::insert_verification_run(kind, ok, summary, details_str.as_deref());
 }
 
-async fn add_exec_allowlist(
-    Json(payload): Json<ExecAllowlistRequest>,
-) -> StatusCode {
+async fn add_exec_allowlist(Json(payload): Json<ExecAllowlistRequest>) -> StatusCode {
     if payload.pattern.trim().is_empty() {
         return StatusCode::BAD_REQUEST;
     }
@@ -1462,9 +1612,7 @@ async fn add_exec_allowlist(
     }
 }
 
-async fn remove_exec_allowlist(
-    Path(id): Path<i64>,
-) -> StatusCode {
+async fn remove_exec_allowlist(Path(id): Path<i64>) -> StatusCode {
     match db::remove_exec_allowlist(id) {
         Ok(_) => StatusCode::OK,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -1512,7 +1660,7 @@ async fn get_recommendation_metrics() -> Json<RecommendationMetricsResponse> {
     })
 }
 
-// Add at top: use crate::recommendation::AutomationProposal; 
+// Add at top: use crate::recommendation::AutomationProposal;
 
 async fn analyze_patterns() -> Json<Vec<String>> {
     Json(run_analysis_internal())
@@ -1521,12 +1669,15 @@ async fn analyze_patterns() -> Json<Vec<String>> {
 fn run_analysis_internal() -> Vec<String> {
     let detector = pattern_detector::PatternDetector::new();
     let patterns = detector.analyze();
-    
+
     // 1. Save detected patterns to DB
     for p in &patterns {
         let proposal = crate::recommendation::AutomationProposal {
             title: format!("New Pattern: {}", p.description),
-            summary: format!("Detected {} repeats. AI suggests automating this.", p.occurrences),
+            summary: format!(
+                "Detected {} repeats. AI suggests automating this.",
+                p.occurrences
+            ),
             trigger: format!("Pattern Type: {:?}", p.pattern_type),
             actions: vec!["Analyze".to_string(), "Automate".to_string()],
             n8n_prompt: format!("Create an automation for: {}", p.description),
@@ -1558,8 +1709,9 @@ fn run_analysis_internal() -> Vec<String> {
         return vec![];
     }
     */
-    
-    patterns.into_iter()
+
+    patterns
+        .into_iter()
         .map(|p| format!("{} ({} occurrences)", p.description, p.occurrences))
         .collect()
 }
@@ -1567,7 +1719,7 @@ fn run_analysis_internal() -> Vec<String> {
 async fn get_quality_metrics() -> Json<QualityMetrics> {
     let collector = feedback_collector::FeedbackCollector::new();
     let metrics = collector.get_quality_metrics();
-    
+
     Json(QualityMetrics {
         total: metrics.total_executions,
         success: metrics.successful_executions,
@@ -1590,7 +1742,7 @@ async fn execute_goal_handler(
     if let Some(llm) = state.llm_client {
         // Spawn background task for OODA loop
         tokio::spawn(async move {
-            let mut planner = crate::controller::planner::Planner::new(llm, None);
+            let planner = crate::controller::planner::Planner::new(llm, None);
             match planner.run_goal(&payload.goal, None).await {
                 Ok(_) => println!("✅ Goal Execution Success"),
                 Err(e) => println!("❌ Goal Execution Failed: {}", e),
@@ -1609,9 +1761,7 @@ async fn execute_goal_handler(
     }
 }
 
-async fn get_current_goal(
-    State(state): State<AppState>,
-) -> Json<serde_json::Value> {
+async fn get_current_goal(State(state): State<AppState>) -> Json<serde_json::Value> {
     let goal = state
         .current_goal
         .lock()
@@ -1621,12 +1771,14 @@ async fn get_current_goal(
     Json(serde_json::json!({ "goal": goal }))
 }
 
-async fn agent_intent_handler(
-    Json(payload): Json<AgentIntentRequest>,
-) -> impl IntoResponse {
+async fn agent_intent_handler(Json(payload): Json<AgentIntentRequest>) -> impl IntoResponse {
     let intent_result = intent_router::classify_intent(&payload.text);
     let fill = slot_filler::fill_slots(&intent_result.intent, intent_result.slots.clone());
-    let session = nl_store::create_session(intent_result.clone(), fill.slots.clone(), payload.text.clone());
+    let session = nl_store::create_session(
+        intent_result.clone(),
+        fill.slots.clone(),
+        payload.text.clone(),
+    );
 
     let response = AgentIntentResponse {
         session_id: session.session_id,
@@ -1640,9 +1792,7 @@ async fn agent_intent_handler(
     (StatusCode::OK, Json(response)).into_response()
 }
 
-async fn agent_plan_handler(
-    Json(payload): Json<AgentPlanRequest>,
-) -> impl IntoResponse {
+async fn agent_plan_handler(Json(payload): Json<AgentPlanRequest>) -> impl IntoResponse {
     let Some(mut session) = nl_store::get_session(&payload.session_id) else {
         return (
             StatusCode::NOT_FOUND,
@@ -1671,9 +1821,7 @@ async fn agent_plan_handler(
     (StatusCode::OK, Json(response)).into_response()
 }
 
-async fn agent_execute_handler(
-    Json(payload): Json<AgentExecuteRequest>,
-) -> impl IntoResponse {
+async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl IntoResponse {
     let Some(plan) = nl_store::get_plan(&payload.plan_id) else {
         return (
             StatusCode::NOT_FOUND,
@@ -1695,7 +1843,9 @@ async fn agent_execute_handler(
     }
     let mut verify = verification_engine::verify_execution(&plan, &result.logs);
     if !verify.ok {
-        result.logs.push(format!("Verification failed: {}", verify.issues.join("; ")));
+        result
+            .logs
+            .push(format!("Verification failed: {}", verify.issues.join("; ")));
     } else {
         result.logs.push("Verification passed".to_string());
     }
@@ -1703,11 +1853,21 @@ async fn agent_execute_handler(
     // Simple auto-replan: one retry on failure or verification issues
     let auto_replan = std::env::var("STEER_AUTO_REPLAN")
         .ok()
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(true);
-    let allow_replan = !matches!(result.status.as_str(), "manual_required" | "approval_required");
+    let allow_replan = !matches!(
+        result.status.as_str(),
+        "manual_required" | "approval_required"
+    );
     if auto_replan && allow_replan && (result.status == "error" || !verify.ok) {
-        result.logs.push("Auto-replan: retrying once after short wait".to_string());
+        result
+            .logs
+            .push("Auto-replan: retrying once after short wait".to_string());
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         let retry = execution_controller::execute_plan(&plan, 0).await;
         result.logs = retry.logs;
@@ -1725,7 +1885,10 @@ async fn agent_execute_handler(
         }
     }
 
-    if matches!(result.status.as_str(), "manual_required" | "approval_required") {
+    if matches!(
+        result.status.as_str(),
+        "manual_required" | "approval_required"
+    ) {
         if let Some(next_step) = result.resume_from {
             nl_store::set_plan_progress(&plan.plan_id, next_step);
         }
@@ -1754,9 +1917,7 @@ async fn agent_execute_handler(
     (StatusCode::OK, Json(response)).into_response()
 }
 
-async fn agent_verify_handler(
-    Json(payload): Json<AgentVerifyRequest>,
-) -> impl IntoResponse {
+async fn agent_verify_handler(Json(payload): Json<AgentVerifyRequest>) -> impl IntoResponse {
     let Some(plan) = nl_store::get_plan(&payload.plan_id) else {
         return (
             StatusCode::NOT_FOUND,
@@ -1774,9 +1935,7 @@ async fn agent_verify_handler(
     (StatusCode::OK, Json(response)).into_response()
 }
 
-async fn agent_approve_handler(
-    Json(payload): Json<AgentApproveRequest>,
-) -> impl IntoResponse {
+async fn agent_approve_handler(Json(payload): Json<AgentApproveRequest>) -> impl IntoResponse {
     let Some(plan) = nl_store::get_plan(&payload.plan_id) else {
         return (
             StatusCode::NOT_FOUND,
@@ -1819,7 +1978,9 @@ async fn handle_feedback(
     } else {
         req.goal.clone()
     };
-    let history = req.history_summary.unwrap_or_else(|| format!("Goal: {}", goal));
+    let history = req
+        .history_summary
+        .unwrap_or_else(|| format!("Goal: {}", goal));
     if let Some(llm) = &state.llm_client {
         match llm.analyze_user_feedback(&req.feedback, &history).await {
             Ok(analysis) => {
@@ -1834,7 +1995,11 @@ async fn handle_feedback(
                 } else {
                     "피드백을 확인했어요. 작업을 완료로 표시합니다.".to_string()
                 };
-                return Json(FeedbackResponse { action, new_goal, message });
+                return Json(FeedbackResponse {
+                    action,
+                    new_goal,
+                    message,
+                });
             }
             Err(e) => {
                 eprintln!("Feedback analysis failed: {}", e);
@@ -1869,24 +2034,27 @@ async fn get_selection_context() -> Json<serde_json::Value> {
 /// List all sessions
 async fn list_sessions_handler() -> Json<serde_json::Value> {
     let _ = crate::session_store::init_session_store();
-    
+
     match crate::session_store::get_session_store() {
         Ok(guard) => {
             if let Some(store) = guard.as_ref() {
-                let sessions: Vec<serde_json::Value> = store.list_active()
+                let sessions: Vec<serde_json::Value> = store
+                    .list_active()
                     .iter()
-                    .map(|s| serde_json::json!({
-                        "id": s.id,
-                        "key": s.key,
-                        "goal": s.goal,
-                        "status": format!("{:?}", s.status),
-                        "created_at": s.created_at.to_rfc3339(),
-                        "updated_at": s.updated_at.to_rfc3339(),
-                        "steps_count": s.steps.len(),
-                        "can_resume": s.can_resume(),
-                    }))
+                    .map(|s| {
+                        serde_json::json!({
+                            "id": s.id,
+                            "key": s.key,
+                            "goal": s.goal,
+                            "status": format!("{:?}", s.status),
+                            "created_at": s.created_at.to_rfc3339(),
+                            "updated_at": s.updated_at.to_rfc3339(),
+                            "steps_count": s.steps.len(),
+                            "can_resume": s.can_resume(),
+                        })
+                    })
                     .collect();
-                
+
                 Json(serde_json::json!({
                     "success": true,
                     "sessions": sessions,
@@ -1896,14 +2064,14 @@ async fn list_sessions_handler() -> Json<serde_json::Value> {
                 Json(serde_json::json!({ "success": false, "error": "Store not initialized" }))
             }
         }
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() }))
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
     }
 }
 
 /// Get specific session by ID
 async fn get_session_handler(Path(id): Path<String>) -> Json<serde_json::Value> {
     let _ = crate::session_store::init_session_store();
-    
+
     match crate::session_store::get_session_store() {
         Ok(guard) => {
             if let Some(store) = guard.as_ref() {
@@ -1930,34 +2098,36 @@ async fn get_session_handler(Path(id): Path<String>) -> Json<serde_json::Value> 
                 Json(serde_json::json!({ "success": false, "error": "Store not initialized" }))
             }
         }
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() }))
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
     }
 }
 
 /// Delete a session
 async fn delete_session_handler(Path(id): Path<String>) -> Json<serde_json::Value> {
     let _ = crate::session_store::init_session_store();
-    
+
     match crate::session_store::get_session_store() {
         Ok(mut guard) => {
             if let Some(store) = guard.as_mut() {
                 match store.delete(&id) {
                     Ok(true) => Json(serde_json::json!({ "success": true, "deleted": id })),
-                    Ok(false) => Json(serde_json::json!({ "success": false, "error": "Session not found" })),
-                    Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() }))
+                    Ok(false) => {
+                        Json(serde_json::json!({ "success": false, "error": "Session not found" }))
+                    }
+                    Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
                 }
             } else {
                 Json(serde_json::json!({ "success": false, "error": "Store not initialized" }))
             }
         }
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() }))
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
     }
 }
 
 /// Resume a paused/failed session
 async fn resume_session_handler(Path(id): Path<String>) -> Json<serde_json::Value> {
     let _ = crate::session_store::init_session_store();
-    
+
     match crate::session_store::get_session_store() {
         Ok(mut guard) => {
             if let Some(store) = guard.as_mut() {
@@ -1966,8 +2136,9 @@ async fn resume_session_handler(Path(id): Path<String>) -> Json<serde_json::Valu
                         let resume_point = session.get_resume_point();
                         let goal = session.goal.clone();
                         session.status = crate::session_store::SessionStatus::Active;
-                        session.add_message("system", &format!("Resuming from step {}", resume_point));
-                        
+                        session
+                            .add_message("system", &format!("Resuming from step {}", resume_point));
+
                         Json(serde_json::json!({
                             "success": true,
                             "resumed": true,
@@ -1977,9 +2148,9 @@ async fn resume_session_handler(Path(id): Path<String>) -> Json<serde_json::Valu
                             "message": format!("Session resumed from step {}", resume_point)
                         }))
                     } else {
-                        Json(serde_json::json!({ 
-                            "success": false, 
-                            "error": "Session cannot be resumed (status or no steps)" 
+                        Json(serde_json::json!({
+                            "success": false,
+                            "error": "Session cannot be resumed (status or no steps)"
                         }))
                     }
                 } else {
@@ -1989,6 +2160,6 @@ async fn resume_session_handler(Path(id): Path<String>) -> Json<serde_json::Valu
                 Json(serde_json::json!({ "success": false, "error": "Store not initialized" }))
             }
         }
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() }))
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
     }
 }
