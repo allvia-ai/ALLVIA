@@ -27,17 +27,87 @@ fn parse_keys_array(arr: &[Value]) -> Option<(String, Vec<String>)> {
         if raw.is_empty() {
             continue;
         }
-        match raw.as_str() {
-            "cmd" | "command" => modifiers.push("command".to_string()),
-            "shift" => modifiers.push("shift".to_string()),
-            "option" | "alt" => modifiers.push("option".to_string()),
-            "control" | "ctrl" => modifiers.push("control".to_string()),
-            other if key.is_none() => key = Some(other.to_string()),
-            other => modifiers.push(other.to_string()),
+        if let Some(normalized) = normalize_modifier(&raw) {
+            if !modifiers.contains(&normalized) {
+                modifiers.push(normalized);
+            }
+            continue;
+        }
+        if key.is_none() {
+            key = Some(raw.to_string());
+        } else if !modifiers.contains(&raw) {
+            modifiers.push(raw.to_string());
         }
     }
 
     key.map(|k| (k, modifiers))
+}
+
+fn normalize_modifier(raw: &str) -> Option<String> {
+    match raw.trim().to_lowercase().as_str() {
+        "cmd" | "command" => Some("command".to_string()),
+        "shift" => Some("shift".to_string()),
+        "option" | "alt" => Some("option".to_string()),
+        "control" | "ctrl" => Some("control".to_string()),
+        _ => None,
+    }
+}
+
+fn parse_shortcut_combo(raw: &str) -> Option<(String, Vec<String>)> {
+    let compact = raw.trim().to_lowercase();
+    if !compact.contains('+') {
+        return None;
+    }
+
+    let mut key: Option<String> = None;
+    let mut modifiers: Vec<String> = Vec::new();
+    for token in compact.split('+') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if let Some(modifier) = normalize_modifier(token) {
+            if !modifiers.contains(&modifier) {
+                modifiers.push(modifier);
+            }
+            continue;
+        }
+        key = Some(token.to_string());
+    }
+
+    key.map(|k| (k, modifiers))
+}
+
+fn canonicalize_shortcut_alias(key: &str, modifiers: &mut Vec<String>) -> String {
+    let mut key_lower = key.trim().to_lowercase();
+    match key_lower.as_str() {
+        "paste" | "붙여넣기" => {
+            key_lower = "v".to_string();
+            if !modifiers.iter().any(|m| m == "command") {
+                modifiers.push("command".to_string());
+            }
+        }
+        "copy" | "복사" => {
+            key_lower = "c".to_string();
+            if !modifiers.iter().any(|m| m == "command") {
+                modifiers.push("command".to_string());
+            }
+        }
+        "select_all" | "selectall" | "전체선택" => {
+            key_lower = "a".to_string();
+            if !modifiers.iter().any(|m| m == "command") {
+                modifiers.push("command".to_string());
+            }
+        }
+        "new" | "새로만들기" => {
+            key_lower = "n".to_string();
+            if !modifiers.iter().any(|m| m == "command") {
+                modifiers.push("command".to_string());
+            }
+        }
+        _ => {}
+    }
+    key_lower
 }
 
 fn normalize_action_name(raw: &str) -> String {
@@ -59,7 +129,11 @@ fn normalize_action_name(raw: &str) -> String {
 pub fn normalize_action(plan: &Value) -> ActionValidation {
     let mut normalized = plan.clone();
 
-    if normalized.get("action").map(|v| v.is_object()).unwrap_or(false) {
+    if normalized
+        .get("action")
+        .map(|v| v.is_object())
+        .unwrap_or(false)
+    {
         normalized = normalized["action"].clone();
     }
 
@@ -123,27 +197,110 @@ pub fn normalize_action(plan: &Value) -> ActionValidation {
         }
         "key" => {
             if let Some(key) = get_string_any(obj, &["key"]) {
-                obj.insert("key".to_string(), Value::String(key));
+                if let Some((combo_key, combo_modifiers)) = parse_shortcut_combo(&key) {
+                    obj.insert("action".to_string(), Value::String("shortcut".to_string()));
+                    obj.insert("key".to_string(), Value::String(combo_key));
+                    obj.insert(
+                        "modifiers".to_string(),
+                        Value::Array(combo_modifiers.into_iter().map(Value::String).collect()),
+                    );
+                } else {
+                    obj.insert("key".to_string(), Value::String(key));
+                }
             } else {
                 error = Some("key requires 'key'".to_string());
             }
         }
         "shortcut" => {
             let mut key = get_string_any(obj, &["key"]);
-            if key.is_none() {
-                if let Some(arr) = obj.get("keys").and_then(|v| v.as_array()) {
-                    if let Some((parsed_key, modifiers)) = parse_keys_array(arr) {
-                        obj.insert("key".to_string(), Value::String(parsed_key.clone()));
-                        obj.insert(
-                            "modifiers".to_string(),
-                            Value::Array(modifiers.into_iter().map(Value::String).collect()),
-                        );
-                        key = Some(parsed_key);
+            let mut modifiers: Vec<String> = Vec::new();
+
+            if let Some(existing_modifiers) = obj.get("modifiers") {
+                match existing_modifiers {
+                    Value::Array(arr) => {
+                        for item in arr {
+                            if let Some(raw) = item.as_str() {
+                                if let Some(normalized) = normalize_modifier(raw) {
+                                    if !modifiers.contains(&normalized) {
+                                        modifiers.push(normalized);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Value::String(raw) => {
+                        if let Some(normalized) = normalize_modifier(raw) {
+                            modifiers.push(normalized);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some(raw_key) = key.clone() {
+                if let Some((parsed_key, parsed_mods)) = parse_shortcut_combo(&raw_key) {
+                    key = Some(parsed_key);
+                    for modifier in parsed_mods {
+                        if !modifiers.contains(&modifier) {
+                            modifiers.push(modifier);
+                        }
                     }
                 }
             }
+
+            if key.is_none() {
+                if let Some(arr) = obj.get("keys").and_then(|v| v.as_array()) {
+                    if let Some((parsed_key, parsed_modifiers)) = parse_keys_array(arr) {
+                        key = Some(parsed_key);
+                        for modifier in parsed_modifiers {
+                            if let Some(normalized) = normalize_modifier(&modifier) {
+                                if !modifiers.contains(&normalized) {
+                                    modifiers.push(normalized);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             if key.is_none() {
                 error = Some("shortcut requires 'key'".to_string());
+            } else {
+                let canonical_key = canonicalize_shortcut_alias(
+                    key.as_deref().unwrap_or_default(),
+                    &mut modifiers,
+                );
+                obj.insert("key".to_string(), Value::String(canonical_key.clone()));
+                obj.insert(
+                    "modifiers".to_string(),
+                    Value::Array(modifiers.into_iter().map(Value::String).collect()),
+                );
+
+                let has_command = obj
+                    .get("modifiers")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .any(|m| m.as_str().unwrap_or("").eq_ignore_ascii_case("command"))
+                    })
+                    .unwrap_or(false);
+                if has_command {
+                    match canonical_key.as_str() {
+                        "v" => {
+                            obj.insert("action".to_string(), Value::String("paste".to_string()));
+                        }
+                        "c" => {
+                            obj.insert("action".to_string(), Value::String("copy".to_string()));
+                        }
+                        "a" => {
+                            obj.insert(
+                                "action".to_string(),
+                                Value::String("select_all".to_string()),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
         "click_visual" => {
@@ -157,7 +314,10 @@ pub fn normalize_action(plan: &Value) -> ActionValidation {
             if let Some(query) = get_string_any(obj, &["query"]) {
                 obj.insert("query".to_string(), Value::String(query));
             } else {
-                obj.insert("query".to_string(), Value::String("Describe the screen".to_string()));
+                obj.insert(
+                    "query".to_string(),
+                    Value::String("Describe the screen".to_string()),
+                );
             }
         }
         "scroll" => {
@@ -192,10 +352,9 @@ pub fn normalize_action(plan: &Value) -> ActionValidation {
         "copy" => {
             if let Some(text) = get_string_any(obj, &["text", "content"]) {
                 obj.insert("text".to_string(), Value::String(text));
-            } else {
-                error = Some("copy requires 'text'".to_string());
             }
         }
+        "select_all" => {}
         "paste" => {}
         "read_clipboard" => {}
         "transfer" => {
@@ -260,7 +419,10 @@ pub fn normalize_action(plan: &Value) -> ActionValidation {
             if let Some(msg) = get_string_any(obj, &["message", "reason"]) {
                 obj.insert("message".to_string(), Value::String(msg));
             } else {
-                obj.insert("message".to_string(), Value::String("Progress update".to_string()));
+                obj.insert(
+                    "message".to_string(),
+                    Value::String("Progress update".to_string()),
+                );
             }
         }
         "reply" => {
@@ -276,10 +438,7 @@ pub fn normalize_action(plan: &Value) -> ActionValidation {
         }
     }
 
-    ActionValidation {
-        normalized,
-        error,
-    }
+    ActionValidation { normalized, error }
 }
 
 #[cfg(test)]
@@ -300,6 +459,25 @@ mod tests {
         let result = normalize_action(&plan);
         assert!(result.error.is_none());
         assert_eq!(result.normalized["key"].as_str().unwrap(), "n");
+        assert_eq!(result.normalized["modifiers"][0].as_str().unwrap(), "command");
+    }
+
+    #[test]
+    fn normalize_shortcut_cmd_plus_v_to_paste() {
+        let plan = json!({"action": "shortcut", "key": "cmd+v"});
+        let result = normalize_action(&plan);
+        assert!(result.error.is_none());
+        assert_eq!(result.normalized["action"].as_str().unwrap(), "paste");
+    }
+
+    #[test]
+    fn normalize_key_combo_to_shortcut() {
+        let plan = json!({"action": "key", "key": "command+n"});
+        let result = normalize_action(&plan);
+        assert!(result.error.is_none());
+        assert_eq!(result.normalized["action"].as_str().unwrap(), "shortcut");
+        assert_eq!(result.normalized["key"].as_str().unwrap(), "n");
+        assert_eq!(result.normalized["modifiers"][0].as_str().unwrap(), "command");
     }
 
     #[test]

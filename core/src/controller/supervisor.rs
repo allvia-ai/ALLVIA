@@ -1,6 +1,6 @@
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use anyhow::Result;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorDecision {
@@ -42,7 +42,9 @@ impl Supervisor {
 
             if let Some(inner) = recovered.get("action") {
                 if inner.is_object() {
-                    if let Ok(decision) = serde_json::from_value::<SupervisorDecision>(inner.clone()) {
+                    if let Ok(decision) =
+                        serde_json::from_value::<SupervisorDecision>(inner.clone())
+                    {
                         return Ok(decision);
                     }
                 }
@@ -60,7 +62,7 @@ impl Supervisor {
         llm: &dyn crate::llm_gateway::LLMClient,
         goal: &str,
         plan: &Value,
-        history: &[String]
+        history: &[String],
     ) -> Result<SupervisorDecision> {
         let system_prompt = crate::prompts::SUPERVISOR_SYSTEM_PROMPT;
 
@@ -70,14 +72,12 @@ impl Supervisor {
 
         let user_msg = format!(
             "GOAL: {}\n\nHISTORY:\n{}\n\nPROPOSED ACTION:\n{}",
-            goal,
-            history_str,
-            plan_str
+            goal, history_str, plan_str
         );
 
         let messages = vec![
             json!({ "role": "system", "content": system_prompt }),
-            json!({ "role": "user", "content": user_msg })
+            json!({ "role": "user", "content": user_msg }),
         ];
 
         let content = llm.chat_completion(messages).await?;

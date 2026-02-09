@@ -16,7 +16,7 @@ pub enum ControllerError {
 
     #[error("Execution Failed: {0}")]
     ExecutionError(String),
-    
+
     #[error("Serialization Error: {0}")]
     SerdeError(#[from] serde_json::Error),
 }

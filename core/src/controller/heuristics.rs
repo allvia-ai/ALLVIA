@@ -1,7 +1,7 @@
-use anyhow::Result;
 use crate::applescript;
 use crate::visual_driver::VisualDriver;
-use sha2::{Sha256, Digest};
+use anyhow::Result;
+use sha2::{Digest, Sha256};
 
 pub fn permission_help() -> &'static str {
     "Enable Screen Recording + Accessibility for Terminal/Codex (System Settings > Privacy & Security). If prompts disappear, try `tccutil reset Accessibility` and `tccutil reset ScreenCapture` then relaunch the app."
@@ -40,7 +40,10 @@ pub fn verify_screen_capture() -> Result<()> {
     // Preflight: verify Screen Recording can capture the screen
     if let Err(e) = VisualDriver::capture_screen() {
         println!("❌ Preflight failed: Screen capture unavailable (check Screen Recording permission). Error: {}", e);
-        return Err(anyhow::anyhow!("Screen capture unavailable (permission missing): {}", e));
+        return Err(anyhow::anyhow!(
+            "Screen capture unavailable (permission missing): {}",
+            e
+        ));
     }
     Ok(())
 }
@@ -120,7 +123,15 @@ pub fn goal_mentions_calculation(goal: &str) -> bool {
 
 pub fn goal_is_ui_task(goal: &str) -> bool {
     let lower = goal.to_lowercase();
-    let apps = ["safari", "notes", "finder", "preview", "textedit", "mail", "calculator"];
+    let apps = [
+        "safari",
+        "notes",
+        "finder",
+        "preview",
+        "textedit",
+        "mail",
+        "calculator",
+    ];
     apps.iter().any(|app| lower.contains(app))
 }
 
@@ -131,7 +142,10 @@ pub fn goal_mentions_desktop(goal: &str) -> bool {
 
 pub fn goal_mentions_image(goal: &str) -> bool {
     let lower = goal.to_lowercase();
-    lower.contains("image") || lower.contains("이미지") || lower.contains(".png") || lower.contains(".jpg")
+    lower.contains("image")
+        || lower.contains("이미지")
+        || lower.contains(".png")
+        || lower.contains(".jpg")
 }
 
 pub fn goal_mentions_notes(goal: &str) -> bool {
@@ -186,7 +200,8 @@ pub fn focus_text_area(app: &str, prefer_subject: bool) -> bool {
                 "#
             }
         }
-        "Notes" => r#"
+        "Notes" => {
+            r#"
             tell application "System Events"
                 tell process "Notes"
                     if exists window 1 then
@@ -200,11 +215,29 @@ pub fn focus_text_area(app: &str, prefer_subject: bool) -> bool {
                 end tell
             end tell
             return ""
-        "#,
-        "TextEdit" => r#"
+        "#
+        }
+        "TextEdit" => {
+            r#"
             tell application "System Events"
                 tell process "TextEdit"
                     if exists window 1 then
+                        set wName to ""
+                        try
+                            set wName to name of window 1 as text
+                        end try
+                        if wName contains "Open" or wName contains "open" or wName contains "열기" or wName contains "Save" or wName contains "save" or wName contains "저장" then
+                            try
+                                if exists button "Cancel" of window 1 then
+                                    click button "Cancel" of window 1
+                                else if exists button "취소" of window 1 then
+                                    click button "취소" of window 1
+                                else
+                                    key code 53
+                                end if
+                                delay 0.12
+                            end try
+                        end if
                         try
                             if exists scroll area 1 of window 1 then
                                 click scroll area 1 of window 1
@@ -215,7 +248,8 @@ pub fn focus_text_area(app: &str, prefer_subject: bool) -> bool {
                 end tell
             end tell
             return ""
-        "#,
+        "#
+        }
         _ => "",
     };
 
@@ -230,7 +264,8 @@ pub fn focus_text_area(app: &str, prefer_subject: bool) -> bool {
     }
 
     // Fallback: click window center
-    let fallback = format!(r#"
+    let fallback = format!(
+        r#"
         tell application "System Events"
             tell process "{}"
                 if exists window 1 then
@@ -242,7 +277,9 @@ pub fn focus_text_area(app: &str, prefer_subject: bool) -> bool {
                 end if
             end tell
         end tell
-    "#, app);
+    "#,
+        app
+    );
     let _ = applescript::run(&fallback);
     true
 }
@@ -261,7 +298,10 @@ pub fn infer_stock_symbol(goal: &str, query: &str) -> Option<&'static str> {
 }
 
 pub async fn fetch_stock_price(symbol: &str) -> Option<String> {
-    let url = format!("https://query1.finance.yahoo.com/v7/finance/quote?symbols={}", symbol);
+    let url = format!(
+        "https://query1.finance.yahoo.com/v7/finance/quote?symbols={}",
+        symbol
+    );
     if let Ok(resp) = reqwest::get(&url).await {
         if let Ok(body) = resp.text().await {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
@@ -311,7 +351,9 @@ pub fn compute_calc_result(num_str: &str) -> Option<String> {
 }
 
 pub fn normalize_digits(s: &str) -> String {
-    s.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect()
+    s.chars()
+        .filter(|c| c.is_ascii_digit() || *c == '.')
+        .collect()
 }
 
 pub fn extract_search_query(goal: &str) -> Option<String> {
@@ -436,7 +478,10 @@ pub fn extract_query_param(url: &str, key: &str) -> Option<String> {
 }
 
 pub fn extract_google_redirect_target(url: &str) -> Option<String> {
-    if !(url.contains("google.com/url?") || url.contains("google.co.kr/url?") || url.contains("google.com/url?q=")) {
+    if !(url.contains("google.com/url?")
+        || url.contains("google.co.kr/url?")
+        || url.contains("google.com/url?q="))
+    {
         return None;
     }
     extract_query_param(url, "url")
@@ -447,7 +492,8 @@ pub fn extract_google_redirect_target(url: &str) -> Option<String> {
 pub fn is_redirect_alert(title: &str, url: &str) -> bool {
     let t = title.to_lowercase();
     let u = url.to_lowercase();
-    t.contains("리디렉션") || t.contains("redirect")
+    t.contains("리디렉션")
+        || t.contains("redirect")
         || u.contains("google.com/url?")
         || u.contains("google.co.kr/url?")
 }
@@ -457,16 +503,39 @@ pub fn try_close_front_dialog() -> bool {
         tell application "System Events"
             set frontApp to name of first application process whose frontmost is true
             tell process frontApp
-                if exists sheet 1 of window 1 then
-                    if exists button "Cancel" of sheet 1 of window 1 then
-                        click button "Cancel" of sheet 1 of window 1
-                        return "cancel"
-                    else if exists button "취소" of sheet 1 of window 1 then
-                        click button "취소" of sheet 1 of window 1
-                        return "cancel"
-                    else if exists button "닫기" of sheet 1 of window 1 then
-                        click button "닫기" of sheet 1 of window 1
-                        return "close"
+                if (count of windows) > 0 then
+                    set w to window 1
+                    if exists sheet 1 of w then
+                        if exists button "Cancel" of sheet 1 of w then
+                            click button "Cancel" of sheet 1 of w
+                            return "cancel-sheet"
+                        else if exists button "취소" of sheet 1 of w then
+                            click button "취소" of sheet 1 of w
+                            return "cancel-sheet"
+                        else if exists button "닫기" of sheet 1 of w then
+                            click button "닫기" of sheet 1 of w
+                            return "close-sheet"
+                        end if
+                    end if
+
+                    set wName to ""
+                    try
+                        set wName to name of w as text
+                    end try
+                    if wName contains "Open" or wName contains "open" or wName contains "열기" or wName contains "Save" or wName contains "save" or wName contains "저장" then
+                        if exists button "Cancel" of w then
+                            click button "Cancel" of w
+                            return "cancel-window"
+                        else if exists button "취소" of w then
+                            click button "취소" of w
+                            return "cancel-window"
+                        else if exists button "닫기" of w then
+                            click button "닫기" of w
+                            return "close-window"
+                        else
+                            key code 53
+                            return "escape-window"
+                        end if
                     end if
                 end if
             end tell
@@ -481,13 +550,27 @@ pub fn try_close_front_dialog() -> bool {
 
 pub fn goal_primary_app(goal: &str) -> Option<&'static str> {
     let lower = goal.to_lowercase();
-    if lower.contains("safari") { return Some("Safari"); }
-    if lower.contains("notes") { return Some("Notes"); }
-    if lower.contains("mail") { return Some("Mail"); }
-    if lower.contains("textedit") { return Some("TextEdit"); }
-    if lower.contains("calculator") { return Some("Calculator"); }
-    if lower.contains("finder") { return Some("Finder"); }
-    if lower.contains("preview") { return Some("Preview"); }
+    if lower.contains("safari") {
+        return Some("Safari");
+    }
+    if lower.contains("notes") {
+        return Some("Notes");
+    }
+    if lower.contains("mail") {
+        return Some("Mail");
+    }
+    if lower.contains("textedit") {
+        return Some("TextEdit");
+    }
+    if lower.contains("calculator") {
+        return Some("Calculator");
+    }
+    if lower.contains("finder") {
+        return Some("Finder");
+    }
+    if lower.contains("preview") {
+        return Some("Preview");
+    }
     None
 }
 
@@ -522,17 +605,25 @@ pub fn compute_plan_key(goal: &str, image_b64: &str) -> String {
     format!("{:x}", out)
 }
 
-pub fn resume_hint_for_goal(goal: &str, checkpoint: &Option<String>, front_app: Option<&str>) -> Option<serde_json::Value> {
+pub fn resume_hint_for_goal(
+    goal: &str,
+    checkpoint: &Option<String>,
+    front_app: Option<&str>,
+) -> Option<serde_json::Value> {
     let lower = goal.to_lowercase();
     let cp = checkpoint.as_deref().unwrap_or("");
     let front = front_app.unwrap_or("");
     if lower.contains("mail") && cp == "mail_compose_open" && front.eq_ignore_ascii_case("Mail") {
         return Some(serde_json::json!({"action":"shortcut","key":"v","modifiers":["command"]}));
     }
-    if lower.contains("notes") && cp == "notes_note_created" && front.eq_ignore_ascii_case("Notes") {
+    if lower.contains("notes") && cp == "notes_note_created" && front.eq_ignore_ascii_case("Notes")
+    {
         return Some(serde_json::json!({"action":"shortcut","key":"v","modifiers":["command"]}));
     }
-    if lower.contains("textedit") && cp == "textedit_new_doc" && front.eq_ignore_ascii_case("TextEdit") {
+    if lower.contains("textedit")
+        && cp == "textedit_new_doc"
+        && front.eq_ignore_ascii_case("TextEdit")
+    {
         return Some(serde_json::json!({"action":"type","text":"Total hours per year: "}));
     }
     None
