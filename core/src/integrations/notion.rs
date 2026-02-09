@@ -1,7 +1,7 @@
-use reqwest::Client;
-use serde_json::json;
 use anyhow::Result;
+use reqwest::Client;
 use serde::Deserialize;
+use serde_json::json;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct NotionPage {
@@ -31,7 +31,12 @@ impl NotionClient {
     }
 
     /// Create a new page in a database
-    pub async fn create_page(&self, database_id: &str, title: &str, content: &str) -> Result<String> {
+    pub async fn create_page(
+        &self,
+        database_id: &str,
+        title: &str,
+        content: &str,
+    ) -> Result<String> {
         let url = "https://api.notion.com/v1/pages";
 
         let body = json!({
@@ -52,7 +57,9 @@ impl NotionClient {
             ]
         });
 
-        let resp = self.client.post(url)
+        let resp = self
+            .client
+            .post(url)
             .header("Authorization", format!("Bearer {}", self.token))
             .header("Notion-Version", "2022-06-28")
             .header("Content-Type", "application/json")
@@ -74,7 +81,9 @@ impl NotionClient {
     pub async fn read_page(&self, page_id: &str) -> Result<NotionPage> {
         // 1. Get page metadata
         let page_url = format!("https://api.notion.com/v1/pages/{}", page_id);
-        let page_resp = self.client.get(&page_url)
+        let page_resp = self
+            .client
+            .get(&page_url)
             .header("Authorization", format!("Bearer {}", self.token))
             .header("Notion-Version", "2022-06-28")
             .send()
@@ -86,7 +95,7 @@ impl NotionClient {
         }
 
         let page_json: serde_json::Value = page_resp.json().await?;
-        
+
         // Extract title from properties
         let title = page_json["properties"]["이름"]["title"]
             .as_array()
@@ -97,7 +106,9 @@ impl NotionClient {
 
         // 2. Get page blocks (content)
         let blocks_url = format!("https://api.notion.com/v1/blocks/{}/children", page_id);
-        let blocks_resp = self.client.get(&blocks_url)
+        let blocks_resp = self
+            .client
+            .get(&blocks_url)
             .header("Authorization", format!("Bearer {}", self.token))
             .header("Notion-Version", "2022-06-28")
             .send()
@@ -135,7 +146,9 @@ impl NotionClient {
             "page_size": limit
         });
 
-        let resp = self.client.post(&url)
+        let resp = self
+            .client
+            .post(&url)
             .header("Authorization", format!("Bearer {}", self.token))
             .header("Notion-Version", "2022-06-28")
             .json(&body)
@@ -171,4 +184,3 @@ impl NotionClient {
         Ok(pages)
     }
 }
-

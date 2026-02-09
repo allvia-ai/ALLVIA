@@ -1,8 +1,8 @@
+use crate::integrations::google_auth;
 use anyhow::Result;
-use chrono::{DateTime, Utc, Duration};
+use chrono::{DateTime, Duration, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use crate::integrations::google_auth;
 
 #[derive(Debug, Deserialize)]
 struct EventList {
@@ -35,7 +35,7 @@ impl CalendarClient {
     pub async fn new() -> Result<Self> {
         let auth = google_auth::get_authenticator().await?;
         let token = google_auth::get_access_token(&auth).await?;
-        
+
         Ok(Self {
             client: Client::new(),
             access_token: token,
@@ -45,26 +45,34 @@ impl CalendarClient {
     /// List today's events
     pub async fn list_today(&self) -> Result<Vec<(String, String, String)>> {
         let now = Utc::now();
-        let start_of_day = now.date_naive().and_hms_opt(0, 0, 0)
+        let start_of_day = now
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
             .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))
             .unwrap_or(now);
-        let end_of_day = now.date_naive().and_hms_opt(23, 59, 59)
+        let end_of_day = now
+            .date_naive()
+            .and_hms_opt(23, 59, 59)
             .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))
             .unwrap_or(now);
-        
+
         self.list_events_range(start_of_day, end_of_day).await
     }
 
     /// List this week's events
     pub async fn list_week(&self) -> Result<Vec<(String, String, String)>> {
         let now = Utc::now();
-        let start = now.date_naive().and_hms_opt(0, 0, 0)
+        let start = now
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
             .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))
             .unwrap_or(now);
-        let end = (now + Duration::days(7)).date_naive().and_hms_opt(23, 59, 59)
+        let end = (now + Duration::days(7))
+            .date_naive()
+            .and_hms_opt(23, 59, 59)
             .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))
             .unwrap_or(now);
-        
+
         self.list_events_range(start, end).await
     }
 
@@ -79,8 +87,9 @@ impl CalendarClient {
             time_min.to_rfc3339(),
             time_max.to_rfc3339()
         );
-        
-        let resp: EventList = self.client
+
+        let resp: EventList = self
+            .client
             .get(&url)
             .bearer_auth(&self.access_token)
             .send()
@@ -89,7 +98,7 @@ impl CalendarClient {
             .await?;
 
         let mut events = Vec::new();
-        
+
         if let Some(items) = resp.items {
             for event in items {
                 let id = event.id.unwrap_or_default();
@@ -120,7 +129,7 @@ impl CalendarClient {
     /// Create a new event
     pub async fn create_event(&self, title: &str, start: &str, end: &str) -> Result<String> {
         let url = "https://www.googleapis.com/calendar/v3/calendars/primary/events";
-        
+
         let event = serde_json::json!({
             "summary": title,
             "start": {
@@ -133,7 +142,8 @@ impl CalendarClient {
             }
         });
 
-        let resp: serde_json::Value = self.client
+        let resp: serde_json::Value = self
+            .client
             .post(url)
             .bearer_auth(&self.access_token)
             .json(&event)
@@ -152,13 +162,13 @@ impl CalendarClient {
             "https://www.googleapis.com/calendar/v3/calendars/primary/events/{}",
             event_id
         );
-        
+
         self.client
             .delete(&url)
             .bearer_auth(&self.access_token)
             .send()
             .await?;
-        
+
         Ok(())
     }
 }

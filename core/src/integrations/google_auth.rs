@@ -6,7 +6,7 @@ use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod};
 pub const ALL_SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.send",
-    "https://mail.google.com/",  // Full Gmail access for sending
+    "https://mail.google.com/", // Full Gmail access for sending
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/calendar.events",
 ];
@@ -29,12 +29,14 @@ fn token_cache_path() -> PathBuf {
 }
 
 /// Type alias for the authenticator used throughout the Google integration
-pub type GoogleAuthenticator = yup_oauth2::authenticator::Authenticator<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>;
+pub type GoogleAuthenticator = yup_oauth2::authenticator::Authenticator<
+    hyper_rustls::HttpsConnector<hyper::client::HttpConnector>,
+>;
 
 /// Create an authenticator for Google APIs with all scopes pre-authorized
 pub async fn get_authenticator() -> Result<GoogleAuthenticator> {
     let creds_path = credentials_path();
-    
+
     if !creds_path.exists() {
         return Err(anyhow::anyhow!(
             "credentials.json not found!\n\
@@ -48,7 +50,7 @@ pub async fn get_authenticator() -> Result<GoogleAuthenticator> {
     }
 
     let secret = yup_oauth2::read_application_secret(&creds_path).await?;
-    
+
     let auth = InstalledFlowAuthenticator::builder(secret, InstalledFlowReturnMethod::HTTPRedirect)
         .persist_tokens_to_disk(token_cache_path())
         .build()
@@ -66,7 +68,7 @@ pub async fn get_authenticator() -> Result<GoogleAuthenticator> {
 #[allow(dead_code)]
 pub async fn get_access_token(auth: &GoogleAuthenticator) -> Result<String> {
     let token = auth.token(ALL_SCOPES).await?;
-    
+
     match token.token() {
         Some(t) => Ok(t.to_string()),
         None => Err(anyhow::anyhow!("Failed to get access token")),

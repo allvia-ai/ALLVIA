@@ -1,4 +1,6 @@
-use crate::{consistency_check, db, performance_verification, quality_scorer, semantic_verification};
+use crate::{
+    consistency_check, db, performance_verification, quality_scorer, semantic_verification,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -40,17 +42,25 @@ pub fn build_baseline(req: ReleaseBaselineRequest) -> ReleaseBaseline {
     let semantic_max = req.max_files.unwrap_or(200);
     let performance_max = req.max_files.unwrap_or(300);
 
-    let semantic = req
-        .semantic
-        .or_else(|| Some(semantic_verification::semantic_consistency(&workdir, semantic_max)));
-    let performance = req
-        .performance
-        .or_else(|| Some(performance_verification::performance_baseline(&workdir, performance_max)));
-    let consistency = req
-        .consistency
-        .or_else(|| Some(consistency_check::run_consistency_check(consistency_check::ConsistencyCheckRequest {
-            workdir: Some(workdir.to_string_lossy().to_string()),
-        })));
+    let semantic = req.semantic.or_else(|| {
+        Some(semantic_verification::semantic_consistency(
+            &workdir,
+            semantic_max,
+        ))
+    });
+    let performance = req.performance.or_else(|| {
+        Some(performance_verification::performance_baseline(
+            &workdir,
+            performance_max,
+        ))
+    });
+    let consistency = req.consistency.or_else(|| {
+        Some(consistency_check::run_consistency_check(
+            consistency_check::ConsistencyCheckRequest {
+                workdir: Some(workdir.to_string_lossy().to_string()),
+            },
+        ))
+    });
 
     ReleaseBaseline {
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -104,8 +114,20 @@ fn evaluate_release_gate(
     };
 
     compare_semantic(&base, &current, &mut regressions, &mut warnings);
-    compare_performance(&base, &current, &mut regressions, &mut warnings, perf_override);
-    compare_quality(&base, &current, &mut regressions, &mut warnings, quality_override);
+    compare_performance(
+        &base,
+        &current,
+        &mut regressions,
+        &mut warnings,
+        perf_override,
+    );
+    compare_quality(
+        &base,
+        &current,
+        &mut regressions,
+        &mut warnings,
+        quality_override,
+    );
     compare_consistency(&base, &current, &mut regressions, &mut warnings);
 
     ReleaseGateResult {
@@ -177,7 +199,10 @@ fn compare_performance(
     let delta = perf_override.unwrap_or_else(|| env_f64("RELEASE_PERF_REGRESSION_PCT", 0.1));
     for base_metric in &base_perf.metrics {
         let Some(cur_metric) = cur_perf.metrics.iter().find(|m| m.name == base_metric.name) else {
-            warnings.push(format!("Current performance metric missing: {}", base_metric.name));
+            warnings.push(format!(
+                "Current performance metric missing: {}",
+                base_metric.name
+            ));
             continue;
         };
         if base_metric.value > 0.0 {

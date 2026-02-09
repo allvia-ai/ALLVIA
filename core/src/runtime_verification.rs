@@ -55,7 +55,9 @@ pub async fn run_runtime_verification(options: RuntimeVerifyOptions) -> RuntimeV
     let run_build_checks = options.run_build_checks.unwrap_or(false);
     let backend_port = options.backend_port.unwrap_or(5123);
     let frontend_port = options.frontend_port.unwrap_or(5173);
-    let backend_health_path = options.backend_health_path.unwrap_or_else(|| "/health".to_string());
+    let backend_health_path = options
+        .backend_health_path
+        .unwrap_or_else(|| "/health".to_string());
 
     let mut issues = Vec::new();
     let mut logs = Vec::new();
@@ -178,7 +180,10 @@ fn detect_backend_target(workdir: &Path) -> Option<BackendTarget> {
     };
 
     if !module.is_empty() {
-        return Some(BackendTarget::Python { dir: python_dir, module });
+        return Some(BackendTarget::Python {
+            dir: python_dir,
+            module,
+        });
     }
 
     if root_dir.join("Cargo.toml").exists() {
@@ -198,7 +203,9 @@ fn detect_frontend_target(workdir: &Path) -> Option<FrontendTarget> {
         return Some(FrontendTarget { dir: web_dir });
     }
     if workdir.join("package.json").exists() {
-        return Some(FrontendTarget { dir: workdir.to_path_buf() });
+        return Some(FrontendTarget {
+            dir: workdir.to_path_buf(),
+        });
     }
     None
 }
@@ -234,13 +241,8 @@ async fn start_backend(
             if !command_exists("cargo") {
                 return Err(anyhow::anyhow!("cargo not found in PATH"));
             }
-            let output = run_command(
-                "cargo",
-                &["check", "-q"],
-                dir,
-                Duration::from_secs(120),
-            )
-            .await?;
+            let output =
+                run_command("cargo", &["check", "-q"], dir, Duration::from_secs(120)).await?;
             logs.push(output);
             Ok(true)
         }
@@ -342,7 +344,8 @@ async fn run_backend_build_check(target: &BackendTarget, logs: &mut Vec<String>)
                 logs.push("cargo not found for backend build check".to_string());
                 return false;
             }
-            let output = run_command("cargo", &["check", "-q"], dir, Duration::from_secs(120)).await;
+            let output =
+                run_command("cargo", &["check", "-q"], dir, Duration::from_secs(120)).await;
             match output {
                 Ok(out) => {
                     logs.push(out);
@@ -362,7 +365,13 @@ async fn run_frontend_build_check(target: &FrontendTarget, logs: &mut Vec<String
         logs.push("npm not found for frontend build check".to_string());
         return false;
     }
-    let output = run_command("npm", &["run", "build"], &target.dir, Duration::from_secs(180)).await;
+    let output = run_command(
+        "npm",
+        &["run", "build"],
+        &target.dir,
+        Duration::from_secs(180),
+    )
+    .await;
     match output {
         Ok(out) => {
             logs.push(out);
@@ -383,7 +392,10 @@ async fn run_e2e_tests(
     if !command_exists("npx") {
         return Err(anyhow::anyhow!("npx not found in PATH"));
     }
-    let spec = target.dir.join("e2e").join("generated_verification.spec.ts");
+    let spec = target
+        .dir
+        .join("e2e")
+        .join("generated_verification.spec.ts");
     if !spec.exists() {
         return Err(anyhow::anyhow!("E2E spec not found at {}", spec.display()));
     }

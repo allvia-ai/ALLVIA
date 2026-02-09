@@ -1,7 +1,7 @@
+use crate::db;
 use crate::schema::AgentAction;
 use crate::security;
 use crate::shell_analysis;
-use crate::db;
 use crate::tool_policy;
 use std::env;
 
@@ -25,7 +25,11 @@ impl PolicyEngine {
         self.check_with_context(action, None)
     }
 
-    pub fn check_with_context(&self, action: &AgentAction, cwd: Option<&str>) -> Result<(), String> {
+    pub fn check_with_context(
+        &self,
+        action: &AgentAction,
+        cwd: Option<&str>,
+    ) -> Result<(), String> {
         if !tool_policy::is_action_allowed(action) {
             return Err("Tool policy blocked this action.".to_string());
         }
@@ -45,16 +49,21 @@ impl PolicyEngine {
                     Ok(())
                 }
             }
-            SecurityLevel::Critical => {
-                Err("Critical Action: Requires explicit 2FA/Confirmation (Not implemented).".to_string())
-            }
+            SecurityLevel::Critical => Err(
+                "Critical Action: Requires explicit 2FA/Confirmation (Not implemented)."
+                    .to_string(),
+            ),
         }
     }
 
     fn classify(&self, action: &AgentAction) -> SecurityLevel {
         match action {
-            AgentAction::UiSnapshot { .. } | AgentAction::UiFind { .. } | AgentAction::SystemSearch { .. } => SecurityLevel::Safe,
-            AgentAction::UiClick { .. } | AgentAction::UiClickText { .. } | AgentAction::KeyboardType { .. } => SecurityLevel::Caution,
+            AgentAction::UiSnapshot { .. }
+            | AgentAction::UiFind { .. }
+            | AgentAction::SystemSearch { .. } => SecurityLevel::Safe,
+            AgentAction::UiClick { .. }
+            | AgentAction::UiClickText { .. }
+            | AgentAction::KeyboardType { .. } => SecurityLevel::Caution,
             AgentAction::UiType { .. } => SecurityLevel::Caution,
             AgentAction::SystemOpen { .. } => SecurityLevel::Caution,
             AgentAction::ShellExecution { command } => {
@@ -62,17 +71,17 @@ impl PolicyEngine {
                     security::SafetyLevel::Critical => SecurityLevel::Critical,
                     _ => SecurityLevel::Caution,
                 }
-            },
+            }
             AgentAction::Terminate => SecurityLevel::Critical,
             AgentAction::DebugFakeLog => SecurityLevel::Safe,
         }
     }
-    
+
     pub fn unlock(&mut self) {
         self.write_lock = false;
         println!("[Policy] Write Lock UNLOCKED.");
     }
-    
+
     pub fn lock(&mut self) {
         self.write_lock = true;
         println!("[Policy] Write Lock ENGAGED.");
@@ -109,9 +118,15 @@ fn is_shell_command_allowed(command: &str, cwd: Option<&str>) -> bool {
         return true;
     }
 
-    let segments = if analysis.segments.is_empty() { vec![trimmed.to_string()] } else { analysis.segments };
+    let segments = if analysis.segments.is_empty() {
+        vec![trimmed.to_string()]
+    } else {
+        analysis.segments
+    };
     for segment in segments {
-        let allowed_by_list = allowlist.iter().any(|a| segment == *a || segment.starts_with(a));
+        let allowed_by_list = allowlist
+            .iter()
+            .any(|a| segment == *a || segment.starts_with(a));
         let allowed_by_db = db::is_exec_allowlisted(&segment, cwd).unwrap_or(false);
         if !allowed_by_list && !allowed_by_db {
             return false;
@@ -173,7 +188,10 @@ mod tests {
     #[test]
     fn test_caution_action_blocked_when_locked() {
         let policy = PolicyEngine::new(); // Default locked
-        let action = AgentAction::UiClick { element_id: "btn".to_string(), double_click: false };
+        let action = AgentAction::UiClick {
+            element_id: "btn".to_string(),
+            double_click: false,
+        };
         assert!(policy.check(&action).is_err());
     }
 
@@ -181,14 +199,19 @@ mod tests {
     fn test_caution_action_allowed_when_unlocked() {
         let mut policy = PolicyEngine::new();
         policy.unlock();
-        let action = AgentAction::UiClick { element_id: "btn".to_string(), double_click: false };
+        let action = AgentAction::UiClick {
+            element_id: "btn".to_string(),
+            double_click: false,
+        };
         assert!(policy.check(&action).is_ok());
     }
 
     #[test]
     fn test_dangerous_shell_blocked() {
         let policy = PolicyEngine::new();
-        let action = AgentAction::ShellExecution { command: "rm -rf /".to_string() };
+        let action = AgentAction::ShellExecution {
+            command: "rm -rf /".to_string(),
+        };
         // Should be Critical
         assert!(policy.check(&action).is_err());
     }

@@ -119,12 +119,12 @@ fn scan_frontend_calls(workdir: &Path) -> Vec<FrontendCall> {
         return calls;
     }
 
-    let files = collect_files(&web_dir, &[
-        "ts", "tsx", "js", "jsx",
-    ]);
+    let files = collect_files(&web_dir, &["ts", "tsx", "js", "jsx"]);
 
-    let axios_re = Regex::new(r#"\b(?:api|axios)\.(get|post|put|patch|delete)\(\s*([\"'`])([^\"'`]+)\2"#).unwrap();
-    let fetch_re = Regex::new(r#"\bfetch\(\s*([\"'`])([^\"'`]+)\1"#).unwrap();
+    let axios_re =
+        Regex::new(r#"\b(?:api|axios)\.(get|post|put|patch|delete)\(\s*[\"'`]([^\"'`]+)[\"'`]"#)
+            .unwrap();
+    let fetch_re = Regex::new(r#"\bfetch\(\s*[\"'`]([^\"'`]+)[\"'`]"#).unwrap();
 
     for file in files {
         let content = match fs::read_to_string(&file) {
@@ -134,7 +134,7 @@ fn scan_frontend_calls(workdir: &Path) -> Vec<FrontendCall> {
 
         for cap in axios_re.captures_iter(&content) {
             let method = cap.get(1).map(|m| m.as_str().to_uppercase());
-            let raw = cap.get(3).map(|m| m.as_str()).unwrap_or("");
+            let raw = cap.get(2).map(|m| m.as_str()).unwrap_or("");
             if let Some(path) = normalize_frontend_path(raw, base_prefix.as_deref()) {
                 calls.push(FrontendCall {
                     path,
@@ -145,7 +145,7 @@ fn scan_frontend_calls(workdir: &Path) -> Vec<FrontendCall> {
         }
 
         for cap in fetch_re.captures_iter(&content) {
-            let raw = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+            let raw = cap.get(1).map(|m| m.as_str()).unwrap_or("");
             if let Some(path) = normalize_frontend_path(raw, base_prefix.as_deref()) {
                 calls.push(FrontendCall {
                     path,
@@ -202,7 +202,10 @@ fn collect_files(root: &Path, extensions: &[&str]) -> Vec<PathBuf> {
 
 fn is_ignored_dir(path: &Path) -> bool {
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    matches!(name, "node_modules" | "dist" | "build" | ".next" | ".git" | "target")
+    matches!(
+        name,
+        "node_modules" | "dist" | "build" | ".next" | ".git" | "target"
+    )
 }
 
 fn normalize_backend_path(path: &str) -> String {
@@ -213,7 +216,10 @@ fn normalize_backend_path(path: &str) -> String {
     if let Some(idx) = normalized.find('?') {
         normalized.truncate(idx);
     }
-    normalized = Regex::new(r":([A-Za-z0-9_]+)").unwrap().replace_all(&normalized, ":param").to_string();
+    normalized = Regex::new(r":([A-Za-z0-9_]+)")
+        .unwrap()
+        .replace_all(&normalized, ":param")
+        .to_string();
     normalized = trim_trailing_slash(&normalized);
     if !normalized.starts_with('/') {
         normalized = format!("/{}", normalized);
@@ -238,7 +244,10 @@ fn normalize_frontend_path(raw: &str, base_prefix: Option<&str>) -> Option<Strin
         path.truncate(idx);
     }
 
-    path = Regex::new(r"\$\{[^}]+\}").unwrap().replace_all(&path, ":param").to_string();
+    path = Regex::new(r"\$\{[^}]+\}")
+        .unwrap()
+        .replace_all(&path, ":param")
+        .to_string();
 
     if let Some(prefix) = base_prefix {
         if path.starts_with('/') && !path.starts_with(prefix) {
@@ -336,7 +345,10 @@ mod tests {
     #[test]
     fn test_paths_match_param() {
         assert!(paths_match("/api/routines/123", "/api/routines/:param"));
-        assert!(!paths_match("/api/routines/123/abc", "/api/routines/:param"));
+        assert!(!paths_match(
+            "/api/routines/123/abc",
+            "/api/routines/:param"
+        ));
     }
 
     #[test]

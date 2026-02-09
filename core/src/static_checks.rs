@@ -96,10 +96,26 @@ pub fn run_static_checks(workdir: &Path, max_files: usize) -> StaticCheckResult 
 }
 
 fn is_check_target(path: &Path) -> bool {
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
     matches!(
         ext.as_str(),
-        "rs" | "py" | "ts" | "tsx" | "js" | "jsx" | "go" | "java" | "kt" | "swift" | "json" | "yaml" | "yml" | "toml"
+        "rs" | "py"
+            | "ts"
+            | "tsx"
+            | "js"
+            | "jsx"
+            | "go"
+            | "java"
+            | "kt"
+            | "swift"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "toml"
     )
 }
 
@@ -113,7 +129,9 @@ fn has_hidden_chars(path: &Path) -> bool {
         Ok(content) => content,
         Err(_) => return false,
     };
-    content.iter().any(|b| matches!(b, 0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0x7F))
+    content
+        .iter()
+        .any(|b| matches!(b, 0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0x7F))
 }
 
 fn is_ignored_dir(name: &str) -> bool {

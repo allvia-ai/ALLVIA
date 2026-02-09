@@ -1,5 +1,5 @@
-use reqwest::Client;
 use anyhow::Result;
+use reqwest::Client;
 
 pub struct TelegramBot {
     token: String,
@@ -26,10 +26,7 @@ impl TelegramBot {
     }
 
     pub async fn send(&self, message: &str) -> Result<()> {
-        let url = format!(
-            "https://api.telegram.org/bot{}/sendMessage",
-            self.token
-        );
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.token);
 
         let params = [
             ("chat_id", self.chat_id.as_str()),

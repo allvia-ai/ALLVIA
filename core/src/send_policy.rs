@@ -121,5 +121,9 @@ fn apply_rule_policy(ctx: &SendPolicyContext) -> Option<SendDecision> {
 
 fn normalize(value: Option<&str>) -> Option<String> {
     let v = value.unwrap_or("").trim().to_lowercase();
-    if v.is_empty() { None } else { Some(v) }
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
 }

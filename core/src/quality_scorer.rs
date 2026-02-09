@@ -1,5 +1,5 @@
-use crate::runtime_verification::RuntimeVerifyResult;
 use crate::llm_gateway::LLMClient;
+use crate::runtime_verification::RuntimeVerifyResult;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -137,7 +137,15 @@ pub fn score_quality(
     let summary = if issues.is_empty() {
         "Quality checks passed".to_string()
     } else {
-        format!("Issues: {}", issues.iter().take(3).cloned().collect::<Vec<_>>().join("; "))
+        format!(
+            "Issues: {}",
+            issues
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
     };
 
     QualityScore {

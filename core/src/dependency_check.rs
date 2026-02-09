@@ -1,5 +1,5 @@
-use std::process::Command;
 use serde::Serialize;
+use std::process::Command;
 
 #[derive(Serialize)]
 pub struct Dependency {
@@ -23,14 +23,16 @@ impl Dependency {
 
     pub fn check(&mut self) -> bool {
         let parts: Vec<&str> = self.check_cmd.split_whitespace().collect();
-        if parts.is_empty() { return false; }
-        
+        if parts.is_empty() {
+            return false;
+        }
+
         let success = Command::new(parts[0])
             .args(&parts[1..])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
-            
+
         self.is_missing = !success;
         success
     }
@@ -55,10 +57,12 @@ impl SystemHealth {
                 missing.push(dep);
             }
         }
-        
-        Self { missing_deps: missing }
+
+        Self {
+            missing_deps: missing,
+        }
     }
-    
+
     pub fn print_report(&self) {
         if self.missing_deps.is_empty() {
             println!("✅ All system dependencies are satisfied.");

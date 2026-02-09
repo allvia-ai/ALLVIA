@@ -1,4 +1,4 @@
-use crate::nl_automation::{Plan, VerificationResult, StepType};
+use crate::nl_automation::{Plan, StepType, VerificationResult};
 
 pub fn verify_plan(plan: &Plan) -> VerificationResult {
     let mut issues = Vec::new();
@@ -6,7 +6,10 @@ pub fn verify_plan(plan: &Plan) -> VerificationResult {
         issues.push("Plan has no steps".to_string());
     }
 
-    let has_extract = plan.steps.iter().any(|s| matches!(s.step_type, StepType::Extract));
+    let has_extract = plan
+        .steps
+        .iter()
+        .any(|s| matches!(s.step_type, StepType::Extract));
     if !has_extract {
         issues.push("No extract step found for result verification".to_string());
     }
@@ -18,12 +21,20 @@ pub fn verify_plan(plan: &Plan) -> VerificationResult {
         if plan.slots.get("to").map(|v| v.is_empty()).unwrap_or(true) {
             issues.push("Missing flight destination (to)".to_string());
         }
-        if plan.slots.get("date_start").map(|v| v.is_empty()).unwrap_or(true) {
+        if plan
+            .slots
+            .get("date_start")
+            .map(|v| v.is_empty())
+            .unwrap_or(true)
+        {
             issues.push("Missing flight start date".to_string());
         }
     }
 
-    if matches!(plan.intent, crate::nl_automation::IntentType::ShoppingCompare) {
+    if matches!(
+        plan.intent,
+        crate::nl_automation::IntentType::ShoppingCompare
+    ) {
         if plan
             .slots
             .get("product_name")
@@ -55,8 +66,12 @@ pub fn verify_execution(plan: &Plan, logs: &[String]) -> VerificationResult {
     let base = verify_plan(plan);
     let mut issues = base.issues;
     let has_summary = logs.iter().any(|line| line.starts_with("Summary: "));
-    let has_manual = logs.iter().any(|line| line.to_lowercase().contains("manual input"));
-    let has_blocked = logs.iter().any(|line| line.to_lowercase().contains("blocked"));
+    let has_manual = logs
+        .iter()
+        .any(|line| line.to_lowercase().contains("manual input"));
+    let has_blocked = logs
+        .iter()
+        .any(|line| line.to_lowercase().contains("blocked"));
 
     if matches!(
         plan.intent,

@@ -50,13 +50,13 @@ impl PermissionManager {
         extern "C" {
             fn AXIsProcessTrustedWithOptions(options: *const std::ffi::c_void) -> bool;
         }
-        
+
         // Create options dictionary with prompt key
         let key = CFString::new("AXTrustedCheckOptionPrompt");
         let value = CFBoolean::true_value();
-        
+
         let dict = CFDictionary::from_CFType_pairs(&[(key.as_CFType(), value.as_CFType())]);
-        
+
         unsafe {
             AXIsProcessTrustedWithOptions(dict.as_concrete_TypeRef() as *const std::ffi::c_void)
         }
@@ -137,8 +137,12 @@ impl PermissionManager {
         println!("🔐 Permission Status:");
         for status in Self::status_all() {
             let icon = if status.granted { "✅" } else { "❌" };
-            println!("   {} {}: {}", icon, status.capability, 
-                if status.granted { "Granted" } else { "Denied" });
+            println!(
+                "   {} {}: {}",
+                icon,
+                status.capability,
+                if status.granted { "Granted" } else { "Denied" }
+            );
         }
     }
 
@@ -152,10 +156,8 @@ impl PermissionManager {
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
             }
         };
-        
-        let _ = std::process::Command::new("open")
-            .arg(url)
-            .spawn();
+
+        let _ = std::process::Command::new("open").arg(url).spawn();
     }
 }
 

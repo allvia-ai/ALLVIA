@@ -1,9 +1,9 @@
 use crate::schema::{EventEnvelope, PrivacyContext};
+use hmac::{Hmac, Mac};
 use regex::Regex;
 use serde_json::Value;
-use std::collections::HashSet;
-use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use std::collections::HashSet;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -23,7 +23,7 @@ impl PrivacyGuard {
         mask_keys.insert("password".to_string());
         mask_keys.insert("secret".to_string());
         mask_keys.insert("token".to_string());
-        
+
         // Email pattern (Compile once or panic early)
         let email_regex = Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
             .expect("Invalid Regex Pattern in PrivacyGuard");
@@ -39,7 +39,7 @@ impl PrivacyGuard {
 
     pub fn apply(&self, mut envelope: EventEnvelope) -> Option<EventEnvelope> {
         // 1. App Allow/Deny (Skipped for simple MVP, can add later)
-        
+
         let mut redactions = Vec::new();
 
         // 2. Hash Window/Resource IDs
@@ -49,10 +49,10 @@ impl PrivacyGuard {
         }
 
         if let Some(res) = &mut envelope.resource {
-             if res.id != "unknown" {
-                 res.id = self.hash_value(&res.id);
-                 redactions.push("resource_id_hashed".to_string());
-             }
+            if res.id != "unknown" {
+                res.id = self.hash_value(&res.id);
+                redactions.push("resource_id_hashed".to_string());
+            }
         }
 
         // 3. Payload Sanitization
@@ -60,7 +60,7 @@ impl PrivacyGuard {
             let keys: Vec<String> = map.keys().cloned().collect();
             for key in keys {
                 let key_lower = key.to_lowercase();
-                
+
                 // Drop
                 if self.drop_keys.contains(&key_lower) {
                     map.remove(&key);
@@ -71,23 +71,23 @@ impl PrivacyGuard {
                 // Mask/Hash
                 if let Some(val) = map.get_mut(&key) {
                     if self.mask_keys.contains(&key_lower) {
-                         *val = Value::String("***MASKED***".to_string());
-                         redactions.push(format!("mask:{}", key));
-                    } 
-                     // Detect Emails in strings
+                        *val = Value::String("***MASKED***".to_string());
+                        redactions.push(format!("mask:{}", key));
+                    }
+                    // Detect Emails in strings
                     else if let Value::String(s) = val {
-                         if self.email_regex.is_match(s) {
-                             *val = Value::String("[EMAIL REDACTED]".to_string());
-                             redactions.push(format!("email_redacted:{}", key));
-                         }
-                         // URL Sanitization
-                         else if s.starts_with("http") {
-                             let sanitized = self.sanitize_url(s);
-                             if sanitized != *s {
-                                 *val = Value::String(sanitized);
-                                 redactions.push(format!("url_sanitized:{}", key));
-                             }
-                         }
+                        if self.email_regex.is_match(s) {
+                            *val = Value::String("[EMAIL REDACTED]".to_string());
+                            redactions.push(format!("email_redacted:{}", key));
+                        }
+                        // URL Sanitization
+                        else if s.starts_with("http") {
+                            let sanitized = self.sanitize_url(s);
+                            if sanitized != *s {
+                                *val = Value::String(sanitized);
+                                redactions.push(format!("url_sanitized:{}", key));
+                            }
+                        }
                     }
                 }
             }
@@ -99,7 +99,7 @@ impl PrivacyGuard {
             hash_method: "hmac_sha256".to_string(),
             is_masked: false,
         });
-        
+
         if !redactions.is_empty() {
             privacy.is_masked = true;
             // Append redactions logic if we add that field to PrivacyContext later
@@ -110,7 +110,8 @@ impl PrivacyGuard {
     }
 
     fn hash_value(&self, value: &str) -> String {
-        let mut mac = HmacSha256::new_from_slice(self.hash_salt.as_bytes()).expect("HMAC can take any key size");
+        let mut mac = HmacSha256::new_from_slice(self.hash_salt.as_bytes())
+            .expect("HMAC can take any key size");
         mac.update(value.as_bytes());
         let result = mac.finalize();
         hex::encode(result.into_bytes())
@@ -119,10 +120,10 @@ impl PrivacyGuard {
     /// Strip query parameters and hash fragments (e.g., ?token=xyz, #access_token=...)
     fn sanitize_url(&self, url: &str) -> String {
         let url_str = url.to_string();
-        
+
         // Find split point (first of '?' or '#')
         let split_idx = url_str.find(|c| c == '?' || c == '#');
-        
+
         if let Some(idx) = split_idx {
             url_str[..idx].to_string()
         } else {
@@ -132,19 +133,22 @@ impl PrivacyGuard {
     /// Public helper for masking arbitrary text (e.g. window titles)
     pub fn mask_sensitive_text(&self, text: &str) -> String {
         let mut masked = text.to_string();
-        
+
         // 1. Mask Emails
         if self.email_regex.is_match(&masked) {
-             masked = self.email_regex.replace_all(&masked, "[EMAIL REDACTED]").to_string();
+            masked = self
+                .email_regex
+                .replace_all(&masked, "[EMAIL REDACTED]")
+                .to_string();
         }
-        
+
         // 2. Simple Credit Card (Luhn check too expensive, just regex)
         // Matches 13-16 digits often separated by space or dash
         let cc_regex = Regex::new(r"\b(?:\d[ -]*?){13,16}\b").unwrap();
         if cc_regex.is_match(&masked) {
-             masked = cc_regex.replace_all(&masked, "[CC REDACTED]").to_string();
+            masked = cc_regex.replace_all(&masked, "[CC REDACTED]").to_string();
         }
-        
+
         masked
     }
 }

@@ -27,11 +27,19 @@ pub fn performance_baseline(workdir: &Path, max_files: usize) -> PerformanceVeri
 
     let total_bytes = total_code_bytes(workdir, max_files);
     let max_bytes_threshold = env_u64("PERF_MAX_CODE_BYTES", 5_000_000) as f64;
-    metrics.push(metric("code_bytes", total_bytes as f64, max_bytes_threshold));
+    metrics.push(metric(
+        "code_bytes",
+        total_bytes as f64,
+        max_bytes_threshold,
+    ));
 
     let dep_count = dependency_count(workdir);
     let max_deps_threshold = env_u64("PERF_MAX_DEPS", 200) as f64;
-    metrics.push(metric("dependency_count", dep_count as f64, max_deps_threshold));
+    metrics.push(metric(
+        "dependency_count",
+        dep_count as f64,
+        max_deps_threshold,
+    ));
 
     let ok = metrics.iter().all(|m| m.ok);
     let reason = if ok {
@@ -147,7 +155,11 @@ fn dependency_count(root: &Path) -> usize {
 }
 
 fn is_code_file(path: &Path) -> bool {
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
     matches!(
         ext.as_str(),
         "rs" | "py" | "ts" | "tsx" | "js" | "jsx" | "go" | "java" | "kt" | "swift" | "css" | "scss"

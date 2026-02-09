@@ -1,7 +1,7 @@
+use crate::static_checks;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use crate::static_checks;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticIssue {
@@ -51,7 +51,8 @@ pub fn semantic_consistency(workdir: &Path, max_files: usize) -> SemanticVerific
             }
             scanned += 1;
             if let Ok(content) = fs::read_to_string(&path) {
-                if content.contains("TODO") || content.contains("FIXME") || content.contains("XXX") {
+                if content.contains("TODO") || content.contains("FIXME") || content.contains("XXX")
+                {
                     issues.push(SemanticIssue {
                         file: display_path(workdir, &path),
                         reason: "TODO/FIXME marker present".to_string(),
@@ -108,7 +109,11 @@ pub fn semantic_consistency(workdir: &Path, max_files: usize) -> SemanticVerific
 }
 
 fn is_code_file(path: &Path) -> bool {
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
     matches!(
         ext.as_str(),
         "rs" | "py" | "ts" | "tsx" | "js" | "jsx" | "go" | "java" | "kt" | "swift"
