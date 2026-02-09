@@ -1,3 +1,3 @@
 pub mod accessibility;
-pub mod events;
 pub mod actions;
+pub mod events;

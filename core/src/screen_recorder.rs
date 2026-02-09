@@ -1,7 +1,7 @@
-use std::process::{Command, Child, Stdio};
-use std::sync::{Arc, Mutex};
-use std::path::PathBuf;
 use chrono::Local;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 pub struct ScreenRecorder {
     child: Arc<Mutex<Option<Child>>>,
@@ -14,7 +14,7 @@ impl ScreenRecorder {
         let mut output_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         output_dir.push(".steer");
         output_dir.push("recordings");
-        
+
         // Ensure dir exists
         let _ = std::fs::create_dir_all(&output_dir);
 
@@ -26,7 +26,7 @@ impl ScreenRecorder {
 
     pub fn start(&self) -> String {
         let mut child_guard = self.child.lock().unwrap();
-        
+
         // If already running, do nothing
         if child_guard.is_some() {
             return "Recording already in progress".to_string();
@@ -50,15 +50,22 @@ impl ScreenRecorder {
         // Log level quiet to avoid spam
         let child = Command::new("ffmpeg")
             .args(&[
-                "-f", "avfoundation",
-                "-r", "5",
-                "-i", "1", 
-                "-vf", "scale=1280:-1",
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-pix_fmt", "yuv420p",
+                "-f",
+                "avfoundation",
+                "-r",
+                "5",
+                "-i",
+                "1",
+                "-vf",
+                "scale=1280:-1",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
                 "-y",
-                &path_str
+                &path_str,
             ])
             .stdin(Stdio::piped()) // Needed to send 'q' later if we wanted, but kill is easier
             .stdout(Stdio::null())
@@ -69,7 +76,7 @@ impl ScreenRecorder {
             Ok(c) => {
                 *child_guard = Some(c);
                 format!("Started recording: {}", filename)
-            },
+            }
             Err(e) => {
                 format!("Failed to start recording: {}", e)
             }
@@ -78,18 +85,17 @@ impl ScreenRecorder {
 
     pub fn stop(&self) -> String {
         let mut child_guard = self.child.lock().unwrap();
-        
+
         if let Some(mut child) = child_guard.take() {
-            // Signal to stop. 
+            // Signal to stop.
             // Sending 'q' to stdin is ideal for ffmpeg to finish file properly.
             // But kill() is more reliable if stdin piping is flaky.
             // Let's try kill first for simplicity as -movflags +faststart usually handles abrupt stops or we can use SIGTERM.
-            // Actually, simply killing ffmpeg might corrupt the mp4 header. 
+            // Actually, simply killing ffmpeg might corrupt the mp4 header.
             // Better to use SIGTERM (Unix) which ffmpeg catches and closes gracefully.
-            
+
             #[cfg(unix)]
             {
-                use std::os::unix::process::CommandExt;
                 // Rust std doesn't expose signal sending easily on Child.
                 // We'll use the 'kill' command line for now as it's easiest cross-platform-ish on macos.
                 let _ = Command::new("kill")

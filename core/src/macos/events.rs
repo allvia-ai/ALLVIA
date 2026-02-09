@@ -1,11 +1,13 @@
-use core_graphics::event::{CGEventTap, CGEventType, CGEventTapLocation, CGEventTapPlacement, CGEventTapOptions};
+use crate::schema::{EventEnvelope, ResourceContext};
+use chrono::Utc;
+use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
+use core_graphics::event::{
+    CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
+};
+use serde_json::json;
 use std::thread;
 use tokio::sync::mpsc;
-use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
-use chrono::Utc;
-use serde_json::json;
 use uuid::Uuid;
-use crate::schema::{EventEnvelope, ResourceContext};
 
 // Hardcoded for MVP to avoid crate version mismatches
 // kCGKeyboardEventKeycode = 9
@@ -44,7 +46,7 @@ pub fn start_event_tap(tx: mpsc::Sender<String>) -> anyhow::Result<()> {
                             json!({ "keycode": keycode }),
                         );
                         serde_json::to_value(envelope).unwrap_or_else(|_| json!({}))
-                    },
+                    }
                     CGEventType::LeftMouseDown => {
                         let loc = event.location();
                         let envelope = base_envelope(
@@ -68,8 +70,12 @@ pub fn start_event_tap(tx: mpsc::Sender<String>) -> anyhow::Result<()> {
                     if let Err(e) = tx.try_send(log) {
                         use tokio::sync::mpsc::error::TrySendError;
                         match e {
-                            TrySendError::Full(_) => eprintln!("⚠️ [MacOS] Event Channel Full! Dropping event (increase buffer?)."),
-                            TrySendError::Closed(_) => eprintln!("⚠️ [MacOS] Event Channel Closed."),
+                            TrySendError::Full(_) => eprintln!(
+                                "⚠️ [MacOS] Event Channel Full! Dropping event (increase buffer?)."
+                            ),
+                            TrySendError::Closed(_) => {
+                                eprintln!("⚠️ [MacOS] Event Channel Closed.")
+                            }
                         }
                     }
                 } else {
@@ -81,17 +87,19 @@ pub fn start_event_tap(tx: mpsc::Sender<String>) -> anyhow::Result<()> {
         );
 
         match tap_result {
-            Ok(tap) => {
-                match tap.mach_port.create_runloop_source(0) {
-                    Ok(source) => {
-                        let current_loop = CFRunLoop::get_current();
-                        current_loop.add_source(&source, unsafe { kCFRunLoopCommonModes });
-                        
-                        println!("[MacOS] Event Tap Loop Running...");
-                        unsafe { CFRunLoopRun(); }
-                    },
-                    Err(_) => eprintln!("❌ Failed to create RunLoop source. Accessibility Access might be missing."),
+            Ok(tap) => match tap.mach_port.create_runloop_source(0) {
+                Ok(source) => {
+                    let current_loop = CFRunLoop::get_current();
+                    current_loop.add_source(&source, unsafe { kCFRunLoopCommonModes });
+
+                    println!("[MacOS] Event Tap Loop Running...");
+                    unsafe {
+                        CFRunLoopRun();
+                    }
                 }
+                Err(_) => eprintln!(
+                    "❌ Failed to create RunLoop source. Accessibility Access might be missing."
+                ),
             },
             Err(e) => eprintln!("❌ Failed to create CGEventTap: {:?}", e),
         }

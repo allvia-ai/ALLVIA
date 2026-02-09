@@ -31,7 +31,7 @@ impl NotionApi {
             base_url: "https://api.notion.com/v1".to_string(),
         }
     }
-    
+
     /// Search for pages matching a query
     pub async fn search(&self, query: &str) -> anyhow::Result<serde_json::Value> {
         let client = reqwest::Client::new();
@@ -50,7 +50,7 @@ impl NotionApi {
             .await?;
         Ok(res)
     }
-    
+
     /// Get page content (blocks)
     pub async fn get_page_content(&self, block_id: &str) -> anyhow::Result<String> {
         let client = reqwest::Client::new();
@@ -62,7 +62,7 @@ impl NotionApi {
             .await?
             .json()
             .await?;
-        
+
         // Extract text from blocks
         let mut text = String::new();
         if let Some(results) = res.get("results").and_then(|r| r.as_array()) {
@@ -70,7 +70,8 @@ impl NotionApi {
                 if let Some(paragraph) = block.get("paragraph") {
                     if let Some(rich_text) = paragraph.get("rich_text").and_then(|r| r.as_array()) {
                         for rt in rich_text {
-                            if let Some(plain_text) = rt.get("plain_text").and_then(|t| t.as_str()) {
+                            if let Some(plain_text) = rt.get("plain_text").and_then(|t| t.as_str())
+                            {
                                 text.push_str(plain_text);
                                 text.push('\n');
                             }
@@ -89,7 +90,7 @@ impl NotionApi {
 
 /// Gmail API Base URL: https://gmail.googleapis.com/gmail/v1
 /// Auth: OAuth 2.0 (requires user consent flow)
-/// 
+///
 /// For Steer agent, recommend using:
 /// - Service Account (for automated access)
 /// - Or: Desktop App OAuth flow via browser
@@ -112,7 +113,7 @@ impl GmailApi {
             base_url: "https://gmail.googleapis.com/gmail/v1".to_string(),
         }
     }
-    
+
     /// Search emails by query
     pub async fn search(&self, query: &str, max_results: u32) -> anyhow::Result<serde_json::Value> {
         let client = reqwest::Client::new();
@@ -126,19 +127,22 @@ impl GmailApi {
             .await?;
         Ok(res)
     }
-    
+
     /// Get email content by ID
     pub async fn get_message(&self, message_id: &str) -> anyhow::Result<String> {
         let client = reqwest::Client::new();
         let res: serde_json::Value = client
-            .get(format!("{}/users/me/messages/{}", self.base_url, message_id))
+            .get(format!(
+                "{}/users/me/messages/{}",
+                self.base_url, message_id
+            ))
             .header("Authorization", format!("Bearer {}", self.access_token))
             .query(&[("format", "full")])
             .send()
             .await?
             .json()
             .await?;
-        
+
         // Extract snippet/body
         if let Some(snippet) = res.get("snippet").and_then(|s| s.as_str()) {
             return Ok(snippet.to_string());

@@ -39,7 +39,10 @@ pub fn sanitize_shell_action(mut action: ShellAction, workdir: &str) -> ShellAct
         action.verify = merge_verify(&action.verify, FILES_TXT_VERIFICATION);
     } else {
         let inferred = infer_verify_steps(&instr);
-        action.verify = merge_verify(&action.verify, &inferred.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        action.verify = merge_verify(
+            &action.verify,
+            &inferred.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        );
     }
 
     if needs_missing_file_guard(&instr) {
@@ -67,20 +70,36 @@ pub fn verify_shell_action(action: &ShellAction, result: &str, workdir: &str) ->
     let result_lower = result.to_lowercase();
 
     if result_lower.contains("error") || result_lower.contains("exception") {
-        verdicts.push(VerifyVerdict { ok: false, reason: "result contains error".to_string() });
-        return VerifyResult { success: false, verdicts };
+        verdicts.push(VerifyVerdict {
+            ok: false,
+            reason: "result contains error".to_string(),
+        });
+        return VerifyResult {
+            success: false,
+            verdicts,
+        };
     }
 
     for item in &action.verify {
         if item == "tests_pass" {
             let ok = !result_lower.contains("fail") && !result_lower.contains("error");
-            verdicts.push(VerifyVerdict { ok, reason: "tests_pass".to_string() });
+            verdicts.push(VerifyVerdict {
+                ok,
+                reason: "tests_pass".to_string(),
+            });
         } else if item == "lint_pass" {
-            let ok = result_lower.contains("lint") && (result_lower.contains("pass") || result_lower.contains("no issues"));
-            verdicts.push(VerifyVerdict { ok, reason: "lint_pass".to_string() });
+            let ok = result_lower.contains("lint")
+                && (result_lower.contains("pass") || result_lower.contains("no issues"));
+            verdicts.push(VerifyVerdict {
+                ok,
+                reason: "lint_pass".to_string(),
+            });
         } else if item == "build_success" {
             let ok = !result_lower.contains("build failed") && !result_lower.contains("error");
-            verdicts.push(VerifyVerdict { ok, reason: "build_success".to_string() });
+            verdicts.push(VerifyVerdict {
+                ok,
+                reason: "build_success".to_string(),
+            });
         } else if item.starts_with("files_exist:") {
             let path = item.splitn(2, ':').nth(1).unwrap_or("");
             verdicts.push(VerifyVerdict {
@@ -131,8 +150,14 @@ pub fn infer_verify_steps(instruction: &str) -> Vec<String> {
 
 fn normalize_ls_command(instr: &str) -> String {
     let mut out = instr.to_string();
-    out = regex::Regex::new(r"ls -[aA]*l[aA]*").unwrap().replace_all(&out, "ls -1").to_string();
-    out = regex::Regex::new(r"ls -[aA]*").unwrap().replace_all(&out, "ls -1").to_string();
+    out = regex::Regex::new(r"ls -[aA]*l[aA]*")
+        .unwrap()
+        .replace_all(&out, "ls -1")
+        .to_string();
+    out = regex::Regex::new(r"ls -[aA]*")
+        .unwrap()
+        .replace_all(&out, "ls -1")
+        .to_string();
     out.replace("ls -A", "ls -1")
 }
 
@@ -162,7 +187,9 @@ fn merge_verify(existing: &[String], extra: &[&str]) -> Vec<String> {
 
 fn needs_missing_file_guard(instr: &str) -> bool {
     let lower = instr.to_lowercase();
-    ["modify", "update", "edit", "add", "append", "change"].iter().any(|k| lower.contains(k))
+    ["modify", "update", "edit", "add", "append", "change"]
+        .iter()
+        .any(|k| lower.contains(k))
 }
 
 fn exists_in_workdir(workdir: &str, target: &str) -> bool {
@@ -197,7 +224,9 @@ fn files_no_hidden(workdir: &str, path: &str) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    !content.chars().any(|c| c.is_control() && c != '\n' && c != '\t')
+    !content
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
 }
 
 fn files_match_listing(workdir: &str, path: &str) -> bool {

@@ -1,12 +1,12 @@
 // Browser Automation Module - Ported from clawdbot-main/src/browser/pw-tools-core.interactions.ts
 // Provides stable element references and Playwright-style automation
 
+use crate::peekaboo_cli;
+use crate::tool_chaining::CrossAppBridge;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::process::Command;
-use crate::peekaboo_cli;
-use crate::tool_chaining::CrossAppBridge;
 
 // =====================================================
 // Element Reference System (clawdbot pattern)
@@ -15,9 +15,9 @@ use crate::tool_chaining::CrossAppBridge;
 /// Element reference from accessibility tree snapshot
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ElementRef {
-    pub id: String,           // e.g., "E123"
-    pub role: String,         // e.g., "button", "textbox"
-    pub name: String,         // Accessible name
+    pub id: String,   // e.g., "E123"
+    pub role: String, // e.g., "button", "textbox"
+    pub name: String, // Accessible name
     pub bounds: Option<Bounds>,
 }
 
@@ -69,7 +69,7 @@ impl BrowserAutomation {
     // =====================================================
     // Snapshot: Build element reference map (like clawdbot's restoreRoleRefsForTarget)
     // =====================================================
-    
+
     /// Take accessibility snapshot and build element reference map
     pub fn take_snapshot(&mut self) -> Result<Vec<ElementRef>> {
         let mut refs = Vec::new();
@@ -78,7 +78,7 @@ impl BrowserAutomation {
         self.last_snapshot_refs.clear();
         self.last_snapshot_source = SnapshotSource::AppleScript;
         self.last_snapshot_id = None;
-        
+
         // Use AppleScript to get accessibility tree
         let script = r#"
             tell application "System Events"
@@ -105,7 +105,7 @@ impl BrowserAutomation {
                 return output
             end tell
         "#;
-        
+
         let output = Command::new("osascript")
             .arg("-e")
             .arg(script)
@@ -150,7 +150,12 @@ impl BrowserAutomation {
                     self.last_snapshot_id = snapshot.snapshot_id.clone();
 
                     for elem in snapshot.elements {
-                        let bounds = elem.bounds.map(|(x, y, w, h)| Bounds { x, y, width: w, height: h });
+                        let bounds = elem.bounds.map(|(x, y, w, h)| Bounds {
+                            x,
+                            y,
+                            width: w,
+                            height: h,
+                        });
                         let elem_ref = ElementRef {
                             id: elem.id.clone(),
                             role: elem.role.clone(),
@@ -161,7 +166,10 @@ impl BrowserAutomation {
                         self.last_snapshot_refs.push(elem_ref.clone());
                         refs.push(elem_ref);
                     }
-                    println!("📸 [Browser] Snapshot captured via Peekaboo: {} elements", refs.len());
+                    println!(
+                        "📸 [Browser] Snapshot captured via Peekaboo: {} elements",
+                        refs.len()
+                    );
                     return Ok(refs);
                 }
             }
@@ -200,32 +208,35 @@ impl BrowserAutomation {
             return Ok(());
         }
 
-        let elem = self.element_refs.get(ref_id)
-            .ok_or_else(|| anyhow::anyhow!("Element ref '{}' not found. Take a new snapshot.", ref_id))?;
-        
-        let (x, y) = elem.bounds.as_ref()
+        let elem = self.element_refs.get(ref_id).ok_or_else(|| {
+            anyhow::anyhow!("Element ref '{}' not found. Take a new snapshot.", ref_id)
+        })?;
+
+        let (x, y) = elem
+            .bounds
+            .as_ref()
             .map(|b| b.center())
             .ok_or_else(|| anyhow::anyhow!("Element '{}' has no bounds", ref_id))?;
-        
+
         let click_count = if double_click { 2 } else { 1 };
-        
+
         let script = format!(
             r#"tell application "System Events" to click at {{{}, {}}} "#,
             x, y
         );
-        
+
         for _ in 0..click_count {
             Command::new("osascript")
                 .arg("-e")
                 .arg(&script)
                 .output()
                 .context("Failed to execute click")?;
-            
+
             if double_click {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
-        
+
         println!("🖱️ [Browser] Clicked '{}' at ({}, {})", elem.name, x, y);
         Ok(())
     }
@@ -240,13 +251,17 @@ impl BrowserAutomation {
             return Ok(());
         }
 
-        let elem = self.element_refs.get(ref_id)
+        let elem = self
+            .element_refs
+            .get(ref_id)
             .ok_or_else(|| anyhow::anyhow!("Element ref '{}' not found", ref_id))?;
-        
-        let (x, y) = elem.bounds.as_ref()
+
+        let (x, y) = elem
+            .bounds
+            .as_ref()
             .map(|b| b.center())
             .ok_or_else(|| anyhow::anyhow!("Element '{}' has no bounds", ref_id))?;
-        
+
         // Move mouse without clicking
         let script = format!(
             r#"
@@ -254,13 +269,10 @@ impl BrowserAutomation {
             "#,
             x, y
         );
-        
+
         // Fallback: Use CoreGraphics via AppleScript
-        let _ = Command::new("osascript")
-            .arg("-e")
-            .arg(&script)
-            .output();
-        
+        let _ = Command::new("osascript").arg("-e").arg(&script).output();
+
         println!("👆 [Browser] Hover over '{}' at ({}, {})", elem.name, x, y);
         Ok(())
     }
@@ -269,7 +281,7 @@ impl BrowserAutomation {
     pub fn type_text(&self, text: &str, delay_ms: u64) -> Result<()> {
         // Use keystroke for reliable typing
         let escaped = text.replace("\"", "\\\"").replace("\\", "\\\\");
-        
+
         let script = if delay_ms > 0 {
             format!(
                 r#"
@@ -289,21 +301,24 @@ impl BrowserAutomation {
                 escaped
             )
         };
-        
+
         Command::new("osascript")
             .arg("-e")
             .arg(&script)
             .output()
             .context("Failed to type text")?;
-        
-        println!("⌨️ [Browser] Typed: '{}'", if text.len() > 20 { &text[..20] } else { text });
+
+        println!(
+            "⌨️ [Browser] Typed: '{}'",
+            if text.len() > 20 { &text[..20] } else { text }
+        );
         Ok(())
     }
 
     /// Find element by name/text (returns ref_id)
     pub fn find_by_name(&self, name: &str) -> Option<String> {
         let name_lower = name.to_lowercase();
-        
+
         for (ref_id, elem) in &self.element_refs {
             if elem.name.to_lowercase().contains(&name_lower) {
                 return Some(ref_id.clone());
@@ -328,7 +343,11 @@ impl BrowserAutomation {
         }
         let mut parts: Vec<String> = Vec::new();
         for r in refs.iter().take(max) {
-            let name = if r.name.trim().is_empty() { "(unnamed)" } else { r.name.as_str() };
+            let name = if r.name.trim().is_empty() {
+                "(unnamed)"
+            } else {
+                r.name.as_str()
+            };
             parts.push(format!("{} [{}] \"{}\"", r.id, r.role, name));
         }
         let mut summary = format!("SNAPSHOT_REFS: {}", parts.join("; "));
@@ -341,7 +360,7 @@ impl BrowserAutomation {
     /// Navigate to URL (opens in default browser or specified browser)
     pub fn navigate(&self, url: &str, browser: Option<&str>) -> Result<()> {
         let browser_name = browser.unwrap_or("Safari");
-        
+
         let script = format!(
             r#"
             tell application "{}"
@@ -351,13 +370,13 @@ impl BrowserAutomation {
             "#,
             browser_name, url
         );
-        
+
         Command::new("osascript")
             .arg("-e")
             .arg(&script)
             .output()
             .context("Failed to navigate")?;
-        
+
         println!("🌐 [Browser] Navigate to: {}", url);
         Ok(())
     }
@@ -365,7 +384,7 @@ impl BrowserAutomation {
     // =====================================================
     // Helper: AI-Friendly Error (clawdbot pattern)
     // =====================================================
-    
+
     pub fn to_ai_friendly_error(err: anyhow::Error, context: &str) -> anyhow::Error {
         anyhow::anyhow!(
             "Action failed on '{}': {}. Try taking a new snapshot or using a different approach.",
@@ -384,9 +403,8 @@ use once_cell::sync::Lazy;
 use std::sync::Mutex;
 
 /// Singleton-style access (Thread-Safe)
-static BROWSER_AUTOMATION: Lazy<Mutex<BrowserAutomation>> = Lazy::new(|| {
-    Mutex::new(BrowserAutomation::new())
-});
+static BROWSER_AUTOMATION: Lazy<Mutex<BrowserAutomation>> =
+    Lazy::new(|| Mutex::new(BrowserAutomation::new()));
 
 pub fn get_browser_automation() -> std::sync::MutexGuard<'static, BrowserAutomation> {
     BROWSER_AUTOMATION.lock().unwrap()
@@ -398,7 +416,12 @@ mod tests {
 
     #[test]
     fn test_bounds_center() {
-        let bounds = Bounds { x: 100, y: 200, width: 50, height: 30 };
+        let bounds = Bounds {
+            x: 100,
+            y: 200,
+            width: 50,
+            height: 30,
+        };
         assert_eq!(bounds.center(), (125, 215));
     }
 }
@@ -415,29 +438,37 @@ pub fn open_url_in_chrome(url: &str) -> Result<()> {
 pub fn scroll_page(pixels: i32) -> Result<()> {
     let direction = if pixels > 0 { "down" } else { "up" };
     let amount = pixels.abs();
-    
+
     let script = format!(
         r#"tell application "System Events" to scroll {} by {}"#,
         direction, amount
     );
-    
+
     std::process::Command::new("osascript")
         .arg("-e")
         .arg(&script)
         .output()
         .context("Failed to scroll")?;
-    
+
     Ok(())
 }
 
 /// Apply flight filters - legacy API (stub) - Returns bool for success
-pub fn apply_flight_filters(_budget: Option<&str>, _time_window: Option<&str>, _direct_only: Option<&str>) -> Result<bool> {
+pub fn apply_flight_filters(
+    _budget: Option<&str>,
+    _time_window: Option<&str>,
+    _direct_only: Option<&str>,
+) -> Result<bool> {
     println!("⚠️ [Browser] apply_flight_filters: Use new ref-based API instead");
     Ok(false) // Return false to indicate manual action needed
 }
 
 /// Apply shopping filters - legacy API (stub) - Returns bool for success
-pub fn apply_shopping_filters(_brand: Option<&str>, _price_min: Option<&str>, _price_max: Option<&str>) -> Result<bool> {
+pub fn apply_shopping_filters(
+    _brand: Option<&str>,
+    _price_min: Option<&str>,
+    _price_max: Option<&str>,
+) -> Result<bool> {
     println!("⚠️ [Browser] apply_shopping_filters: Use new ref-based API instead");
     Ok(false) // Return false to indicate manual action needed
 }
@@ -454,7 +485,12 @@ pub fn get_page_context() -> Result<String> {
 }
 
 /// Fill flight fields - legacy API (stub) - Returns bool for success
-pub fn fill_flight_fields(_from: &str, _to: &str, _date_start: &str, _date_end: Option<&str>) -> Result<bool> {
+pub fn fill_flight_fields(
+    _from: &str,
+    _to: &str,
+    _date_start: &str,
+    _date_end: Option<&str>,
+) -> Result<bool> {
     println!("⚠️ [Browser] fill_flight_fields: Use new type_text API instead");
     Ok(true) // Return true to indicate attempted (stub)
 }

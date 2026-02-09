@@ -1,17 +1,21 @@
-use serde_json::{json, Value};
 use accessibility_sys::{
-    AXUIElementCopyAttributeValue, AXUIElementCreateSystemWide, AXUIElementRef,
-    AXUIElementCopyElementAtPosition,
+    AXUIElementCopyAttributeValue, AXUIElementCopyElementAtPosition, AXUIElementCreateSystemWide,
+    AXUIElementRef,
 };
+use core_foundation::array::CFArray;
 use core_foundation::base::{CFTypeRef, TCFType};
 use core_foundation::string::CFString;
-use core_foundation::array::CFArray;
+use serde_json::{json, Value};
 use std::ptr;
 
 // Helper to convert foreign AX error to Result
 #[allow(dead_code)]
 fn check_ax_err(err: i32) -> Result<(), i32> {
-    if err == 0 { Ok(()) } else { Err(err) }
+    if err == 0 {
+        Ok(())
+    } else {
+        Err(err)
+    }
 }
 
 // Helper to get attribute
@@ -19,7 +23,8 @@ fn get_attribute(element: AXUIElementRef, attribute: &str) -> Option<CFTypeRef> 
     unsafe {
         let attr_name = CFString::new(attribute);
         let mut value_ref: CFTypeRef = ptr::null_mut();
-        let err = AXUIElementCopyAttributeValue(element, attr_name.as_concrete_TypeRef(), &mut value_ref);
+        let err =
+            AXUIElementCopyAttributeValue(element, attr_name.as_concrete_TypeRef(), &mut value_ref);
         if err == 0 {
             Some(value_ref)
         } else {
@@ -32,7 +37,9 @@ fn get_attribute(element: AXUIElementRef, attribute: &str) -> Option<CFTypeRef> 
 struct AxElement(AXUIElementRef);
 impl Drop for AxElement {
     fn drop(&mut self) {
-        unsafe { core_foundation::base::CFRelease(self.0 as CFTypeRef); }
+        unsafe {
+            core_foundation::base::CFRelease(self.0 as CFTypeRef);
+        }
     }
 }
 
@@ -57,13 +64,15 @@ pub fn snapshot(_scope: Option<String>) -> Value {
 
         // 3. Focused Window
         let focused_window_ref = match get_attribute(focused_app_ref, "AXFocusedWindow") {
-             Some(r) => r as AXUIElementRef,
-             None => return json!({ "role": "AXApplication", "title": app_title, "error": "No focused window" }),
+            Some(r) => r as AXUIElementRef,
+            None => {
+                return json!({ "role": "AXApplication", "title": app_title, "error": "No focused window" })
+            }
         };
         let _focused_window = AxElement(focused_window_ref);
-        
+
         let window_title = get_string_attribute(focused_window_ref, "AXTitle").unwrap_or_default();
-        
+
         // 4. Traverse Children (Limit depth for MVP)
         // For performance, we only dump the focused window's children.
         let children_json = traverse_children(focused_window_ref, 0, 2);
@@ -81,42 +90,52 @@ pub fn snapshot(_scope: Option<String>) -> Value {
 }
 
 unsafe fn traverse_children(element: AXUIElementRef, depth: usize, max_depth: usize) -> Vec<Value> {
-    if depth > max_depth { return vec![]; }
-    
+    if depth > max_depth {
+        return vec![];
+    }
+
     let mut nodes = Vec::new();
-    
+
     if let Some(children_ref) = get_attribute(element, "AXChildren") {
-        let children_array = CFArray::<CFTypeRef>::wrap_under_get_rule(children_ref as core_foundation::array::CFArrayRef);
-        
+        let children_array = CFArray::<CFTypeRef>::wrap_under_get_rule(
+            children_ref as core_foundation::array::CFArrayRef,
+        );
+
         for i in 0..children_array.len() {
-             let Some(child_ptr) = children_array.get(i) else { continue; };
-             let child_element = *child_ptr as AXUIElementRef;
-             
-             let role = get_string_attribute(child_element, "AXRole").unwrap_or_default();
-             let title = get_string_attribute(child_element, "AXTitle").unwrap_or_default();
-             let value = get_string_attribute(child_element, "AXValue").unwrap_or_default();
-             
-             // Recursion
-             let sub_children = if depth < max_depth {
-                 traverse_children(child_element, depth + 1, max_depth)
-             } else {
-                 vec![]
-             };
-             
-             let mut node = json!({
-                 "role": role,
-                 "children": sub_children
-             });
-             
-             if !title.is_empty() { node["title"] = json!(title); }
-             if !value.is_empty() { node["value"] = json!(value); }
-             
-             nodes.push(node);
+            let Some(child_ptr) = children_array.get(i) else {
+                continue;
+            };
+            let child_element = *child_ptr as AXUIElementRef;
+
+            let role = get_string_attribute(child_element, "AXRole").unwrap_or_default();
+            let title = get_string_attribute(child_element, "AXTitle").unwrap_or_default();
+            let value = get_string_attribute(child_element, "AXValue").unwrap_or_default();
+
+            // Recursion
+            let sub_children = if depth < max_depth {
+                traverse_children(child_element, depth + 1, max_depth)
+            } else {
+                vec![]
+            };
+
+            let mut node = json!({
+                "role": role,
+                "children": sub_children
+            });
+
+            if !title.is_empty() {
+                node["title"] = json!(title);
+            }
+            if !value.is_empty() {
+                node["value"] = json!(value);
+            }
+
+            nodes.push(node);
         }
         // Release the array ref
         core_foundation::base::CFRelease(children_ref);
     }
-    
+
     nodes
 }
 
@@ -124,7 +143,8 @@ unsafe fn get_string_attribute(element: AXUIElementRef, attr: &str) -> Option<St
     if let Some(val_ref) = get_attribute(element, attr) {
         // Assume it's a string
         // Check ID?
-        let cf_str = CFString::wrap_under_create_rule(val_ref as core_foundation::string::CFStringRef);
+        let cf_str =
+            CFString::wrap_under_create_rule(val_ref as core_foundation::string::CFStringRef);
         Some(cf_str.to_string())
     } else {
         None
@@ -190,59 +210,61 @@ pub fn find_element_at_pos(x: f32, y: f32) -> Option<(i32, i32)> {
     unsafe {
         let system_wide = AXUIElementCreateSystemWide();
         let _system = AxElement(system_wide); // Release
-        
+
         let mut element_ref: AXUIElementRef = ptr::null_mut();
-        
+
         let err = AXUIElementCopyElementAtPosition(system_wide, x, y, &mut element_ref);
-        if err != 0 { return None; }
-        
+        if err != 0 {
+            return None;
+        }
+
         // Wrap for release
         let _element = AxElement(element_ref);
 
         // Get Position
-        let pos_val = get_attribute(element_ref, "AXPosition")?;
+        let _pos_val = get_attribute(element_ref, "AXPosition")?;
         // Get Size
-        let size_val = get_attribute(element_ref, "AXSize")?;
-        
+        let _size_val = get_attribute(element_ref, "AXSize")?;
+
         // Convert to concrete values (Need AXValueGetValue)
         // Accessing AXValue is tricky via raw bindings without `core-foundation` helpers for AXValue.
         // For MVP, if we found an element, we assume it's robust.
         // But to return CENTER, we need logic.
-        
+
         // Wait, since parsing AXValue structure manually in Rust is painful without a helper crate,
         // and we barely have `accessibility-sys`.
         // Let's rely on AppleScript for the "Get Position/Size" part if raw bindings fail.
         // Actually, let's keep it simple: If we found *something* at (x,y), we trust the OS.
-        // But the goal is "Snapping". 
+        // But the goal is "Snapping".
         // If we click (100, 100), and the element is at (0, 0) size (200, 200), its center is (100, 100).
         // If we click (190, 190), and element is the same, center is (100, 100).
         // We WANT to click (100, 100) instead of (190, 190).
-        
+
         // Alternative: Use AppleScript to query element at raw pos?
         // "tell application 'System Events' to click at {x,y}" is already what we do.
-        
+
         // The point of "Hybrid Grounding" is to correct MIS-CLICKS.
         // e.g. Vision says (500, 500) [Empty Space], but Button is at (480, 500).
         // OS `ElementAtPosition(500, 500)` might return "Window" (parent) instead of "Button".
-        
+
         // Only if we hit the button do we get the button.
         // So this function helps verify: "Is there a clickable thing here?"
         // If it returns "Window" or "Group", maybe we are off.
-        
+
         // Let's implement a "Smart Snap" via Applescript for simplicity vs Unsafe Rust logic?
         // No, let's try to extract position if possible.
         // Just checking if we hit a LEAF node is good enough.
-        
+
         // For now, let's return input (x,y) if success, just to validate "Something is there".
         // Use AppleScript for the heavy lifting of "Find nearest button"?
-        
+
         // Let's stick to: "Confirm there is a UI element"
-        
+
         // Actually, to implement "Snap to Center", we NEED the position/size.
         // Since properly binding AXValue in raw Rust is verbose...
         // I will use a helper AppleScript to "Get Center of Element at X,Y".
         // It's slower but safe and easy implementation for this MVP.
-        
+
         None // Fallback to AppleScript approach below
     }
 }
@@ -250,7 +272,7 @@ pub fn find_element_at_pos(x: f32, y: f32) -> Option<(i32, i32)> {
 pub fn get_element_center_at(x: i32, y: i32) -> Option<(i32, i32)> {
     // Returns the center (x, y) of the element at the given coordinates.
     // Minimizes "edge clicking" risk.
-    let script = format!(
+    let _script = format!(
         r#"
         use framework "CoreGraphics"
         use scripting additions
@@ -262,30 +284,33 @@ pub fn get_element_center_at(x: i32, y: i32) -> Option<(i32, i32)> {
              -- Standard way: click, but we want to query.
              -- Let's iterate processes? Too slow.
         end tell
-        "#, x, y);
-        
+        "#,
+        x, y
+    );
+
     // Actually, AXUIElementCopyElementAtPosition IS the best way.
     // Let's try to do it properly in Rust, ignoring complex AXValue parsing if hard.
     // BUT we can check the ROLE. If role is "AXButton", we trust it.
-    
+
     // For now, let's just use the function signature and "Mock" it or use a simplified check
     // because complex struct decoding (AXValue) without `accessibility` crate (we have sys) is error prone.
-    
+
     // Let's simulate a "Snap" by verifying existence.
     // If AXUIElementCopyElementAtPosition returns valid ref, it means "Hit".
     // We return input (x,y) to confirm "Yes, valid target".
-    
+
     unsafe {
         let system_wide = AXUIElementCreateSystemWide();
-        let _system = AxElement(system_wide); 
+        let _system = AxElement(system_wide);
         let mut element_ref: AXUIElementRef = ptr::null_mut();
-        let err = AXUIElementCopyElementAtPosition(system_wide, x as f32, y as f32, &mut element_ref);
+        let err =
+            AXUIElementCopyElementAtPosition(system_wide, x as f32, y as f32, &mut element_ref);
         if err == 0 && !element_ref.is_null() {
-             let _element = AxElement(element_ref);
-             // We hit something!
-             Some((x, y))
+            let _element = AxElement(element_ref);
+            // We hit something!
+            Some((x, y))
         } else {
-             None
+            None
         }
     }
 }
@@ -299,14 +324,14 @@ pub fn get_element_center_at(x: i32, y: i32) -> Option<(i32, i32)> {
 /// This serves as a CLI fallback when vision-based click fails
 pub fn find_text_on_screen(query: &str) -> Option<String> {
     let query_lower = query.to_lowercase();
-    
+
     unsafe {
         let system_wide = AXUIElementCreateSystemWide();
         if system_wide.is_null() {
             return None;
         }
         let _system = AxElement(system_wide);
-        
+
         // Get focused application
         let focused_app_ref = get_attribute(system_wide, "AXFocusedApplication");
         if focused_app_ref.is_none() {
@@ -314,17 +339,20 @@ pub fn find_text_on_screen(query: &str) -> Option<String> {
         }
         let focused_app = focused_app_ref.unwrap() as AXUIElementRef;
         let _focused_app_guard = AxElement(focused_app);
-        
+
         // Search through UI hierarchy
         fn search_element(element: AXUIElementRef, query: &str, depth: usize) -> Option<String> {
-            if depth > 8 { return None; } // Limit recursion for performance
-            
+            if depth > 8 {
+                return None;
+            } // Limit recursion for performance
+
             unsafe {
                 // Check this element's text attributes
                 let title = get_string_attribute(element, "AXTitle").unwrap_or_default();
                 let value = get_string_attribute(element, "AXValue").unwrap_or_default();
-                let description = get_string_attribute(element, "AXDescription").unwrap_or_default();
-                
+                let description =
+                    get_string_attribute(element, "AXDescription").unwrap_or_default();
+
                 // Check if any text matches (case-insensitive)
                 if title.to_lowercase().contains(query) {
                     return Some(format!("title:{}", title));
@@ -335,13 +363,13 @@ pub fn find_text_on_screen(query: &str) -> Option<String> {
                 if description.to_lowercase().contains(query) {
                     return Some(format!("description:{}", description));
                 }
-                
+
                 // Search children
                 if let Some(children_ref) = get_attribute(element, "AXChildren") {
                     let children_array = CFArray::<CFTypeRef>::wrap_under_get_rule(
-                        children_ref as core_foundation::array::CFArrayRef
+                        children_ref as core_foundation::array::CFArrayRef,
                     );
-                    
+
                     for i in 0..children_array.len() {
                         if let Some(child_ptr) = children_array.get(i) {
                             let child = *child_ptr as AXUIElementRef;
@@ -353,12 +381,11 @@ pub fn find_text_on_screen(query: &str) -> Option<String> {
                     }
                     core_foundation::base::CFRelease(children_ref);
                 }
-                
+
                 None
             }
         }
-        
+
         search_element(focused_app, &query_lower, 0)
     }
 }
-

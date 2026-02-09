@@ -1,5 +1,5 @@
-use std::process::Command;
 use anyhow::{Context, Result};
+use std::process::Command;
 
 pub fn run(script: &str) -> Result<String> {
     #[cfg(target_os = "macos")]
@@ -34,13 +34,13 @@ pub fn control_app(app: &str, command: &str) -> Result<String> {
         ("notes", "new") => "tell application \"Notes\" to make new note at folder \"Notes\"",
         _ => return Err(anyhow::anyhow!("Unknown app control command")),
     };
-    
-    
+
     run(script)
 }
 
 pub fn activate_app(app: &str) -> Result<String> {
-    let script = format!(r#"
+    let script = format!(
+        r#"
     tell application "{}"
         activate
         repeat until frontmost
@@ -48,7 +48,9 @@ pub fn activate_app(app: &str) -> Result<String> {
         end repeat
         delay 0.5
     end tell
-    "#, app);
+    "#,
+        app
+    );
     run(&script)
 }
 
@@ -121,7 +123,7 @@ pub fn get_active_window_context() -> Result<(String, String)> {
     let parts: Vec<&str> = output.split("|||").collect();
     let title = parts.get(0).unwrap_or(&"").trim().to_string();
     let url = parts.get(1).unwrap_or(&"").trim().to_string();
-    
+
     Ok((title, url))
 }
 
@@ -153,10 +155,15 @@ fn run_lines_with_args(lines: &[&str], args: &[String]) -> Result<String> {
     }
 }
 
+pub fn run_with_args(lines: &[&str], args: &[String]) -> Result<String> {
+    run_lines_with_args(lines, args)
+}
+
 pub fn open_url(url: &str) -> Result<String> {
     // Smart Open: Detects if Safari or Chrome is frontmost and force-opens there.
     // Otherwise falls back to system default.
-    let script = format!(r#"
+    let script = format!(
+        r#"
         tell application "System Events"
             set frontApp to name of first application process whose frontmost is true
         end tell
@@ -177,7 +184,9 @@ pub fn open_url(url: &str) -> Result<String> {
             open location "{}"
             return "Opened in Default Browser"
         end if
-    "#, url, url, url);
-    
+    "#,
+        url, url, url
+    );
+
     run(&script)
 }
