@@ -80,6 +80,7 @@ export const ExecResultSchema = z.object({
 export const RoutineRunSchema = z.object({
     id: z.number(),
     routine_id: z.number(),
+    routine_name: z.string().optional(),
     started_at: z.string(),
     finished_at: z.string().nullable().optional(),
     status: z.string(),
@@ -190,6 +191,8 @@ export const VerificationRunSchema = z.object({
     id: z.number(),
     created_at: z.string(),
     kind: z.string(),
+    mode: z.string().optional(),
+    status: z.string().optional(),
     ok: z.boolean(),
     summary: z.string(),
     details: z.string().nullable().optional(),

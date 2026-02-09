@@ -1386,7 +1386,7 @@ function VerificationActionsCard() {
     const backendBuildState = runtimeResult?.backend_build_ok;
     const frontendBuildState = runtimeResult?.frontend_build_ok;
     const e2eState = runtimeResult?.e2e_passed;
-    const buildLabel = (value?: boolean) => (value === undefined ? "—" : value ? "OK" : "Fail");
+    const buildLabel = (value?: boolean | null) => (value === undefined || value === null ? "—" : value ? "OK" : "Fail");
 
     return (
         <Card className="h-auto mb-4 border-white/10 bg-white/5">
@@ -1941,11 +1941,11 @@ function NaturalLanguageAutomationCard() {
                 ? execStatus === "completed"
                     ? "done"
                     : execStatus === "approval_required" || execStatus === "manual_required"
-                    ? "pending"
-                    : "blocked"
+                        ? "pending"
+                        : "blocked"
                 : planId
-                ? "pending"
-                : "idle",
+                    ? "pending"
+                    : "idle",
         },
         {
             label: "Verify",
@@ -2211,10 +2211,10 @@ function NaturalLanguageAutomationCard() {
                                     );
                                 })
                                 .map((item, idx) => (
-                                <div key={`${item.time}-${idx}`} className="text-[10px] text-muted-foreground">
-                                    {item.time} · {item.status} · {item.prompt}
-                                </div>
-                            ))}
+                                    <div key={`${item.time}-${idx}`} className="text-[10px] text-muted-foreground">
+                                        {item.time} · {item.status} · {item.prompt}
+                                    </div>
+                                ))}
                         </div>
                     )}
                     {nlRuns && nlRuns.length > 0 && (
@@ -2232,11 +2232,11 @@ function NaturalLanguageAutomationCard() {
                                 })
                                 .slice(0, 5)
                                 .map((run) => (
-                                <div key={run.id} className="text-[10px] text-muted-foreground">
-                                    {format(new Date(run.created_at), "HH:mm:ss")} · {run.status} · {run.intent}
-                                    {run.summary ? ` · ${run.summary}` : ""}
-                                </div>
-                            ))}
+                                    <div key={run.id} className="text-[10px] text-muted-foreground">
+                                        {format(new Date(run.created_at), "HH:mm:ss")} · {run.status} · {run.intent}
+                                        {run.summary ? ` · ${run.summary}` : ""}
+                                    </div>
+                                ))}
                         </div>
                     )}
                 </div>
@@ -2521,7 +2521,7 @@ function VerificationRunHistory() {
                             run.status === "success" ? "text-emerald-300" :
                                 run.status === "failure" ? "text-rose-300" : "text-amber-300"
                         }>
-                            {run.mode.toUpperCase()}
+                            {run.mode?.toUpperCase() ?? "—"}
                         </span>
                         <span className="text-muted-foreground">
                             {format(new Date(run.created_at), "MM/dd HH:mm")}

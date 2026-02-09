@@ -27,7 +27,8 @@ type ApprovalContext = {
 };
 
 const markdownComponents: Components = {
-    code({ inline, children, ...props }) {
+    code({ children, ...props }) {
+        const inline = 'inline' in props && props.inline;
         return !inline ? (
             <div className="bg-black/50 p-2 rounded-md my-2 overflow-x-auto font-mono text-xs border border-white/10">
                 <code {...props}>{children}</code>
@@ -132,8 +133,8 @@ export default function Launcher() {
         // [Phase 6.3] Performance Test Command
         if (input.trim() === "test_perf") {
             const start = performance.now();
-            const dummyItems = Array.from({ length: 1000 }, (_, i) => ({
-                type: 'response',
+            const dummyItems: LauncherResult[] = Array.from({ length: 1000 }, (_, i) => ({
+                type: 'response' as const,
                 content: `**Perf Item #${i + 1}**: This is a dummy item to test rendering performance. ${Math.random()}`
             }));
             const end = performance.now();
@@ -407,9 +408,10 @@ export default function Launcher() {
 
             if (navigableItems.length > 0) {
                 const selected = navigableItems[selectedIndex];
-                if (selected?.type === 'recommendation') {
+                if (selected && selected.type === 'recommendation') {
                     e.preventDefault();
-                    await handleApprove(selected.data.id);
+                    const rec = selected.data as { id: number; title: string; summary: string; status: string };
+                    await handleApprove(rec.id);
                 }
             } else if (input.trim()) {
                 await handleSend();
@@ -626,11 +628,10 @@ export default function Launcher() {
                                                     handleApprove(rec.id);
                                                 }}
                                                 disabled={approvingIds.has(rec.id)}
-                                                className={`text-xs px-3 py-1.5 rounded transition-colors border ${
-                                                    isSel
-                                                        ? 'bg-blue-500 text-white border-blue-400'
-                                                        : 'text-gray-200 bg-white/10 border-white/10 hover:bg-white/20'
-                                                } ${approvingIds.has(rec.id) ? 'opacity-60 cursor-wait' : ''}`}
+                                                className={`text-xs px-3 py-1.5 rounded transition-colors border ${isSel
+                                                    ? 'bg-blue-500 text-white border-blue-400'
+                                                    : 'text-gray-200 bg-white/10 border-white/10 hover:bg-white/20'
+                                                    } ${approvingIds.has(rec.id) ? 'opacity-60 cursor-wait' : ''}`}
                                             >
                                                 {approvingIds.has(rec.id)
                                                     ? 'Approving…'
