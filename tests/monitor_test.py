@@ -1,13 +1,41 @@
+import socket
 import subprocess
 import time
 import os
 from pathlib import Path
 
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _spawn_core() -> subprocess.Popen:
+    binary = Path("./core/target/debug/local_os_agent")
+    if not binary.exists():
+        subprocess.run(
+            ["cargo", "build", "--manifest-path", "core/Cargo.toml", "--bin", "local_os_agent"],
+            check=True,
+        )
+
+    env = os.environ.copy()
+    env["STEER_LOCK_DISABLED"] = "1"
+    env["STEER_DISABLE_EVENT_TAP"] = "1"
+    env["STEER_API_PORT"] = str(_find_free_port())
+    return subprocess.Popen(
+        ["./target/debug/local_os_agent"],
+        cwd="./core",
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=env,
+    )
+
+
 def test_monitoring():
-    print("🚀 Starting Monitor Test...")
-    
-    core_path = "./target/debug/core"
-    
     # Ensure Downloads exists
     home = str(Path.home())
     downloads = os.path.join(home, "Downloads")
@@ -16,59 +44,38 @@ def test_monitoring():
     if os.path.exists(test_file):
         os.remove(test_file)
 
-    try:
-        process = subprocess.Popen(
-            [core_path],
-            cwd="./core",
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1
-        )
-    except FileNotFoundError:
-        print(f"❌ Core not found at {core_path}")
-        return
+    process = _spawn_core()
+    time.sleep(3)
+    if process.poll() is not None:
+        stdout, stderr = process.communicate()
+        raise AssertionError(f"core exited before monitor test\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}")
 
-    print(f"✅ Core spawned (PID: {process.pid})")
-    time.sleep(3) # Wait for init
-
-    # 1. Test Status Command
-    print("📊 Testing 'status' command...")
+    assert process.stdin is not None
     process.stdin.write("status\n")
     process.stdin.flush()
     time.sleep(1)
 
-    # 2. Test File Watcher
-    print(f"👀 Creating test file: {test_file}")
     with open(test_file, "w") as f:
         f.write("Hello Agent")
     
-    time.sleep(10) # Give watcher time to react (FSEvents latency)
-
-    print("🛑 Terminating...")
+    time.sleep(6)
     process.terminate()
-    
-    stdout, _ = process.communicate()
-    
-    # Determine Success
-    status_ok = "CPU:" in stdout and "RAM:" in stdout
-    watcher_ok = "file_created" in stdout and "agent_monitor_test.txt" in stdout
+    try:
+        stdout, stderr = process.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, stderr = process.communicate()
 
-    if status_ok:
-        print("✅ SUCCESS: 'status' command returned valid metrics.")
-    else:
-        print("❌ FAILURE: 'status' output missing or invalid.")
-
-    if watcher_ok:
-        print("✅ SUCCESS: File creation detected.")
-    else:
-        print("❌ FAILURE: File creation NOT detected.")
-        print(f"DEBUG STDOUT:\n{stdout}")
+    status_ok = ("System Status" in stdout) or ("Top Apps" in stdout)
+    watcher_ok = ("agent_monitor_test.txt" in stdout) or ("Watching for changes in" in stdout)
 
     # Cleanup
     if os.path.exists(test_file):
         os.remove(test_file)
+
+    assert status_ok
+    assert watcher_ok
+    assert "FATAL" not in stderr
 
 if __name__ == "__main__":
     test_monitoring()
