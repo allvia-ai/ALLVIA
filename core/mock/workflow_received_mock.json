@@ -1,0 +1,18 @@
+{
+  "title": "Complex Scenario Verification Pipeline",
+  "summary": "Execute natural-language scenario, capture node evidence, verify semantic tokens by app location, and report result bundle to Telegram.",
+  "trigger": "Manual request received from user",
+  "actions": [
+    "Run NL scenario executor",
+    "Collect node screenshots and logs",
+    "Run semantic verification against Notes/Mail/TextEdit",
+    "Send Telegram evidence summary"
+  ],
+  "confidence": 0.92,
+  "n8n_prompt": "Create a workflow that starts when a scenario request arrives, runs the local scenario executor, attaches node screenshots and logs, verifies required semantic tokens by location, and sends a Telegram report with pass/fail evidence and next actions.",
+  "evidence": [
+    "Goal completed by planner should not be treated as final success without semantic verification",
+    "Node-level screenshots are required for trustable output verification"
+  ],
+  "pattern_id": "mock-pattern-20260208"
+}
