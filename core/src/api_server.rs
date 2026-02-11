@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    http::{HeaderValue, StatusCode},
+    http::{HeaderValue, Method, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -297,11 +297,17 @@ async fn auth_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, StatusCode> {
+    if req.method() == Method::OPTIONS {
+        return Ok(next.run(req).await);
+    }
+
     let api_key = std::env::var("STEER_API_KEY").unwrap_or_default();
 
     // Require explicit opt-in for no-key local development mode.
     if api_key.is_empty() {
-        if crate::env_flag("STEER_API_ALLOW_NO_KEY") {
+        let allow_no_key = crate::env_flag("STEER_API_ALLOW_NO_KEY")
+            && (crate::env_flag("STEER_TEST_MODE") || crate::env_flag("STEER_DEV_LOCAL_MODE"));
+        if allow_no_key {
             let host_header = req
                 .headers()
                 .get("host")
@@ -311,21 +317,51 @@ async fn auth_middleware(
             let host_only = host_header.split(':').next().unwrap_or("");
             let localhost_only =
                 host_only == "127.0.0.1" || host_only == "localhost" || host_only == "[::1]";
-            if localhost_only {
+            let origin = req
+                .headers()
+                .get("origin")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("")
+                .to_lowercase();
+            let origin_ok = origin.is_empty()
+                || origin.starts_with("http://localhost")
+                || origin.starts_with("http://127.0.0.1")
+                || origin.starts_with("https://localhost")
+                || origin.starts_with("https://127.0.0.1");
+            let dev_header_required = std::env::var("STEER_API_DEV_HEADER_VALUE")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+            let dev_header_ok = if let Some(expected) = dev_header_required.as_ref() {
+                req.headers()
+                    .get("x-steer-dev")
+                    .and_then(|h| h.to_str().ok())
+                    .map(|provided| provided == expected)
+                    .unwrap_or(false)
+            } else {
+                true
+            };
+            if localhost_only && origin_ok && dev_header_ok {
                 return Ok(next.run(req).await);
             }
         }
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    // Check Header
+    // Check Authorization header first, then fallback to X-API-Key.
     let auth_header = req
         .headers()
         .get("Authorization")
         .and_then(|h| h.to_str().ok())
-        .map(|s| s.replace("Bearer ", ""));
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string());
+    let x_api_key = req
+        .headers()
+        .get("X-API-Key")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.trim().to_string());
 
-    match auth_header {
+    match auth_header.or(x_api_key) {
         Some(key) if key == api_key => Ok(next.run(req).await),
         _ => Err(StatusCode::UNAUTHORIZED),
     }

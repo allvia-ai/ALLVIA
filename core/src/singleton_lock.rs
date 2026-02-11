@@ -23,10 +23,15 @@ impl Drop for LockGuard {
 pub fn acquire_lock() -> Result<Option<LockGuard>, String> {
     let allow_multi = env_flag("STEER_ALLOW_MULTI");
     let lock_disabled = env_flag("STEER_LOCK_DISABLED");
-    let allow_lock_disable = env_flag("STEER_ALLOW_LOCK_DISABLE")
-        || env_flag("STEER_TEST_MODE")
-        || env_flag("STEER_SCENARIO_MODE");
+    let allow_lock_disable =
+        env_flag("STEER_ALLOW_LOCK_DISABLE") || env_flag("STEER_TEST_MODE") || env_flag("CI");
 
+    if allow_multi && !allow_lock_disable {
+        return Err(
+            "STEER_ALLOW_MULTI requires STEER_ALLOW_LOCK_DISABLE=1 or STEER_TEST_MODE=1"
+                .to_string(),
+        );
+    }
     if allow_multi || (lock_disabled && allow_lock_disable) {
         return Ok(None);
     }
@@ -64,7 +69,7 @@ pub fn acquire_lock() -> Result<Option<LockGuard>, String> {
         }
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
             if let Some(payload) = read_payload(&lock_path) {
-                if is_stale(&payload, stale_secs) {
+                if !process_alive(payload.pid) || is_stale(&payload, stale_secs) {
                     let _ = fs::remove_file(&lock_path);
                     return acquire_lock();
                 }
@@ -116,4 +121,16 @@ fn env_flag(key: &str) -> bool {
 
 fn env_i64(key: &str) -> Option<i64> {
     std::env::var(key).ok().and_then(|v| v.parse::<i64>().ok())
+}
+
+fn process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
