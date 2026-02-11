@@ -7,6 +7,9 @@ use core_foundation::base::{CFTypeRef, TCFType};
 use core_foundation::string::CFString;
 use serde_json::{json, Value};
 use std::ptr;
+use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 // Helper to convert foreign AX error to Result
 #[allow(dead_code)]
@@ -52,9 +55,25 @@ pub fn snapshot(_scope: Option<String>) -> Value {
         let _system_wrapper = AxElement(system_wide); // Auto-release
 
         // 2. Focused App
-        let focused_app_ref = match get_attribute(system_wide, "AXFocusedApplication") {
-            Some(r) => r as AXUIElementRef,
-            None => return json!({ "error": "No focused application" }),
+        let focused_app_ref = {
+            let mut out: Option<AXUIElementRef> = None;
+            for _ in 0..3 {
+                if let Some(r) = get_attribute(system_wide, "AXFocusedApplication") {
+                    out = Some(r as AXUIElementRef);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(60));
+            }
+            match out {
+                Some(v) => v,
+                None => {
+                    let front_name = frontmost_app_name_via_osascript().unwrap_or_default();
+                    return json!({
+                        "error": "No focused application",
+                        "frontmost_app_hint": front_name
+                    });
+                }
+            }
         };
         // Note: get_attribute returns +1 retain count, so we wrap it
         let _focused_app = AxElement(focused_app_ref);
@@ -86,6 +105,23 @@ pub fn snapshot(_scope: Option<String>) -> Value {
                 "children": children_json
             }
         })
+    }
+}
+
+fn frontmost_app_name_via_osascript() -> Option<String> {
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg("tell application \"System Events\" to return name of first application process whose frontmost is true")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
     }
 }
 

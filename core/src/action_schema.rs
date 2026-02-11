@@ -122,6 +122,7 @@ fn normalize_action_name(raw: &str) -> String {
         "paste_clipboard" => "paste".to_string(),
         "get_clipboard" => "read_clipboard".to_string(),
         "copy_between_apps" => "transfer".to_string(),
+        "mail_send" | "send_mail" | "email_send" | "send_email" => "mail_send".to_string(),
         other => other.to_string(),
     }
 }
@@ -357,6 +358,7 @@ pub fn normalize_action(plan: &Value) -> ActionValidation {
         "select_all" => {}
         "paste" => {}
         "read_clipboard" => {}
+        "mail_send" => {}
         "transfer" => {
             let from = get_string_any(obj, &["from"]);
             let to = get_string_any(obj, &["to"]);
