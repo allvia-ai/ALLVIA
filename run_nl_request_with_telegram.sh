@@ -31,7 +31,7 @@ require_terminal_context() {
     [ "$require_terminal" = "1" ] || return 0
 
     local term_program="${TERM_PROGRAM:-unknown}"
-    local allowed_programs="${STEER_ALLOWED_TERM_PROGRAMS:-Apple_Terminal}"
+    local allowed_programs="${STEER_ALLOWED_TERM_PROGRAMS:-Apple_Terminal,unknown}"
     local allowed_match=0
     IFS=',' read -r -a _allowed_arr <<< "$allowed_programs"
     for entry in "${_allowed_arr[@]}"; do
@@ -196,14 +196,25 @@ send_telegram_with_timeout() {
 }
 
 extract_expected_tokens_from_request() {
-    printf '%s\n' "$REQUEST_TEXT" | perl -ne '
-        while (/"([^"]+)"|'\''([^'\'']+)'\''/g) {
-            my $s = defined($1) && $1 ne "" ? $1 : $2;
-            $s =~ s/^\s+|\s+$//g;
-            next if length($s) < 3;
-            print "$s\n";
-        }
-    ' | awk '!seen[$0]++'
+    {
+        printf '%s\n' "$REQUEST_TEXT" | perl -ne '
+            while (/"([^"]+)"|'\''([^'\'']+)'\''/g) {
+                my $s = defined($1) && $1 ne "" ? $1 : $2;
+                $s =~ s/^\s+|\s+$//g;
+                next if length($s) < 3;
+                print "$s\n";
+            }
+        '
+        # Also capture non-quoted status/value style requirements.
+        printf '%s\n' "$REQUEST_TEXT" | perl -ne '
+            while (/(?:status|상태)\s*:\s*([A-Za-z0-9 _-]{3,80})/ig) {
+                my $s = $1;
+                $s =~ s/^\s+|\s+$//g;
+                next if length($s) < 3;
+                print "$s\n";
+            }
+        '
+    } | awk '!seen[$0]++'
 }
 
 is_noise_token() {
@@ -234,25 +245,41 @@ on run argv
 
     try
         tell application "Notes"
-            repeat with ac in accounts
-                repeat with f in folders of ac
-                    repeat with n in notes of f
-                        try
-                            set nName to name of n as text
-                        on error
-                            set nName to ""
-                        end try
-                        if nName contains tokenText then return "NOTE_TITLE"
-
-                        try
-                            set nBody to body of n as text
-                        on error
-                            set nBody to ""
-                        end try
-                        if nBody contains tokenText then return "NOTE_BODY"
+            if (count of accounts) > 0 then
+                set latestNote to missing value
+                set latestDate to date "January 1, 1970 at 00:00:00"
+                repeat with ac in accounts
+                    repeat with f in folders of ac
+                        repeat with n in notes of f
+                            try
+                                set modDate to modification date of n
+                            on error
+                                set modDate to current date
+                            end try
+                            if latestNote is missing value or modDate > latestDate then
+                                set latestNote to n
+                                set latestDate to modDate
+                            end if
+                        end repeat
                     end repeat
                 end repeat
-            end repeat
+
+                if latestNote is not missing value then
+                    try
+                        set nName to name of latestNote as text
+                    on error
+                        set nName to ""
+                    end try
+                    if nName contains tokenText then return "NOTE_TITLE"
+
+                    try
+                        set nBody to body of latestNote as text
+                    on error
+                        set nBody to ""
+                    end try
+                    if nBody contains tokenText then return "NOTE_BODY"
+                end if
+            end if
         end tell
     on error
         return "CHECK_ERROR"
@@ -262,21 +289,20 @@ on run argv
         tell application "Mail"
             set draftCount to count of outgoing messages
             if draftCount > 0 then
-                repeat with m in outgoing messages
-                    try
-                        set s to subject of m as text
-                    on error
-                        set s to ""
-                    end try
-                    if s contains tokenText then return "MAIL_SUBJECT"
+                set m to last outgoing message
+                try
+                    set s to subject of m as text
+                on error
+                    set s to ""
+                end try
+                if s contains tokenText then return "MAIL_SUBJECT"
 
-                    try
-                        set c to content of m as text
-                    on error
-                        set c to ""
-                    end try
-                    if c contains tokenText then return "MAIL_BODY"
-                end repeat
+                try
+                    set c to content of m as text
+                on error
+                    set c to ""
+                end try
+                if c contains tokenText then return "MAIL_BODY"
             end if
         end tell
     on error
@@ -286,14 +312,13 @@ on run argv
     try
         tell application "TextEdit"
             if (count of documents) > 0 then
-                repeat with d in documents
-                    try
-                        set t to text of d as text
-                    on error
-                        set t to ""
-                    end try
-                    if t contains tokenText then return "TEXTEDIT_BODY"
-                end repeat
+                set d to front document
+                try
+                    set t to text of d as text
+                on error
+                    set t to ""
+                end try
+                if t contains tokenText then return "TEXTEDIT_BODY"
             end if
         end tell
     on error
@@ -349,6 +374,7 @@ CLI_LLM_VALUE="${STEER_CLI_LLM-}"
 FAIL_ON_FALLBACK_VALUE="${STEER_FAIL_ON_FALLBACK:-1}"
 NOTIFIER_TIMEOUT_SEC="${STEER_NOTIFIER_TIMEOUT_SEC:-25}"
 REQUIRE_PRIMARY_PLANNER_VALUE="${STEER_REQUIRE_PRIMARY_PLANNER:-1}"
+LOCK_DISABLED_VALUE="${STEER_LOCK_DISABLED:-0}"
 
 if [ "$REQUIRE_PRIMARY_PLANNER_VALUE" = "1" ] && [ "$SCENARIO_MODE_VALUE" = "1" ] && [ "${STEER_ALLOW_SCENARIO_MODE:-0}" != "1" ]; then
     echo "❌ 정책 위반: STEER_SCENARIO_MODE=1 이지만 STEER_ALLOW_SCENARIO_MODE=1 승인 없이 fallback 모드 실행은 금지됩니다."
@@ -384,6 +410,17 @@ get_frontmost_app() {
     osascript -e 'tell application "System Events" to get name of first process whose frontmost is true' 2>/dev/null || true
 }
 
+mail_outgoing_count() {
+    local timeout_sec="${STEER_OSASCRIPT_TIMEOUT_SEC:-8}"
+    if run_cmd_with_timeout_capture "$timeout_sec" \
+        osascript -e 'tell application "Mail" to return count of outgoing messages'; then
+        printf '%s' "${RUN_TIMEOUT_STDOUT}" | tr -d '[:space:]'
+        return 0
+    fi
+    echo "-1"
+    return 1
+}
+
 is_user_active_front_app() {
     local app="$1"
     local user_apps_csv="${STEER_USER_ACTIVE_APPS:-Terminal,Codex,iTerm2}"
@@ -411,14 +448,14 @@ run_surf_with_input_guard() {
                 STEER_NODE_CAPTURE=1 \
                 STEER_NODE_CAPTURE_ALL="$NODE_CAPTURE_ALL_VALUE" \
                 STEER_NODE_CAPTURE_DIR="$NODE_DIR" \
-                STEER_LOCK_DISABLED=1 \
+                STEER_LOCK_DISABLED="$LOCK_DISABLED_VALUE" \
                 cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$REQUEST_TEXT" &> "$LOG_FILE"
         else
             STEER_SCENARIO_MODE="$SCENARIO_MODE_VALUE" \
                 STEER_NODE_CAPTURE=1 \
                 STEER_NODE_CAPTURE_ALL="$NODE_CAPTURE_ALL_VALUE" \
                 STEER_NODE_CAPTURE_DIR="$NODE_DIR" \
-                STEER_LOCK_DISABLED=1 \
+                STEER_LOCK_DISABLED="$LOCK_DISABLED_VALUE" \
                 cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$REQUEST_TEXT" &> "$LOG_FILE"
         fi
         return $?
@@ -439,14 +476,14 @@ run_surf_with_input_guard() {
             STEER_NODE_CAPTURE=1 \
             STEER_NODE_CAPTURE_ALL="$NODE_CAPTURE_ALL_VALUE" \
             STEER_NODE_CAPTURE_DIR="$NODE_DIR" \
-            STEER_LOCK_DISABLED=1 \
+            STEER_LOCK_DISABLED="$LOCK_DISABLED_VALUE" \
             cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$REQUEST_TEXT" &> "$LOG_FILE" &
     else
         STEER_SCENARIO_MODE="$SCENARIO_MODE_VALUE" \
             STEER_NODE_CAPTURE=1 \
             STEER_NODE_CAPTURE_ALL="$NODE_CAPTURE_ALL_VALUE" \
             STEER_NODE_CAPTURE_DIR="$NODE_DIR" \
-            STEER_LOCK_DISABLED=1 \
+            STEER_LOCK_DISABLED="$LOCK_DISABLED_VALUE" \
             cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$REQUEST_TEXT" &> "$LOG_FILE" &
     fi
     run_pid=$!
@@ -521,7 +558,7 @@ if [ "${STEER_SEMANTIC_VERIFY:-1}" = "1" ]; then
     missing_count=0
     checked_count=0
     if [ "${#FILTERED_TOKENS[@]}" -eq 0 ]; then
-        SEMANTIC_LINES="${SEMANTIC_LINES}- 의미 검증 토큰 없음(요청의 따옴표 문자열 기준)"$'\n'
+        SEMANTIC_LINES="${SEMANTIC_LINES}- 의미 검증 토큰 없음(요청에서 추출된 핵심 문자열 기준)"$'\n'
     else
         for token in "${FILTERED_TOKENS[@]}"; do
             checked_count=$((checked_count + 1))
@@ -546,6 +583,20 @@ if [ "${STEER_SEMANTIC_VERIFY:-1}" = "1" ]; then
     fi
 else
     SEMANTIC_LINES="${SEMANTIC_LINES}- 의미검증 비활성(STEER_SEMANTIC_VERIFY=0)"$'\n'
+fi
+
+if printf '%s' "$REQUEST_TEXT" | grep -Eiq '보내|발송|send'; then
+    mail_send_logged=0
+    if grep -Eiq "Shortcut 'd'.*shift|send.*mail|mail sent" "$LOG_FILE"; then
+        mail_send_logged=1
+    fi
+    outgoing_count="$(mail_outgoing_count || echo -1)"
+    if [ "$mail_send_logged" -eq 1 ] && [ "$outgoing_count" = "0" ]; then
+        SEMANTIC_LINES="${SEMANTIC_LINES}- 메일 발송 검증 ✅ (send-action 로그 + outgoing=0)"$'\n'
+    else
+        SEMANTIC_LINES="${SEMANTIC_LINES}- 메일 발송 검증 ❌ (send-action 로그=${mail_send_logged}, outgoing=${outgoing_count})"$'\n'
+        STATUS="failed"
+    fi
 fi
 
 KEY_LOGS=$(grep -En "Goal completed by planner|Surf failed|Supervisor escalated|Preflight failed|Execution Error|SCHEMA_ERROR|PLAN_REJECTED|LLM Refused|fallback action|FALLBACK_ACTION:|Node evidence" "$LOG_FILE" 2>/dev/null | tail -n 10 | sed -E 's/^[0-9]+://')
@@ -685,19 +736,28 @@ EOF
 printf '%s\n' "$TELEGRAM_MESSAGE" > "$RAW_MSG_FILE"
 
 if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ] && [ -f "./send_telegram_notification.sh" ]; then
+    TELEGRAM_SEND_OK=1
     EXTRA_NODE_ENV=()
     if [ -s "$NODE_IMAGE_LIST_FILE" ]; then
         EXTRA_NODE_ENV=(TELEGRAM_EXTRA_IMAGE_LIST_FILE="$NODE_IMAGE_LIST_FILE")
     fi
 
     if [ -n "$TELEGRAM_MAIN_IMAGE" ] && [ -f "$TELEGRAM_MAIN_IMAGE" ]; then
-        send_telegram_with_timeout "$NOTIFIER_TIMEOUT_SEC" \
+        if ! send_telegram_with_timeout "$NOTIFIER_TIMEOUT_SEC" \
             env TELEGRAM_DUMP_FINAL_PATH="$FINAL_MSG_FILE" TELEGRAM_SKIP_REWRITE=1 "${EXTRA_NODE_ENV[@]}" \
-            bash ./send_telegram_notification.sh "$TELEGRAM_MESSAGE" "$TELEGRAM_MAIN_IMAGE" >/dev/null 2>&1 || true
+            bash ./send_telegram_notification.sh "$TELEGRAM_MESSAGE" "$TELEGRAM_MAIN_IMAGE" >/dev/null 2>&1; then
+            TELEGRAM_SEND_OK=0
+        fi
     else
-        send_telegram_with_timeout "$NOTIFIER_TIMEOUT_SEC" \
+        if ! send_telegram_with_timeout "$NOTIFIER_TIMEOUT_SEC" \
             env TELEGRAM_DUMP_FINAL_PATH="$FINAL_MSG_FILE" TELEGRAM_SKIP_REWRITE=1 "${EXTRA_NODE_ENV[@]}" \
-            bash ./send_telegram_notification.sh "$TELEGRAM_MESSAGE" >/dev/null 2>&1 || true
+            bash ./send_telegram_notification.sh "$TELEGRAM_MESSAGE" >/dev/null 2>&1; then
+            TELEGRAM_SEND_OK=0
+        fi
+    fi
+    if [ "$TELEGRAM_SEND_OK" -ne 1 ]; then
+        STATUS="failed"
+        printf '%s\n- 텔레그램 전송 실패(타임아웃/오류)\n' "$TELEGRAM_MESSAGE" > "$FINAL_MSG_FILE"
     fi
 else
     echo "Warning: Telegram env or notifier missing. Skipped Telegram send." >&2

@@ -24,6 +24,14 @@ CLI_LLM_VALUE="${STEER_CLI_LLM-}"
 FAIL_ON_FALLBACK_VALUE="${STEER_FAIL_ON_FALLBACK:-1}"
 NOTIFIER_TIMEOUT_SEC="${STEER_NOTIFIER_TIMEOUT_SEC:-25}"
 REQUIRE_PRIMARY_PLANNER_VALUE="${STEER_REQUIRE_PRIMARY_PLANNER:-1}"
+LOCK_DISABLED_VALUE="${STEER_LOCK_DISABLED:-0}"
+MAIL_TO_TARGET="${STEER_DEFAULT_MAIL_TO:-$(git config --get user.email 2>/dev/null || true)}"
+
+SUBJECT_S1="Today Plan Brief S1_${TIMESTAMP}"
+SUBJECT_S2="Downloads Triage S2_${TIMESTAMP}"
+SUBJECT_S3="Calc Result S3_${TIMESTAMP}"
+SUBJECT_S4="Productivity Research S4_${TIMESTAMP}"
+SUBJECT_S5="Budget Check S5_${TIMESTAMP}"
 
 if [ "$REQUIRE_PRIMARY_PLANNER_VALUE" = "1" ] && [ "$SCENARIO_MODE_VALUE" = "1" ] && [ "${STEER_ALLOW_SCENARIO_MODE:-0}" != "1" ]; then
     echo "❌ 정책 위반: STEER_SCENARIO_MODE=1 이지만 STEER_ALLOW_SCENARIO_MODE=1 승인 없이 fallback 모드 실행은 금지됩니다."
@@ -46,7 +54,7 @@ require_terminal_context() {
     [ "$require_terminal" = "1" ] || return 0
 
     local term_program="${TERM_PROGRAM:-unknown}"
-    local allowed_programs="${STEER_ALLOWED_TERM_PROGRAMS:-Apple_Terminal}"
+    local allowed_programs="${STEER_ALLOWED_TERM_PROGRAMS:-Apple_Terminal,unknown}"
     local allowed_match=0
     IFS=',' read -r -a _allowed_arr <<< "$allowed_programs"
     for entry in "${_allowed_arr[@]}"; do
@@ -206,6 +214,12 @@ preflight_checks() {
         echo "✅ Preflight: OPENAI_API_KEY detected."
     fi
 
+    if [ "${STEER_REQUIRE_MAIL_SEND:-1}" = "1" ] && [ -z "$MAIL_TO_TARGET" ]; then
+        echo "❌ Preflight failed: mail send target is empty."
+        echo "   Fix: STEER_DEFAULT_MAIL_TO 또는 git user.email 을 설정하세요."
+        failed=1
+    fi
+
     if [ "$failed" -ne 0 ]; then
         echo ""
         echo "⛔ Preflight checks failed. Aborting scenario run."
@@ -235,6 +249,17 @@ send_telegram_with_timeout() {
     return 1
 }
 
+mail_outgoing_count() {
+    local timeout_sec="${STEER_OSASCRIPT_TIMEOUT_SEC:-8}"
+    if run_cmd_with_timeout_capture "$timeout_sec" \
+        osascript -e 'tell application "Mail" to return count of outgoing messages'; then
+        printf '%s' "${RUN_TIMEOUT_STDOUT}" | tr -d '[:space:]'
+        return 0
+    fi
+    echo "-1"
+    return 1
+}
+
 token_presence_location() {
     local token="$1"
     local result=""
@@ -252,25 +277,41 @@ on run argv
 
     try
         tell application "Notes"
-            repeat with ac in accounts
-                repeat with f in folders of ac
-                    repeat with n in notes of f
-                        try
-                            set nName to name of n as text
-                        on error
-                            set nName to ""
-                        end try
-                        if nName contains tokenText then return "NOTE_TITLE"
-
-                        try
-                            set nBody to body of n as text
-                        on error
-                            set nBody to ""
-                        end try
-                        if nBody contains tokenText then return "NOTE_BODY"
+            if (count of accounts) > 0 then
+                set latestNote to missing value
+                set latestDate to date "January 1, 1970 at 00:00:00"
+                repeat with ac in accounts
+                    repeat with f in folders of ac
+                        repeat with n in notes of f
+                            try
+                                set modDate to modification date of n
+                            on error
+                                set modDate to current date
+                            end try
+                            if latestNote is missing value or modDate > latestDate then
+                                set latestNote to n
+                                set latestDate to modDate
+                            end if
+                        end repeat
                     end repeat
                 end repeat
-            end repeat
+
+                if latestNote is not missing value then
+                    try
+                        set nName to name of latestNote as text
+                    on error
+                        set nName to ""
+                    end try
+                    if nName contains tokenText then return "NOTE_TITLE"
+
+                    try
+                        set nBody to body of latestNote as text
+                    on error
+                        set nBody to ""
+                    end try
+                    if nBody contains tokenText then return "NOTE_BODY"
+                end if
+            end if
         end tell
     on error
         return "CHECK_ERROR"
@@ -280,21 +321,20 @@ on run argv
         tell application "Mail"
             set draftCount to count of outgoing messages
             if draftCount > 0 then
-                repeat with m in outgoing messages
-                    try
-                        set s to subject of m as text
-                    on error
-                        set s to ""
-                    end try
-                    if s contains tokenText then return "MAIL_SUBJECT"
+                set m to last outgoing message
+                try
+                    set s to subject of m as text
+                on error
+                    set s to ""
+                end try
+                if s contains tokenText then return "MAIL_SUBJECT"
 
-                    try
-                        set c to content of m as text
-                    on error
-                        set c to ""
-                    end try
-                    if c contains tokenText then return "MAIL_BODY"
-                end repeat
+                try
+                    set c to content of m as text
+                on error
+                    set c to ""
+                end try
+                if c contains tokenText then return "MAIL_BODY"
             end if
         end tell
     on error
@@ -304,14 +344,13 @@ on run argv
     try
         tell application "TextEdit"
             if (count of documents) > 0 then
-                repeat with d in documents
-                    try
-                        set t to text of d as text
-                    on error
-                        set t to ""
-                    end try
-                    if t contains tokenText then return "TEXTEDIT_BODY"
-                end repeat
+                set d to front document
+                try
+                    set t to text of d as text
+                on error
+                    set t to ""
+                end try
+                if t contains tokenText then return "TEXTEDIT_BODY"
             end if
         end tell
     on error
@@ -363,7 +402,7 @@ run_agent_scenario() {
             STEER_NODE_CAPTURE=1 \
             STEER_NODE_CAPTURE_ALL="$NODE_CAPTURE_ALL_VALUE" \
             STEER_NODE_CAPTURE_DIR="$node_dir" \
-            STEER_LOCK_DISABLED=1 \
+            STEER_LOCK_DISABLED="$LOCK_DISABLED_VALUE" \
             cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$prompt" &> "$log_file"; then
             return 1
         fi
@@ -372,7 +411,7 @@ run_agent_scenario() {
             STEER_NODE_CAPTURE=1 \
             STEER_NODE_CAPTURE_ALL="$NODE_CAPTURE_ALL_VALUE" \
             STEER_NODE_CAPTURE_DIR="$node_dir" \
-            STEER_LOCK_DISABLED=1 \
+            STEER_LOCK_DISABLED="$LOCK_DISABLED_VALUE" \
             cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$prompt" &> "$log_file"; then
             return 1
         fi
@@ -405,19 +444,19 @@ capture_and_notify() {
         local expected_tokens=()
         case "$scenario_num" in
             1)
-                expected_tokens=("Today Plan Brief" "Calendar opened" "Notes draft ready" "Mail prep pending" "Shared via TextEdit")
+                expected_tokens=("$SUBJECT_S1" "Calendar opened" "Notes draft ready" "Mail prep pending" "Shared via TextEdit")
                 ;;
             2)
-                expected_tokens=("Downloads Triage" "1. invoice.pdf" "2. screenshot.png" "3. notes.txt")
+                expected_tokens=("$SUBJECT_S2" "1. invoice.pdf" "2. screenshot.png" "3. notes.txt")
                 ;;
             3)
-                expected_tokens=("Calc Result" "120*1300=" "Done")
+                expected_tokens=("$SUBJECT_S3" "120*1300=" "Done")
                 ;;
             4)
-                expected_tokens=("Productivity Research" "focus music" "pomodoro timer" "daily review template")
+                expected_tokens=("$SUBJECT_S4" "focus music" "pomodoro timer" "daily review template")
                 ;;
             5)
-                expected_tokens=("Budget Check" "Base: 120 USD")
+                expected_tokens=("$SUBJECT_S5" "Base: 120 USD")
                 ;;
         esac
 
@@ -445,6 +484,21 @@ capture_and_notify() {
         fi
     else
         semantic_lines="${semantic_lines}- 의미검증 비활성(STEER_SEMANTIC_VERIFY=0)"$'\n'
+    fi
+
+    if [ "${STEER_REQUIRE_MAIL_SEND:-1}" = "1" ]; then
+        local mail_send_logged=0
+        if grep -Eiq "Shortcut 'd'.*shift|send.*mail|mail sent" "$log_file"; then
+            mail_send_logged=1
+        fi
+        local outgoing_count
+        outgoing_count="$(mail_outgoing_count || echo -1)"
+        if [ "$mail_send_logged" -eq 1 ] && [ "$outgoing_count" = "0" ]; then
+            semantic_lines="${semantic_lines}- 메일 발송 검증 ✅ (send-action 로그 + outgoing=0)"$'\n'
+        else
+            semantic_lines="${semantic_lines}- 메일 발송 검증 ❌ (send-action 로그=${mail_send_logged}, outgoing=${outgoing_count})"$'\n'
+            status="failed"
+        fi
     fi
     
     # Derive result from judged status, not emoji presence in logs.
@@ -601,18 +655,27 @@ EOF
     local notifier="./send_telegram_notification.sh"
     if [ -f "$notifier" ]; then
         if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+            local telegram_send_ok=1
             local notify_env=()
             if [ -s "$node_image_list_file" ]; then
                 notify_env=(TELEGRAM_EXTRA_IMAGE_LIST_FILE="$node_image_list_file")
             fi
             if [ -n "$telegram_main_image" ] && [ -f "$telegram_main_image" ]; then
-                send_telegram_with_timeout "$NOTIFIER_TIMEOUT_SEC" \
+                if ! send_telegram_with_timeout "$NOTIFIER_TIMEOUT_SEC" \
                     env TELEGRAM_DUMP_FINAL_PATH="$final_message_file" TELEGRAM_SKIP_REWRITE=1 "${notify_env[@]}" \
-                    bash "$notifier" "$telegram_message" "$telegram_main_image" >/dev/null 2>&1 || true
+                    bash "$notifier" "$telegram_message" "$telegram_main_image" >/dev/null 2>&1; then
+                    telegram_send_ok=0
+                fi
             else
-                send_telegram_with_timeout "$NOTIFIER_TIMEOUT_SEC" \
+                if ! send_telegram_with_timeout "$NOTIFIER_TIMEOUT_SEC" \
                     env TELEGRAM_DUMP_FINAL_PATH="$final_message_file" TELEGRAM_SKIP_REWRITE=1 "${notify_env[@]}" \
-                    bash "$notifier" "$telegram_message" >/dev/null 2>&1 || true
+                    bash "$notifier" "$telegram_message" >/dev/null 2>&1; then
+                    telegram_send_ok=0
+                fi
+            fi
+            if [ "$telegram_send_ok" -ne 1 ]; then
+                printf '%s\n- 텔레그램 전송 실패(타임아웃/오류)\n' "$telegram_message" > "$final_message_file"
+                status="failed"
             fi
         else
             echo "Warning: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set; skipped Telegram notification." >&2
@@ -637,7 +700,7 @@ echo "📅 Scenario 1: Calendar → Safari → Notes → Mail"
 LOG_FILE="scenario_results/complex_scenario_1_${TIMESTAMP}.log"
 SCENARIO_GOAL="Multi-app draft chain without screen-reading dependency."
 echo "Goal: ${SCENARIO_GOAL}"
-CMD='Calendar를 열고 전면으로 가져오세요. Notes를 열어 새 메모(Cmd+N)를 만들고 제목을 "Today Plan Brief"로 입력한 뒤 아래 3줄을 그대로 입력하세요: "Calendar opened", "Notes draft ready", "Mail prep pending". 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. TextEdit를 열어 새 문서(Cmd+N)에 붙여넣기(Cmd+V)하고 다음 줄에 "Shared via TextEdit"를 입력하세요. 다시 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 "Today Plan Brief"를 입력한 뒤 본문에 붙여넣기(Cmd+V)하세요.'
+CMD="Calendar를 열고 전면으로 가져오세요. Notes를 열어 새 메모(Cmd+N)를 만들고 제목을 \"${SUBJECT_S1}\"로 입력한 뒤 아래 3줄을 그대로 입력하세요: \"Calendar opened\", \"Notes draft ready\", \"Mail prep pending\". 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. TextEdit를 열어 새 문서(Cmd+N)에 붙여넣기(Cmd+V)하고 다음 줄에 \"Shared via TextEdit\"를 입력하세요. 다시 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S1}\"를 입력한 뒤 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
 
 if run_agent_scenario "$CMD" "$LOG_FILE" 1; then
     echo "✅ Scenario 1 Complete."
@@ -656,7 +719,7 @@ echo "📂 Scenario 2: Finder → TextEdit → Notes"
 LOG_FILE="scenario_results/complex_scenario_2_${TIMESTAMP}.log"
 SCENARIO_GOAL="Finder/TextEdit/Notes/Mail transfer chain."
 echo "Goal: ${SCENARIO_GOAL}"
-CMD='Finder를 열어 Downloads 폴더로 이동하세요. TextEdit를 열어 새 문서(Cmd+N)를 만들고 제목 "Downloads Triage"를 입력한 뒤 아래 3줄을 그대로 입력하세요: "1. invoice.pdf", "2. screenshot.png", "3. notes.txt". 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Notes를 열어 새 메모(Cmd+N)를 만들고 붙여넣기(Cmd+V)하세요. 다시 전체 선택(Cmd+A) 후 복사(Cmd+C)하고 Mail을 열어 새 이메일(Cmd+N) 초안을 만든 뒤 제목 "Downloads Triage"를 입력하고 본문에 붙여넣기(Cmd+V)하세요.'
+CMD="Finder를 열어 Downloads 폴더로 이동하세요. TextEdit를 열어 새 문서(Cmd+N)를 만들고 제목 \"${SUBJECT_S2}\"를 입력한 뒤 아래 3줄을 그대로 입력하세요: \"1. invoice.pdf\", \"2. screenshot.png\", \"3. notes.txt\". 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Notes를 열어 새 메모(Cmd+N)를 만들고 붙여넣기(Cmd+V)하세요. 다시 전체 선택(Cmd+A) 후 복사(Cmd+C)하고 Mail을 열어 새 이메일(Cmd+N) 초안을 만든 뒤 제목 \"${SUBJECT_S2}\"를 입력하고 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
 
 if run_agent_scenario "$CMD" "$LOG_FILE" 2; then
     echo "✅ Scenario 2 Complete."
@@ -675,7 +738,7 @@ echo "📈 Scenario 3: Safari → Calculator → Notes"
 LOG_FILE="scenario_results/complex_scenario_3_${TIMESTAMP}.log"
 SCENARIO_GOAL="Browser + calculation + document handoff chain."
 echo "Goal: ${SCENARIO_GOAL}"
-CMD='Safari를 열고 https://www.google.com 으로 이동하세요. 새 탭(Cmd+T)을 열고 https://www.wikipedia.org 로 이동하세요. Calculator를 열어 "120*1300=" 을 입력해 계산한 뒤 복사(Cmd+C)하세요. Notes를 열어 새 메모(Cmd+N)를 만들고 제목 "Calc Result"를 입력한 뒤 다음 줄에 "120*1300="를 입력하고 다음 줄에 붙여넣기(Cmd+V)하세요. TextEdit를 열어 새 문서(Cmd+N)에 방금 메모 내용을 붙여넣기(Cmd+V)하고 마지막 줄에 "Done"을 입력하세요.'
+CMD="Safari를 열고 https://www.google.com 으로 이동하세요. 새 탭(Cmd+T)을 열고 https://www.wikipedia.org 로 이동하세요. Calculator를 열어 \"120*1300=\" 을 입력해 계산한 뒤 복사(Cmd+C)하세요. Notes를 열어 새 메모(Cmd+N)를 만들고 제목 \"${SUBJECT_S3}\"를 입력한 뒤 다음 줄에 \"120*1300=\"를 입력하고 다음 줄에 붙여넣기(Cmd+V)하세요. TextEdit를 열어 새 문서(Cmd+N)에 방금 메모 내용을 붙여넣기(Cmd+V)하고 마지막 줄에 \"Done\"을 입력하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S3}\"를 입력한 뒤 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
 
 if run_agent_scenario "$CMD" "$LOG_FILE" 3; then
     echo "✅ Scenario 3 Complete."
@@ -694,7 +757,7 @@ echo "🧠 Scenario 4: Notes → Safari → TextEdit"
 LOG_FILE="scenario_results/complex_scenario_4_${TIMESTAMP}.log"
 SCENARIO_GOAL="Idea note -> web query -> report -> mail draft chain."
 echo "Goal: ${SCENARIO_GOAL}"
-CMD='Notes를 열어 새 메모(Cmd+N)를 만들고 아래 3줄을 그대로 입력하세요: "focus music", "pomodoro timer", "daily review template". 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Safari를 열고 https://www.google.com 으로 이동한 뒤 붙여넣기(Cmd+V)하고 Enter를 누르세요. 주소창에 포커스(Cmd+L) 후 복사(Cmd+C)하세요. TextEdit를 열어 새 문서(Cmd+N)에 "Productivity Research" 제목을 입력하고 다음 줄에 붙여넣기(Cmd+V)하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 "Productivity Research"를 입력한 뒤 본문에 붙여넣기(Cmd+V)하세요.'
+CMD="Notes를 열어 새 메모(Cmd+N)를 만들고 아래 3줄을 그대로 입력하세요: \"focus music\", \"pomodoro timer\", \"daily review template\". 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Safari를 열고 https://www.google.com 으로 이동한 뒤 붙여넣기(Cmd+V)하고 Enter를 누르세요. 주소창에 포커스(Cmd+L) 후 복사(Cmd+C)하세요. TextEdit를 열어 새 문서(Cmd+N)에 \"${SUBJECT_S4}\" 제목을 입력하고 다음 줄에 붙여넣기(Cmd+V)하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S4}\"를 입력한 뒤 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
 
 if run_agent_scenario "$CMD" "$LOG_FILE" 4; then
     echo "✅ Scenario 4 Complete."
@@ -713,7 +776,7 @@ echo "💱 Scenario 5: Safari → Calculator → Notes → Mail"
 LOG_FILE="scenario_results/complex_scenario_5_${TIMESTAMP}.log"
 SCENARIO_GOAL="Finder/Calculator/Notes/Mail budget draft chain."
 echo "Goal: ${SCENARIO_GOAL}"
-CMD='Finder를 열어 Desktop으로 이동하세요. Calculator를 열어 "120*1450=" 을 입력해 계산하고 결과를 복사(Cmd+C)하세요. Notes를 열어 새 메모(Cmd+N)를 만들고 제목 "Budget Check"를 입력한 뒤 다음 줄에 "Base: 120 USD"를 입력하고 다음 줄에 붙여넣기(Cmd+V)하세요. 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 "Budget Check"를 입력한 다음 본문에 붙여넣기(Cmd+V)하세요.'
+CMD="Finder를 열어 Desktop으로 이동하세요. Calculator를 열어 \"120*1450=\" 을 입력해 계산하고 결과를 복사(Cmd+C)하세요. Notes를 열어 새 메모(Cmd+N)를 만들고 제목 \"${SUBJECT_S5}\"를 입력한 뒤 다음 줄에 \"Base: 120 USD\"를 입력하고 다음 줄에 붙여넣기(Cmd+V)하세요. 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S5}\"를 입력한 다음 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
 
 if run_agent_scenario "$CMD" "$LOG_FILE" 5; then
     echo "✅ Scenario 5 Complete."

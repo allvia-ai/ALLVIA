@@ -43,7 +43,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' 'unsafe-inline' 'unsafe-eval' http://localhost:5679 ws://localhost:5679"
+      "csp": "default-src 'self' 'unsafe-inline' 'unsafe-eval' http://localhost:5680 ws://localhost:5680"
     }
   },
   "bundle": {
