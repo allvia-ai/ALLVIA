@@ -11,11 +11,10 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::{
     approval_gate, chat_sanitize, consistency_check, context_pruning, db, execution_controller,
-    feedback_collector, integrations, intent_router, judgment, llm_gateway, monitor, n8n_api,
-    nl_store, pattern_detector, performance_verification, plan_builder, project_scanner,
-    quality_scorer, recommendation_executor, release_gate, runtime_verification,
-    semantic_verification, slot_filler, tool_result_guard, verification_engine,
-    visual_verification,
+    feedback_collector, integrations, intent_router, judgment, llm_gateway, monitor, nl_store,
+    pattern_detector, performance_verification, plan_builder, project_scanner, quality_scorer,
+    recommendation_executor, release_gate, runtime_verification, semantic_verification,
+    slot_filler, tool_result_guard, verification_engine, visual_verification,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -303,7 +302,18 @@ async fn auth_middleware(
     // Require explicit opt-in for no-key local development mode.
     if api_key.is_empty() {
         if crate::env_flag("STEER_API_ALLOW_NO_KEY") {
-            return Ok(next.run(req).await);
+            let host_header = req
+                .headers()
+                .get("host")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("")
+                .to_lowercase();
+            let host_only = host_header.split(':').next().unwrap_or("");
+            let localhost_only =
+                host_only == "127.0.0.1" || host_only == "localhost" || host_only == "[::1]";
+            if localhost_only {
+                return Ok(next.run(req).await);
+            }
         }
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -319,6 +329,64 @@ async fn auth_middleware(
         Some(key) if key == api_key => Ok(next.run(req).await),
         _ => Err(StatusCode::UNAUTHORIZED),
     }
+}
+
+fn recommendation_fingerprint(title: &str, trigger: &str) -> String {
+    format!(
+        "{}::{}",
+        title.trim().to_lowercase(),
+        trigger.trim().to_lowercase()
+    )
+}
+
+fn find_recommendation_id_by_fingerprint(target: &str) -> anyhow::Result<Option<i64>> {
+    let rows = db::get_recommendations_with_filter(Some("all"))?;
+    for rec in rows {
+        let fp = recommendation_fingerprint(&rec.title, &rec.trigger);
+        if fp == target {
+            return Ok(Some(rec.id));
+        }
+    }
+    Ok(None)
+}
+
+fn summarize_prompt(prompt: &str, max_chars: usize) -> String {
+    let trimmed = prompt.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let short = trimmed.chars().take(max_chars).collect::<String>();
+    format!("{}...", short)
+}
+
+fn queue_manual_workflow_recommendation(prompt: &str, source: &str) -> anyhow::Result<(i64, bool)> {
+    let prompt_trimmed = prompt.trim();
+    if prompt_trimmed.is_empty() {
+        return Err(anyhow::anyhow!("workflow prompt is empty"));
+    }
+    let short = summarize_prompt(prompt_trimmed, 48);
+    let proposal = crate::recommendation::AutomationProposal {
+        title: format!("Manual Workflow: {}", short),
+        summary: format!(
+            "Manual workflow request captured from {} (approval required before creation).",
+            source
+        ),
+        trigger: "Manual workflow request".to_string(),
+        actions: vec!["n8n Workflow".to_string()],
+        confidence: 0.6,
+        n8n_prompt: prompt_trimmed.to_string(),
+        evidence: vec![
+            format!("source={}", source),
+            format!("prompt={}", summarize_prompt(prompt_trimmed, 160)),
+        ],
+        pattern_id: None,
+    };
+
+    let fp = proposal.fingerprint();
+    let inserted = db::insert_recommendation(&proposal)?;
+    let rec_id = find_recommendation_id_by_fingerprint(&fp)?
+        .ok_or_else(|| anyhow::anyhow!("failed to resolve recommendation id after insert"))?;
+    Ok((rec_id, inserted))
 }
 
 /// Start the HTTP API server for desktop GUI
@@ -1111,55 +1179,16 @@ async fn handle_chat(
                         let prompt_str = intent["params"]["prompt"].as_str()
                             .or_else(|| intent["params"]["description"].as_str())
                             .unwrap_or(&message);
-                        let prompt = prompt_str.to_string(); // Clone to owned String for async block
-                        let response_msg = format!("🏗️ 자동화 워크플로우 생성을 시작합니다: '{}'\n(잠시만 기다려주세요...)", prompt);
-
-                        // Spawn async task to handle creation (avoid blocking response)
-                        let llm_clone = brain.clone();
-                        tokio::spawn(async move {
-                            match n8n_api::N8nApi::from_env() {
-                                Ok(n8n) => {
-                                    // 1. Get Credentials Context
-                                    let creds = n8n.list_credentials().await.unwrap_or_default();
-                                    let cred_context = creds.iter().map(|c| format!("{}:{}", c.name, c.id)).collect::<Vec<_>>().join(", ");
-
-                                    // Ensure server is running
-                                    if let Err(e) = n8n.ensure_server_running().await {
-                                        println!("⚠️ n8n Server Check Failed: {}", e);
-                                        // Try proceeding anyway? Or return?
-                                        // CLI fallback handles start, so we might be fine, but explicit check is good.
-                                    }
-
-                                    // 2. Build via LLM
-                                    let cred_str = if cred_context.is_empty() {
-                                        "NO CREDENTIALS AVAILABLE. Do NOT use any nodes requiring authentication (like Gmail, Slack, Drive). Use ONLY core nodes (Schedule, Webhook, HTTP Request, etc).".to_string()
-                                    } else {
-                                        format!("Available Credentials: {}", cred_context)
-                                    };
-
-                                    let full_prompt = format!("Create a n8n workflow for: {}. {}", prompt, cred_str);
-                                    match llm_clone.build_n8n_workflow(&full_prompt).await {
-                                        Ok(json_str) => {
-                                            // Parse JSON string to Value
-                                            match serde_json::from_str::<serde_json::Value>(&json_str) {
-                                                Ok(json_val) => {
-                                                    // 3. Create in n8n (Inactive)
-                                                    match n8n.create_workflow("Chat Generated Workflow", &json_val, false).await {
-                                                        Ok(id) => println!("✅ Chat-triggered Workflow Created: {}", id),
-                                                        Err(e) => println!("❌ Workflow Creation Failed: {}", e),
-                                                    }
-                                                },
-                                                Err(e) => println!("❌ Invalid JSON from LLM: {}", e),
-                                            }
-                                        },
-                                        Err(e) => println!("❌ LLM Generation Failed: {}", e),
-                                    }
-                                },
-                                Err(e) => println!("❌ n8n Client Error: {}", e),
+                        match queue_manual_workflow_recommendation(prompt_str, "api.chat.build_workflow") {
+                            Ok((rec_id, inserted)) => {
+                                let queued = if inserted { "생성" } else { "재사용" };
+                                format!(
+                                    "📝 워크플로우 제안을 {}했습니다 (ID: {}).\n승인 게이트 정책상 즉시 생성은 차단되며, `/api/recommendations/{}/approve` 또는 CLI `approve {}`로 승인 후 생성됩니다.",
+                                    queued, rec_id, rec_id, rec_id
+                                )
                             }
-                        });
-
-                        response_msg
+                            Err(e) => format!("❌ 워크플로우 제안 저장 실패: {}", e),
+                        }
                     },
                     "create_routine" => {
                         let params = intent["params"].as_object();
@@ -1295,52 +1324,39 @@ async fn approve_recommendation(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     println!("🔔 Received approval request for Recommendation ID: {}", id);
 
-    let rec = match db::get_recommendation(id) {
-        Ok(Some(r)) => r,
-        _ => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Recommendation not found"})),
-            ));
-        }
-    };
-
-    if rec.status.eq_ignore_ascii_case("rejected") {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "Rejected recommendation cannot be approved"
-            })),
-        ));
-    }
-
-    if !rec.status.eq_ignore_ascii_case("approved") {
-        if let Err(e) = db::update_recommendation_review_status(id, "approved") {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "Failed to set approved status",
-                    "details": e.to_string()
-                })),
-            ));
-        }
-    }
-
-    match recommendation_executor::execute_approved_recommendation(id, state.llm_client.clone())
+    match recommendation_executor::approve_and_execute_recommendation(id, state.llm_client.clone())
         .await
     {
-        Ok(workflow_id) => Ok(Json(serde_json::json!({
+        Ok(outcome) => Ok(Json(serde_json::json!({
             "status": "success",
-            "id": workflow_id,
-            "message": "Workflow created successfully"
+            "id": outcome.workflow_id,
+            "approved_now": outcome.approved_now,
+            "reused_existing": outcome.reused_existing,
+            "message": if outcome.reused_existing {
+                "Workflow already existed; reused existing workflow_id"
+            } else {
+                "Workflow created successfully"
+            }
         }))),
-        Err(e) => Err((
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "error": "Approval pipeline failed",
-                "details": e.to_string()
-            })),
-        )),
+        Err(e) => {
+            let detail = e.to_string();
+            let status = if detail.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else if detail.contains("rejected") {
+                StatusCode::CONFLICT
+            } else if detail.contains("workflow creation failed") {
+                StatusCode::BAD_GATEWAY
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            Err((
+                status,
+                Json(serde_json::json!({
+                    "error": "Approval pipeline failed",
+                    "details": detail
+                })),
+            ))
+        }
     }
 }
 
@@ -1897,11 +1913,14 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
     let planner_complete = !plan.steps.is_empty();
     let execution_complete = result.status == "completed";
     let verification_ok = verify.ok;
-    let business_complete = planner_complete && execution_complete && verification_ok;
+    let (evidence_ok, evidence_detail) = evaluate_business_evidence(&plan, &result.logs);
+    let business_complete =
+        planner_complete && execution_complete && verification_ok && evidence_ok;
 
     let planner_actual = planner_complete.to_string();
     let execution_actual = execution_complete.to_string();
     let verify_actual = verification_ok.to_string();
+    let evidence_actual = evidence_ok.to_string();
     let business_actual = business_complete.to_string();
 
     let _ = db::record_task_stage_run(
@@ -1968,6 +1987,12 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
         verification_ok,
         Some(&verify.issues.join("; ")),
     );
+    let business_stage_requirements =
+        "requires planner_complete && execution_complete && verify_ok && business_evidence_ok";
+    let business_stage_details = format!(
+        "{}; evidence={}",
+        business_stage_requirements, evidence_detail
+    );
     let _ = db::record_task_stage_run(
         &run_id,
         "business",
@@ -1977,7 +2002,16 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
         } else {
             "failed"
         },
-        Some("requires planner_complete && execution_complete && verify_ok"),
+        Some(&business_stage_details),
+    );
+    let _ = db::record_task_stage_assertion(
+        &run_id,
+        "business",
+        "business_evidence",
+        "true",
+        &evidence_actual,
+        evidence_ok,
+        Some(&evidence_detail),
     );
     let _ = db::record_task_stage_assertion(
         &run_id,
@@ -1986,10 +2020,15 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
         "true",
         &business_actual,
         business_complete,
-        Some("planner_complete && execution_complete && verify_ok"),
+        Some(business_stage_requirements),
     );
 
     if result.status == "completed" && !business_complete {
+        if !evidence_ok {
+            result
+                .logs
+                .push(format!("Business evidence failed: {}", evidence_detail));
+        }
         result.logs.push(
             "Final status downgraded: planner/execution complete but business completion failed"
                 .to_string(),
@@ -2095,6 +2134,80 @@ async fn agent_approve_handler(Json(payload): Json<AgentApproveRequest>) -> impl
     };
 
     (StatusCode::OK, Json(response)).into_response()
+}
+
+fn evaluate_business_evidence(
+    plan: &crate::nl_automation::Plan,
+    logs: &[String],
+) -> (bool, String) {
+    let lowered_logs: Vec<String> = logs.iter().map(|line| line.to_lowercase()).collect();
+    let mut issues: Vec<String> = Vec::new();
+
+    let blocking_markers = [
+        "execution paused awaiting approval",
+        "execution paused for manual input",
+        "approval required before continuing",
+        "execution blocked by policy",
+        "manual input required",
+        "manual filters required",
+    ];
+    for marker in blocking_markers {
+        if lowered_logs.iter().any(|line| line.contains(marker)) {
+            issues.push(format!("blocking signal present: {}", marker));
+            break;
+        }
+    }
+
+    if lowered_logs
+        .iter()
+        .any(|line| line.contains("no summary extracted"))
+    {
+        issues.push("summary extraction returned empty".to_string());
+    }
+
+    let summaries: Vec<String> = logs
+        .iter()
+        .filter_map(|line| line.strip_prefix("Summary: ").map(|s| s.trim().to_string()))
+        .collect();
+    let meaningful_summary = summaries
+        .iter()
+        .find(|summary| is_meaningful_summary(plan, summary))
+        .cloned();
+    if meaningful_summary.is_none() {
+        issues.push("missing meaningful summary output".to_string());
+    }
+
+    if issues.is_empty() {
+        let summary = meaningful_summary
+            .or_else(|| summaries.first().cloned())
+            .unwrap_or_else(|| "n/a".to_string());
+        return (true, format!("summary=\"{}\"", summary));
+    }
+
+    (false, issues.join("; "))
+}
+
+fn is_meaningful_summary(plan: &crate::nl_automation::Plan, summary: &str) -> bool {
+    let normalized = summary.trim().to_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    if matches!(normalized.as_str(), "need more details" | "n/a" | "unknown") {
+        return false;
+    }
+    if normalized.contains("no summary extracted") {
+        return false;
+    }
+    if matches!(
+        plan.intent,
+        crate::nl_automation::IntentType::FlightSearch
+            | crate::nl_automation::IntentType::ShoppingCompare
+            | crate::nl_automation::IntentType::FormFill
+    ) && normalized.contains("unknown")
+    {
+        return false;
+    }
+    true
 }
 
 fn extract_summary(logs: &[String]) -> Option<String> {
@@ -2299,5 +2412,63 @@ async fn resume_session_handler(Path(id): Path<String>) -> Json<serde_json::Valu
             }
         }
         Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nl_automation::{IntentType, Plan, PlanStep, StepType};
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    fn test_plan(intent: IntentType) -> Plan {
+        Plan {
+            plan_id: format!("plan-{}", uuid::Uuid::new_v4()),
+            intent,
+            slots: HashMap::new(),
+            steps: vec![PlanStep {
+                step_id: "extract-1".to_string(),
+                step_type: StepType::Extract,
+                description: "Extract final result".to_string(),
+                data: json!({}),
+            }],
+        }
+    }
+
+    #[test]
+    fn business_evidence_accepts_meaningful_summary() {
+        let plan = test_plan(IntentType::GenericTask);
+        let logs = vec![
+            "Start plan".to_string(),
+            "Summary: Notes saved and shared".to_string(),
+            "Verification passed".to_string(),
+        ];
+
+        let (ok, detail) = evaluate_business_evidence(&plan, &logs);
+        assert!(ok, "expected evidence to pass, got: {}", detail);
+    }
+
+    #[test]
+    fn business_evidence_rejects_placeholder_summary() {
+        let plan = test_plan(IntentType::GenericTask);
+        let logs = vec!["Summary: need more details".to_string()];
+
+        let (ok, detail) = evaluate_business_evidence(&plan, &logs);
+        assert!(!ok);
+        assert!(detail.contains("missing meaningful summary output"));
+    }
+
+    #[test]
+    fn business_evidence_rejects_blocking_signal() {
+        let plan = test_plan(IntentType::FlightSearch);
+        let logs = vec![
+            "Summary: search flights Seoul -> Tokyo".to_string(),
+            "Execution paused awaiting approval".to_string(),
+        ];
+
+        let (ok, detail) = evaluate_business_evidence(&plan, &logs);
+        assert!(!ok);
+        assert!(detail.contains("blocking signal present"));
     }
 }

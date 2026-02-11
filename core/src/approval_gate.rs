@@ -4,6 +4,7 @@
 use lazy_static::lazy_static;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 // =====================================================
 // Approval Types (from clawdbot)
@@ -110,7 +111,7 @@ lazy_static! {
 #[derive(Debug, Clone)]
 struct DecisionEntry {
     status: ApprovalStatus,
-    created_at: std::time::Instant,
+    expires_at: Instant,
 }
 
 // =====================================================
@@ -120,6 +121,22 @@ struct DecisionEntry {
 pub struct ApprovalGate;
 
 impl ApprovalGate {
+    fn has_shell_features(cmd: &str) -> bool {
+        let compact = cmd.trim();
+        if compact.is_empty() {
+            return false;
+        }
+        // Conservative: if shell chaining/redirection/substitution exists, require approval.
+        compact.contains("&&")
+            || compact.contains("||")
+            || compact.contains(';')
+            || compact.contains('|')
+            || compact.contains('>')
+            || compact.contains('<')
+            || compact.contains("$(")
+            || compact.contains('`')
+    }
+
     /// Check if a command requires approval, is blocked, or can auto-run
     pub fn check_command(cmd: &str) -> ApprovalLevel {
         let cmd_lower = cmd.to_lowercase();
@@ -132,15 +149,9 @@ impl ApprovalGate {
             }
         }
 
-        // 2. Check if it's a safe binary
-        let first_word = cmd_trimmed.split_whitespace().next().unwrap_or("");
-        let binary_name = std::path::Path::new(first_word)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(first_word);
-
-        if SAFE_BINS.contains(binary_name) {
-            return ApprovalLevel::AutoApprove;
+        // 2. Chaining/redirection/substitution always requires explicit approval.
+        if Self::has_shell_features(cmd_trimmed) {
+            return ApprovalLevel::RequireApproval;
         }
 
         // 3. Check approval patterns
@@ -150,7 +161,17 @@ impl ApprovalGate {
             }
         }
 
-        // 4. Default: require approval for unknown commands.
+        // 4. Check if it's a safe binary (simple single command only).
+        let first_word = cmd_trimmed.split_whitespace().next().unwrap_or("");
+        let binary_name = std::path::Path::new(first_word)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(first_word);
+        if SAFE_BINS.contains(binary_name) {
+            return ApprovalLevel::AutoApprove;
+        }
+
+        // 5. Default: require approval for unknown commands.
         ApprovalLevel::RequireApproval
     }
 
@@ -261,6 +282,18 @@ mod tests {
     }
 
     #[test]
+    fn test_safe_bin_with_shell_features_requires_approval() {
+        assert_eq!(
+            ApprovalGate::check_command("echo hello > /tmp/a.txt"),
+            ApprovalLevel::RequireApproval
+        );
+        assert_eq!(
+            ApprovalGate::check_command("cat file.txt | wc -l"),
+            ApprovalLevel::RequireApproval
+        );
+    }
+
+    #[test]
     fn test_user_approval_overrides_policy() {
         reset_decisions();
         let plan = test_plan("plan-approval-override");
@@ -288,6 +321,25 @@ mod tests {
         assert_eq!(decision.status, "denied");
         assert!(decision.requires_approval);
         assert_eq!(decision.policy, "user_decision");
+    }
+
+    #[test]
+    fn test_decision_persists_via_db() {
+        if let Err(e) = crate::db::init() {
+            eprintln!("skip: db init unavailable for persistence test: {}", e);
+            return;
+        }
+        reset_decisions();
+        let plan = test_plan(&format!("plan-db-persist-{}", uuid::Uuid::new_v4()));
+        let action = r#"{"action":"shell","command":"sudo apt install git"}"#;
+
+        register_decision("approve", action, &plan);
+        reset_decisions();
+
+        let after = preview_approval(action, &plan);
+        assert_eq!(after.status, "approved");
+        assert!(!after.requires_approval);
+        assert_eq!(after.policy, "user_decision");
     }
 
     fn test_plan(plan_id: &str) -> Plan {
@@ -329,14 +381,27 @@ pub fn register_decision(decision: &str, action: &str, plan: &crate::nl_automati
         );
         return;
     };
+    let ttl = decision_ttl();
     let key = decision_key(&plan.plan_id, action);
     let entry = DecisionEntry {
         status,
-        created_at: std::time::Instant::now(),
+        expires_at: Instant::now() + ttl,
     };
     if let Ok(mut registry) = DECISION_REGISTRY.lock() {
         cleanup_expired_decisions_locked(&mut registry);
-        registry.insert(key, entry);
+        registry.insert(key.clone(), entry);
+    }
+    if let Err(e) = crate::db::upsert_approval_decision(
+        &key,
+        &plan.plan_id,
+        action,
+        status_to_storage(status),
+        std::cmp::min(ttl.as_secs(), i64::MAX as u64) as i64,
+    ) {
+        println!(
+            "⚠️ [ApprovalGate] Failed to persist decision for plan {}: {}",
+            plan.plan_id, e
+        );
     }
     println!(
         "📝 [ApprovalGate] Decision '{}' registered for plan {} action: {}",
@@ -500,17 +565,58 @@ fn decision_ttl() -> std::time::Duration {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(600);
-    std::time::Duration::from_secs(ttl_seconds)
+    Duration::from_secs(ttl_seconds)
 }
 
 fn cleanup_expired_decisions_locked(registry: &mut HashMap<String, DecisionEntry>) {
-    let ttl = decision_ttl();
-    registry.retain(|_, entry| entry.created_at.elapsed() < ttl);
+    let now = Instant::now();
+    registry.retain(|_, entry| entry.expires_at > now);
 }
 
 fn get_registered_decision(plan_id: &str, action: &str) -> Option<ApprovalStatus> {
     let key = decision_key(plan_id, action);
-    let mut registry = DECISION_REGISTRY.lock().ok()?;
-    cleanup_expired_decisions_locked(&mut registry);
-    registry.get(&key).map(|entry| entry.status)
+    if let Ok(mut registry) = DECISION_REGISTRY.lock() {
+        cleanup_expired_decisions_locked(&mut registry);
+        if let Some(entry) = registry.get(&key) {
+            return Some(entry.status);
+        }
+    }
+
+    let stored = crate::db::get_active_approval_decision(&key)
+        .ok()
+        .flatten()?;
+    let status = parse_stored_status(&stored.status)?;
+    if let Ok(mut registry) = DECISION_REGISTRY.lock() {
+        let expires_at = instant_from_expiry(&stored.expires_at)
+            .unwrap_or_else(|| Instant::now() + decision_ttl());
+        registry.insert(key, DecisionEntry { status, expires_at });
+    }
+    Some(status)
+}
+
+fn status_to_storage(status: ApprovalStatus) -> &'static str {
+    match status {
+        ApprovalStatus::Pending => "pending",
+        ApprovalStatus::Approved => "approved",
+        ApprovalStatus::Denied => "denied",
+        ApprovalStatus::Expired => "expired",
+    }
+}
+
+fn parse_stored_status(value: &str) -> Option<ApprovalStatus> {
+    match value.trim().to_lowercase().as_str() {
+        "pending" => Some(ApprovalStatus::Pending),
+        "approved" => Some(ApprovalStatus::Approved),
+        "denied" => Some(ApprovalStatus::Denied),
+        "expired" => Some(ApprovalStatus::Expired),
+        _ => None,
+    }
+}
+
+fn instant_from_expiry(expires_at: &str) -> Option<Instant> {
+    let parsed = chrono::DateTime::parse_from_rfc3339(expires_at).ok()?;
+    let expiry_utc = parsed.with_timezone(&chrono::Utc);
+    let now_utc = chrono::Utc::now();
+    let remaining = (expiry_utc - now_utc).to_std().ok()?;
+    Some(Instant::now() + remaining)
 }

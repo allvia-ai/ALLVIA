@@ -144,7 +144,7 @@ run_cmd_with_timeout_capture() {
 
 semantic_location_missing() {
     case "$1" in
-        NOT_FOUND|CHECK_ERROR|CHECK_TIMEOUT|"")
+        NOT_FOUND|CHECK_ERROR|CHECK_TIMEOUT|MARKER_REQUIRED|"")
             return 0
             ;;
         *)
@@ -212,12 +212,15 @@ preflight_checks() {
         rm -f "$preflight_capture"
     fi
 
-    if [ -z "${OPENAI_API_KEY:-}" ]; then
+    if [ "$SCENARIO_MODE_VALUE" = "0" ] && [ -z "$CLI_LLM_VALUE" ] && [ -z "${OPENAI_API_KEY:-}" ]; then
         echo "❌ Preflight failed: OPENAI_API_KEY is not set."
-        echo "   Fix: core/.env 또는 현재 셸 환경에 OPENAI_API_KEY를 설정하세요."
+        echo "   Fix: 기본 OpenAI 경로를 쓰려면 core/.env 또는 현재 셸에 OPENAI_API_KEY를 설정하세요."
+        echo "   대안: STEER_CLI_LLM 설정 또는 STEER_SCENARIO_MODE=1(테스트 전용) 사용."
         failed=1
-    else
+    elif [ -n "${OPENAI_API_KEY:-}" ]; then
         echo "✅ Preflight: OPENAI_API_KEY detected."
+    else
+        echo "ℹ️ Preflight: OPENAI_API_KEY not required in current mode (CLI/scenario path)."
     fi
 
     if [ "${STEER_REQUIRE_MAIL_SEND:-1}" = "1" ] && [ -z "$MAIL_TO_TARGET" ]; then
@@ -266,61 +269,182 @@ mail_outgoing_count() {
     return 1
 }
 
+get_idle_seconds() {
+    local idle_raw
+    idle_raw=$(ioreg -c IOHIDSystem 2>/dev/null | awk '/HIDIdleTime/ {print $NF; exit}')
+    if [ -z "$idle_raw" ]; then
+        return 1
+    fi
+    # HIDIdleTime is nanoseconds.
+    echo $((idle_raw / 1000000000))
+    return 0
+}
+
+get_frontmost_app() {
+    osascript -e 'tell application "System Events" to get name of first process whose frontmost is true' 2>/dev/null || true
+}
+
+is_user_active_front_app() {
+    local app="$1"
+    local user_apps_csv="${STEER_USER_ACTIVE_APPS:-Terminal,Codex,iTerm2}"
+    local oldifs="$IFS"
+    IFS=','
+    read -r -a apps <<< "$user_apps_csv"
+    IFS="$oldifs"
+    for item in "${apps[@]}"; do
+        local trimmed
+        trimmed="$(echo "$item" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [ -z "$trimmed" ] && continue
+        if [ "$app" = "$trimmed" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+run_surf_with_input_guard() {
+    local prompt="$1"
+    local log_file="$2"
+    local node_dir="$3"
+    local use_guard="${STEER_PAUSE_ON_USER_INPUT:-1}"
+    if [ "$use_guard" != "1" ]; then
+        if [ -n "$CLI_LLM_VALUE" ]; then
+            STEER_SCENARIO_MODE="$SCENARIO_MODE_VALUE" \
+                STEER_CLI_LLM="$CLI_LLM_VALUE" \
+                STEER_NODE_CAPTURE=1 \
+                STEER_NODE_CAPTURE_ALL="$NODE_CAPTURE_ALL_VALUE" \
+                STEER_NODE_CAPTURE_DIR="$node_dir" \
+                STEER_LOCK_DISABLED="$LOCK_DISABLED_VALUE" \
+                STEER_TEST_MODE=1 \
+                cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$prompt" &> "$log_file"
+        else
+            STEER_SCENARIO_MODE="$SCENARIO_MODE_VALUE" \
+                STEER_NODE_CAPTURE=1 \
+                STEER_NODE_CAPTURE_ALL="$NODE_CAPTURE_ALL_VALUE" \
+                STEER_NODE_CAPTURE_DIR="$node_dir" \
+                STEER_LOCK_DISABLED="$LOCK_DISABLED_VALUE" \
+                STEER_TEST_MODE=1 \
+                cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$prompt" &> "$log_file"
+        fi
+        return $?
+    fi
+
+    local active_threshold="${STEER_INPUT_ACTIVE_THRESHOLD_SECONDS:-1}"
+    local resume_idle="${STEER_IDLE_RESUME_SECONDS:-3}"
+    local poll_interval="${STEER_INPUT_POLL_SECONDS:-1}"
+    local paused=0
+    local pause_count=0
+    local run_pid=""
+
+    echo "🛡️ User-input guard enabled (apps=${STEER_USER_ACTIVE_APPS:-Terminal,Codex,iTerm2}, active<=${active_threshold}s, resume>=${resume_idle}s)"
+
+    if [ -n "$CLI_LLM_VALUE" ]; then
+        STEER_SCENARIO_MODE="$SCENARIO_MODE_VALUE" \
+            STEER_CLI_LLM="$CLI_LLM_VALUE" \
+            STEER_NODE_CAPTURE=1 \
+            STEER_NODE_CAPTURE_ALL="$NODE_CAPTURE_ALL_VALUE" \
+            STEER_NODE_CAPTURE_DIR="$node_dir" \
+            STEER_LOCK_DISABLED="$LOCK_DISABLED_VALUE" \
+            STEER_TEST_MODE=1 \
+            cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$prompt" &> "$log_file" &
+    else
+        STEER_SCENARIO_MODE="$SCENARIO_MODE_VALUE" \
+            STEER_NODE_CAPTURE=1 \
+            STEER_NODE_CAPTURE_ALL="$NODE_CAPTURE_ALL_VALUE" \
+            STEER_NODE_CAPTURE_DIR="$node_dir" \
+            STEER_LOCK_DISABLED="$LOCK_DISABLED_VALUE" \
+            STEER_TEST_MODE=1 \
+            cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$prompt" &> "$log_file" &
+    fi
+    run_pid=$!
+
+    while kill -0 "$run_pid" 2>/dev/null; do
+        local idle_sec=""
+        idle_sec="$(get_idle_seconds || true)"
+        if [ -n "$idle_sec" ]; then
+            local front_app=""
+            front_app="$(get_frontmost_app)"
+            if [ "$paused" -eq 0 ] && [ "$idle_sec" -le "$active_threshold" ] && is_user_active_front_app "$front_app"; then
+                kill -STOP "$run_pid" >/dev/null 2>&1 || true
+                pkill -STOP -P "$run_pid" >/dev/null 2>&1 || true
+                paused=1
+                pause_count=$((pause_count + 1))
+                echo "⏸️ [InputGuard] Paused run (front_app=${front_app}, idle=${idle_sec}s, count=${pause_count})"
+                echo "⏸️ [InputGuard] Paused run (front_app=${front_app}, idle=${idle_sec}s, count=${pause_count})" >> "$log_file"
+            elif [ "$paused" -eq 1 ] && [ "$idle_sec" -ge "$resume_idle" ]; then
+                kill -CONT "$run_pid" >/dev/null 2>&1 || true
+                pkill -CONT -P "$run_pid" >/dev/null 2>&1 || true
+                paused=0
+                echo "▶️ [InputGuard] Resumed run (idle=${idle_sec}s)"
+                echo "▶️ [InputGuard] Resumed run (idle=${idle_sec}s)" >> "$log_file"
+            fi
+        fi
+        sleep "$poll_interval"
+    done
+
+    wait "$run_pid"
+    local exit_code=$?
+    echo "🧾 [InputGuard] pause_count=${pause_count}"
+    echo "🧾 [InputGuard] pause_count=${pause_count}" >> "$log_file"
+    return $exit_code
+}
+
 token_presence_location() {
     local token="$1"
     local marker="${2:-}"
+    local require_marker="${STEER_SEMANTIC_REQUIRE_MARKER:-1}"
+    local scan_limit="${STEER_MAIL_SENT_SCAN_LIMIT:-120}"
     local result=""
     local timeout_sec="${STEER_OSASCRIPT_TIMEOUT_SEC:-8}"
     local tmp_out=""
     local tmp_err=""
     local osa_pid=""
+
+    if [ "$require_marker" = "1" ] && [ -z "$marker" ]; then
+        printf '%s\n' "MARKER_REQUIRED"
+        return 0
+    fi
     tmp_out="$(mktemp -t steer_osa_out.XXXXXX)"
     tmp_err="$(mktemp -t steer_osa_err.XXXXXX)"
 
     (
-        osascript - "$token" "$marker" <<'APPLESCRIPT'
+        osascript - "$token" "$marker" "$scan_limit" <<'APPLESCRIPT'
 on run argv
     set tokenText to item 1 of argv
     set markerText to ""
     if (count of argv) > 1 then set markerText to item 2 of argv
+    set scanLimit to 120
+    if (count of argv) > 2 then
+        try
+            set scanLimit to (item 3 of argv) as integer
+        on error
+            set scanLimit to 120
+        end try
+    end if
+    if scanLimit < 10 then set scanLimit to 10
 
     try
         tell application "Notes"
             if (count of accounts) > 0 then
-                set latestNote to missing value
-                set latestDate to date "January 1, 1970 at 00:00:00"
                 repeat with ac in accounts
                     repeat with f in folders of ac
                         repeat with n in notes of f
                             try
-                                set modDate to modification date of n
+                                set nName to name of n as text
                             on error
-                                set modDate to current date
+                                set nName to ""
                             end try
-                            if latestNote is missing value or modDate > latestDate then
-                                set latestNote to n
-                                set latestDate to modDate
-                            end if
+                            try
+                                set nBody to body of n as text
+                            on error
+                                set nBody to ""
+                            end try
+                            set scopeOk to (markerText is "" or nBody contains markerText or nName contains markerText)
+                            if scopeOk and nName contains tokenText then return "NOTE_TITLE"
+                            if scopeOk and nBody contains tokenText then return "NOTE_BODY"
                         end repeat
                     end repeat
                 end repeat
-
-                if latestNote is not missing value then
-                    try
-                        set nName to name of latestNote as text
-                    on error
-                        set nName to ""
-                    end try
-
-                    try
-                        set nBody to body of latestNote as text
-                    on error
-                        set nBody to ""
-                    end try
-                    set scopeOk to (markerText is "" or nBody contains markerText or nName contains markerText)
-                    if scopeOk and nName contains tokenText then return "NOTE_TITLE"
-                    if scopeOk and nBody contains tokenText then return "NOTE_BODY"
-                end if
             end if
         end tell
     on error
@@ -331,21 +455,25 @@ on run argv
         tell application "Mail"
             set draftCount to count of outgoing messages
             if draftCount > 0 then
-                set m to last outgoing message
-                try
-                    set s to subject of m as text
-                on error
-                    set s to ""
-                end try
+                set lowerDraft to draftCount - scanLimit
+                if lowerDraft < 1 then set lowerDraft to 1
+                repeat with idx from draftCount to lowerDraft by -1
+                    set m to item idx of outgoing messages
+                    try
+                        set s to subject of m as text
+                    on error
+                        set s to ""
+                    end try
 
-                try
-                    set c to content of m as text
-                on error
-                    set c to ""
-                end try
-                set scopeOk to (markerText is "" or c contains markerText or s contains markerText)
-                if scopeOk and s contains tokenText then return "MAIL_SUBJECT"
-                if scopeOk and c contains tokenText then return "MAIL_BODY"
+                    try
+                        set c to content of m as text
+                    on error
+                        set c to ""
+                    end try
+                    set scopeOk to (markerText is "" or c contains markerText or s contains markerText)
+                    if scopeOk and s contains tokenText then return "MAIL_SUBJECT"
+                    if scopeOk and c contains tokenText then return "MAIL_BODY"
+                end repeat
             end if
 
             repeat with ac in accounts
@@ -354,7 +482,7 @@ on run argv
                     if sentMbx is not missing value then
                         set sentCount to count of messages of sentMbx
                         if sentCount > 0 then
-                            set lowerBound to sentCount - 40
+                            set lowerBound to sentCount - scanLimit
                             if lowerBound < 1 then set lowerBound to 1
                             repeat with idx from sentCount to lowerBound by -1
                                 set sm to message idx of sentMbx
@@ -381,15 +509,20 @@ on run argv
 
     try
         tell application "TextEdit"
-            if (count of documents) > 0 then
-                set d to front document
-                try
-                    set t to text of d as text
-                on error
-                    set t to ""
-                end try
-                set scopeOk to (markerText is "" or t contains markerText)
-                if scopeOk and t contains tokenText then return "TEXTEDIT_BODY"
+            set docCount to count of documents
+            if docCount > 0 then
+                set lowerDoc to docCount - scanLimit
+                if lowerDoc < 1 then set lowerDoc to 1
+                repeat with idx from docCount to lowerDoc by -1
+                    set d to item idx of documents
+                    try
+                        set t to text of d as text
+                    on error
+                        set t to ""
+                    end try
+                    set scopeOk to (markerText is "" or t contains markerText)
+                    if scopeOk and t contains tokenText then return "TEXTEDIT_BODY"
+                end repeat
             end if
         end tell
     on error
@@ -427,33 +560,124 @@ APPLESCRIPT
     printf '%s\n' "$result"
 }
 
+mail_sent_recipient_location() {
+    local recipient="$1"
+    local marker="${2:-}"
+    local require_marker="${STEER_SEMANTIC_REQUIRE_MARKER:-1}"
+    local scan_limit="${STEER_MAIL_SENT_SCAN_LIMIT:-120}"
+    local result=""
+    local timeout_sec="${STEER_OSASCRIPT_TIMEOUT_SEC:-8}"
+    local tmp_out=""
+    local tmp_err=""
+    local osa_pid=""
+
+    if [ -z "$recipient" ]; then
+        printf '%s\n' "RECIPIENT_EMPTY"
+        return 0
+    fi
+    if [ "$require_marker" = "1" ] && [ -z "$marker" ]; then
+        printf '%s\n' "MARKER_REQUIRED"
+        return 0
+    fi
+
+    tmp_out="$(mktemp -t steer_mail_recipient_out.XXXXXX)"
+    tmp_err="$(mktemp -t steer_mail_recipient_err.XXXXXX)"
+
+    (
+        osascript - "$recipient" "$marker" "$scan_limit" <<'APPLESCRIPT'
+on run argv
+    set recipientText to item 1 of argv
+    set markerText to ""
+    if (count of argv) > 1 then set markerText to item 2 of argv
+    set scanLimit to 120
+    if (count of argv) > 2 then
+        try
+            set scanLimit to (item 3 of argv) as integer
+        on error
+            set scanLimit to 120
+        end try
+    end if
+    if scanLimit < 10 then set scanLimit to 10
+
+    try
+        tell application "Mail"
+            repeat with ac in accounts
+                try
+                    set sentMbx to sent mailbox of ac
+                    if sentMbx is not missing value then
+                        set sentCount to count of messages of sentMbx
+                        if sentCount > 0 then
+                            set lowerBound to sentCount - scanLimit
+                            if lowerBound < 1 then set lowerBound to 1
+                            repeat with idx from sentCount to lowerBound by -1
+                                set sm to message idx of sentMbx
+                                set ss to ""
+                                set sc to ""
+                                set recipientsText to ""
+                                try
+                                    set ss to subject of sm as text
+                                end try
+                                try
+                                    set sc to content of sm as text
+                                end try
+                                try
+                                    repeat with r in to recipients of sm
+                                        try
+                                            set recipientsText to recipientsText & " " & (address of r as text)
+                                        end try
+                                    end repeat
+                                end try
+                                set scopeOk to (markerText is "" or sc contains markerText or ss contains markerText)
+                                if scopeOk and recipientsText contains recipientText then return "MAIL_SENT_RECIPIENT"
+                            end repeat
+                        end if
+                    end if
+                end try
+            end repeat
+        end tell
+    on error
+        return "CHECK_ERROR"
+    end try
+    return "NOT_FOUND"
+end run
+APPLESCRIPT
+    ) >"$tmp_out" 2>"$tmp_err" &
+    osa_pid=$!
+
+    local elapsed=0
+    while kill -0 "$osa_pid" 2>/dev/null; do
+        if [ "$elapsed" -ge "$timeout_sec" ]; then
+            kill -9 "$osa_pid" 2>/dev/null || true
+            wait "$osa_pid" 2>/dev/null || true
+            result="CHECK_TIMEOUT"
+            break
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    if [ -z "$result" ]; then
+        wait "$osa_pid" 2>/dev/null || true
+        result="$(cat "$tmp_out" 2>/dev/null || true)"
+    fi
+
+    rm -f "$tmp_out" "$tmp_err"
+    if [ -z "$result" ]; then
+        result="CHECK_ERROR"
+    fi
+    printf '%s\n' "$result"
+}
+
 # Run agent command and detect logical failures from logs as well as exit code.
 run_agent_scenario() {
     local prompt=$1
     local log_file=$2
     local scenario_num=$3
-    local fatal_pattern='Failed to acquire lock|thread .* panicked|FATAL ERROR|⛔️|❌|LLM not available for surf mode|Preflight failed|Surf failed|Supervisor escalated|Execution Error|SCHEMA_ERROR|PLAN_REJECTED|LLM Refused'
+    local fatal_pattern='Failed to acquire lock|thread .* panicked|FATAL ERROR|⛔️|LLM not available for surf mode|Preflight failed|Surf failed|Supervisor escalated|Execution Error|SCHEMA_ERROR|PLAN_REJECTED|LLM Refused'
     local node_dir="scenario_results/complex_scenario_${scenario_num}_${TIMESTAMP}_nodes"
 
-    if [ -n "$CLI_LLM_VALUE" ]; then
-        if ! STEER_SCENARIO_MODE="$SCENARIO_MODE_VALUE" \
-            STEER_CLI_LLM="$CLI_LLM_VALUE" \
-            STEER_NODE_CAPTURE=1 \
-            STEER_NODE_CAPTURE_ALL="$NODE_CAPTURE_ALL_VALUE" \
-            STEER_NODE_CAPTURE_DIR="$node_dir" \
-            STEER_LOCK_DISABLED="$LOCK_DISABLED_VALUE" \
-            cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$prompt" &> "$log_file"; then
-            return 1
-        fi
-    else
-        if ! STEER_SCENARIO_MODE="$SCENARIO_MODE_VALUE" \
-            STEER_NODE_CAPTURE=1 \
-            STEER_NODE_CAPTURE_ALL="$NODE_CAPTURE_ALL_VALUE" \
-            STEER_NODE_CAPTURE_DIR="$node_dir" \
-            STEER_LOCK_DISABLED="$LOCK_DISABLED_VALUE" \
-            cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$prompt" &> "$log_file"; then
-            return 1
-        fi
+    if ! run_surf_with_input_guard "$prompt" "$log_file" "$node_dir"; then
+        return 1
     fi
 
     if grep -Eq "$fatal_pattern" "$log_file"; then
@@ -555,10 +779,20 @@ capture_and_notify() {
                 mail_sent_ok=1
                 ;;
         esac
-        if [ "$mail_send_logged" -eq 1 ] && [ "$mail_sent_ok" -eq 1 ]; then
-            semantic_lines="${semantic_lines}- 메일 발송 검증 ✅ (send-action 로그 + sent mailbox 확인, outgoing=${outgoing_count})"$'\n'
+        local expected_recipient
+        expected_recipient="$(printf '%s' "${STEER_EXPECT_MAIL_RECIPIENT:-$MAIL_TO_TARGET}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+        local mail_recipient_location="RECIPIENT_UNSET"
+        local mail_recipient_ok=0
+        if printf '%s' "$expected_recipient" | grep -Eq '.+@.+\..+'; then
+            mail_recipient_location="$(mail_sent_recipient_location "$expected_recipient" "$CURRENT_SCENARIO_MARKER")"
+            if [ "$mail_recipient_location" = "MAIL_SENT_RECIPIENT" ]; then
+                mail_recipient_ok=1
+            fi
+        fi
+        if [ "$mail_send_logged" -eq 1 ] && [ "$mail_sent_ok" -eq 1 ] && [ "$mail_recipient_ok" -eq 1 ]; then
+            semantic_lines="${semantic_lines}- 메일 발송 검증 ✅ (send-action 로그 + sent mailbox 확인 + recipient=${expected_recipient}, outgoing=${outgoing_count})"$'\n'
         else
-            semantic_lines="${semantic_lines}- 메일 발송 검증 ❌ (send-action 로그=${mail_send_logged}, outgoing=${outgoing_count}, sent_location=${mail_sent_location}, token=${mail_verify_token:-none})"$'\n'
+            semantic_lines="${semantic_lines}- 메일 발송 검증 ❌ (send-action 로그=${mail_send_logged}, outgoing=${outgoing_count}, sent_location=${mail_sent_location}, recipient=${expected_recipient:-none}, recipient_location=${mail_recipient_location}, token=${mail_verify_token:-none})"$'\n'
             status="failed"
         fi
     fi

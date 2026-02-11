@@ -6,6 +6,13 @@ use std::process::Command;
 /// Global cache of installed applications (loaded once at startup)
 pub static mut INSTALLED_APPS: Option<HashSet<String>> = None;
 
+fn env_truthy(name: &str) -> bool {
+    matches!(
+        std::env::var(name).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
 /// 1. Environment Scanner: Scan installed apps via system_profiler
 pub fn scan_app_inventory() -> Result<()> {
     info!("🔍 [Reality] Scanning installed applications...");
@@ -57,6 +64,13 @@ pub fn scan_app_inventory() -> Result<()> {
 /// 2. Pre-Flight Check: App Existence
 pub fn verify_app_exists(app_name: &str) -> Result<String> {
     unsafe {
+        if INSTALLED_APPS.is_none() {
+            println!("⚠️ [Reality] Inventory is NONE. Attempting lazy app scan...");
+            if let Err(e) = scan_app_inventory() {
+                println!("⚠️ [Reality] Lazy app scan failed: {}", e);
+            }
+        }
+
         if let Some(ref apps) = INSTALLED_APPS {
             let target = app_name.to_lowercase();
             // 1. Exact match
@@ -85,8 +99,15 @@ pub fn verify_app_exists(app_name: &str) -> Result<String> {
                 app_name
             ));
         } else {
-            println!("⚠️ [Reality] Inventory is NONE. Failing Open (Danger).");
-            return Ok(app_name.to_string());
+            if env_truthy("STEER_REALITY_FAIL_OPEN") {
+                println!("⚠️ [Reality] Inventory is NONE. Failing Open due to STEER_REALITY_FAIL_OPEN=1.");
+                return Ok(app_name.to_string());
+            }
+            println!("❌ [Reality] Inventory unavailable. Failing closed by default.");
+            return Err(anyhow!(
+                "REALITY_CHECK_UNAVAILABLE: app inventory is unavailable; refusing to auto-open '{}'",
+                app_name
+            ));
         }
     }
 }

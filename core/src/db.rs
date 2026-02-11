@@ -62,6 +62,33 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) {
     }
 }
 
+fn ensure_approval_decisions_table(conn: &Connection) {
+    if let Err(e) = conn.execute(
+        "CREATE TABLE IF NOT EXISTS nl_approval_decisions (
+            decision_key TEXT PRIMARY KEY,
+            plan_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )",
+        [],
+    ) {
+        eprintln!("Failed to create nl_approval_decisions table: {}", e);
+        return;
+    }
+    if let Err(e) = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_nl_approval_decisions_expires_at
+         ON nl_approval_decisions(expires_at)",
+        [],
+    ) {
+        eprintln!(
+            "Failed to create idx_nl_approval_decisions_expires_at index: {}",
+            e
+        );
+    }
+}
+
 pub fn init() -> anyhow::Result<()> {
     // [Paranoid Audit] Fix Connection Leak & Idempotency
     {
@@ -182,6 +209,22 @@ pub fn init() -> anyhow::Result<()> {
             decision TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS nl_approval_decisions (
+            decision_key TEXT PRIMARY KEY,
+            plan_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_nl_approval_decisions_expires_at
+         ON nl_approval_decisions(expires_at)",
         [],
     )?;
 
@@ -628,6 +671,12 @@ pub struct ApprovalPolicy {
     pub policy_key: String,
     pub decision: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveApprovalDecision {
+    pub status: String,
+    pub expires_at: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1097,6 +1146,69 @@ pub fn list_approval_policies(limit: i64) -> Result<Vec<ApprovalPolicy>> {
         return Ok(policies);
     }
     Ok(Vec::new())
+}
+
+pub fn upsert_approval_decision(
+    decision_key: &str,
+    plan_id: &str,
+    action: &str,
+    status: &str,
+    ttl_seconds: i64,
+) -> Result<()> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        ensure_approval_decisions_table(conn);
+        let now = chrono::Utc::now();
+        let bounded_ttl = ttl_seconds.clamp(1, 86_400);
+        let created_at = now.to_rfc3339();
+        let expires_at = (now + chrono::Duration::seconds(bounded_ttl)).to_rfc3339();
+        conn.execute(
+            "INSERT INTO nl_approval_decisions (
+                decision_key, plan_id, action, status, created_at, expires_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(decision_key) DO UPDATE SET
+                status = excluded.status,
+                created_at = excluded.created_at,
+                expires_at = excluded.expires_at",
+            params![
+                decision_key,
+                plan_id,
+                action,
+                status,
+                created_at,
+                expires_at
+            ],
+        )?;
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        let _ = conn.execute(
+            "DELETE FROM nl_approval_decisions WHERE expires_at <= ?1",
+            params![now_iso],
+        );
+    }
+    Ok(())
+}
+
+pub fn get_active_approval_decision(decision_key: &str) -> Result<Option<ActiveApprovalDecision>> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        ensure_approval_decisions_table(conn);
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut stmt = conn.prepare(
+            "SELECT status, expires_at
+             FROM nl_approval_decisions
+             WHERE decision_key = ?1
+               AND expires_at > ?2
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![decision_key, now])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(ActiveApprovalDecision {
+                status: row.get(0)?,
+                expires_at: row.get(1)?,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 pub fn add_exec_allowlist(pattern: &str, cwd: Option<&str>) -> Result<i64> {

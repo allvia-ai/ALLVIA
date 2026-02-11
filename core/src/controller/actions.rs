@@ -181,6 +181,45 @@ impl ActionRunner {
         Self::default_mail_recipient()
     }
 
+    fn preferred_mail_subject(goal: Option<&str>) -> Option<String> {
+        let goal_text = goal?.trim();
+        if goal_text.is_empty() {
+            return None;
+        }
+
+        let quoted = Self::extract_quoted_fragments(goal_text);
+        if quoted.is_empty() {
+            return None;
+        }
+
+        let lower_goal = goal_text.to_lowercase();
+        for keyword in ["제목", "subject"] {
+            if let Some(idx) = lower_goal.find(keyword) {
+                let goal_tail = &goal_text[idx..];
+                for frag in quoted.iter().rev() {
+                    if goal_tail.contains(frag) {
+                        return Some(frag.clone());
+                    }
+                }
+            }
+        }
+
+        for frag in quoted.iter().rev() {
+            if frag.contains("S1_")
+                || frag.contains("S2_")
+                || frag.contains("S3_")
+                || frag.contains("S4_")
+                || frag.contains("S5_")
+                || frag.contains("DONE_")
+                || frag.contains("RUN_SCOPE_")
+            {
+                return Some(frag.clone());
+            }
+        }
+
+        quoted.first().cloned()
+    }
+
     fn default_mail_recipient() -> Option<String> {
         let candidates = [
             "STEER_DEFAULT_MAIL_TO",
@@ -268,40 +307,56 @@ impl ActionRunner {
 
     fn mail_send_latest_message(goal: Option<&str>) -> Result<String> {
         let fallback = Self::preferred_mail_recipient(goal).unwrap_or_default();
+        let subject_hint = Self::preferred_mail_subject(goal).unwrap_or_default();
         let lines = [
             "on run argv",
-            "set fallbackAddress to item 1 of argv",
+            "set fallbackAddress to \"\"",
+            "set subjectHint to \"\"",
+            "if (count of argv) >= 1 then set fallbackAddress to item 1 of argv",
+            "if (count of argv) >= 2 then set subjectHint to item 2 of argv",
             "tell application \"Mail\"",
             "activate",
-            "if (count of outgoing messages) = 0 then return \"no_draft|0|0\"",
             "set beforeOutgoing to (count of outgoing messages)",
-            "set _msg to last outgoing message",
+            "if beforeOutgoing = 0 then return \"no_draft|0|0\"",
+            "set _msg to missing value",
+            "if subjectHint is not \"\" then",
+            "repeat with idx from beforeOutgoing to 1 by -1",
+            "set candidate to item idx of outgoing messages",
+            "set candidateSubject to \"\"",
+            "try",
+            "set candidateSubject to (subject of candidate as text)",
+            "end try",
+            "if candidateSubject is subjectHint then",
+            "set _msg to candidate",
+            "exit repeat",
+            "end if",
+            "end repeat",
+            "end if",
+            "if _msg is missing value then set _msg to item beforeOutgoing of outgoing messages",
             "set visible of _msg to true",
             "set _subject to \"\"",
+            "set _recipient to \"\"",
             "try",
             "set _subject to (subject of _msg as text)",
             "end try",
-            "set sendTargets to {}",
-            "if _subject is not \"\" then",
-            "repeat with m in outgoing messages",
-            "set mSubject to \"\"",
+            "if (count of to recipients of _msg) = 0 then",
+            "if fallbackAddress is \"\" then",
             "try",
-            "set mSubject to (subject of m as text)",
+            "set fallbackAddress to sender of _msg as text",
             "end try",
-            "if mSubject is _subject then set end of sendTargets to m",
-            "end repeat",
             "end if",
-            "if (count of sendTargets) = 0 then set sendTargets to {_msg}",
-            "repeat with m in sendTargets",
-            "if (count of to recipients of m) = 0 then",
             "if fallbackAddress is not \"\" then",
-            "make new to recipient at end of to recipients of m with properties {address:fallbackAddress}",
+            "make new to recipient at end of to recipients of _msg with properties {address:fallbackAddress}",
+            "set _recipient to fallbackAddress",
             "else",
             "return \"missing_recipient|\" & beforeOutgoing & \"|\" & beforeOutgoing",
             "end if",
+            "else",
+            "try",
+            "set _recipient to (address of first to recipient of _msg as text)",
+            "end try",
             "end if",
-            "send m",
-            "end repeat",
+            "send _msg",
             "delay 0.8",
             "set afterOutgoing to (count of outgoing messages)",
             "if afterOutgoing = 0 then return \"sent_confirmed|\" & beforeOutgoing & \"|\" & afterOutgoing",
@@ -311,8 +366,27 @@ impl ActionRunner {
             "try",
             "set sentMbx to sent mailbox of ac",
             "if sentMbx is not missing value then",
-            "set sentHits to (count of (messages of sentMbx whose subject is _subject))",
-            "if sentHits > 0 then return \"sent_confirmed|\" & beforeOutgoing & \"|\" & afterOutgoing",
+            "set sentCount to count of messages of sentMbx",
+            "if sentCount > 0 then",
+            "set lowerBound to sentCount - 40",
+            "if lowerBound < 1 then set lowerBound to 1",
+            "repeat with idx from sentCount to lowerBound by -1",
+            "set sm to message idx of sentMbx",
+            "set ss to \"\"",
+            "set recipientText to \"\"",
+            "try",
+            "set ss to subject of sm as text",
+            "end try",
+            "if ss is _subject then",
+            "if _recipient is \"\" then return \"sent_confirmed|\" & beforeOutgoing & \"|\" & afterOutgoing",
+            "try",
+            "repeat with r in to recipients of sm",
+            "set recipientText to recipientText & \" \" & (address of r as text)",
+            "end repeat",
+            "end try",
+            "if recipientText contains _recipient then return \"sent_confirmed|\" & beforeOutgoing & \"|\" & afterOutgoing",
+            "end if",
+            "end repeat",
             "end if",
             "end if",
             "end try",
@@ -322,7 +396,7 @@ impl ActionRunner {
             "return \"sent_pending|\" & beforeOutgoing & \"|\" & afterOutgoing",
             "end run",
         ];
-        let out = crate::applescript::run_with_args(&lines, &[fallback])?;
+        let out = crate::applescript::run_with_args(&lines, &[fallback, subject_hint])?;
         Ok(out.trim().to_string())
     }
 
@@ -1638,6 +1712,25 @@ impl ActionRunner {
         }
 
         // Log to history and session
+        if action_status_override.is_none() {
+            let lower_desc = description.to_lowercase();
+            if lower_desc.contains(" failed")
+                || lower_desc.contains("blocked")
+                || lower_desc.contains("error")
+            {
+                action_status_override = Some("failed");
+            }
+        }
+        if action_status_override.is_none() {
+            if let Some(data) = action_data.as_ref() {
+                if let Some(send_status) = data.get("send_status").and_then(|v| v.as_str()) {
+                    if send_status != "sent_confirmed" {
+                        action_status_override = Some("failed");
+                    }
+                }
+            }
+        }
+
         let status = action_status_override.unwrap_or("success");
         history.push(description.clone());
         if action_data.is_none() {

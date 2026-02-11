@@ -21,8 +21,20 @@ impl Drop for LockGuard {
 }
 
 pub fn acquire_lock() -> Result<Option<LockGuard>, String> {
-    if env_flag("STEER_ALLOW_MULTI") || env_flag("STEER_LOCK_DISABLED") {
+    let allow_multi = env_flag("STEER_ALLOW_MULTI");
+    let lock_disabled = env_flag("STEER_LOCK_DISABLED");
+    let allow_lock_disable = env_flag("STEER_ALLOW_LOCK_DISABLE")
+        || env_flag("STEER_TEST_MODE")
+        || env_flag("STEER_SCENARIO_MODE");
+
+    if allow_multi || (lock_disabled && allow_lock_disable) {
         return Ok(None);
+    }
+    if lock_disabled && !allow_lock_disable {
+        return Err(
+            "STEER_LOCK_DISABLED requires STEER_ALLOW_LOCK_DISABLE=1 or STEER_TEST_MODE=1"
+                .to_string(),
+        );
     }
 
     let lock_path = resolve_lock_path();

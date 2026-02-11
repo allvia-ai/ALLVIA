@@ -1,7 +1,7 @@
 use local_os_agent::{
     analyzer, api_server, applescript, bash_executor, db, dependency_check, feedback_collector,
-    integrations, llm_gateway, mcp_client, monitor, n8n_api, orchestrator, pattern_detector,
-    policy, recommendation, recommendation_executor, scheduler, security, visual_driver,
+    integrations, llm_gateway, mcp_client, monitor, orchestrator, pattern_detector, policy,
+    recommendation, recommendation_executor, scheduler, security,
 };
 
 use local_os_agent::env_flag;
@@ -34,6 +34,45 @@ fn find_recommendation_id_by_fingerprint(target: &str) -> anyhow::Result<Option<
         }
     }
     Ok(None)
+}
+
+fn summarize_prompt(prompt: &str, max_chars: usize) -> String {
+    let trimmed = prompt.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let short = trimmed.chars().take(max_chars).collect::<String>();
+    format!("{}...", short)
+}
+
+fn queue_manual_workflow_recommendation(prompt: &str, source: &str) -> anyhow::Result<(i64, bool)> {
+    let prompt_trimmed = prompt.trim();
+    if prompt_trimmed.is_empty() {
+        return Err(anyhow::anyhow!("workflow prompt is empty"));
+    }
+    let short = summarize_prompt(prompt_trimmed, 48);
+    let proposal = recommendation::AutomationProposal {
+        title: format!("Manual Workflow: {}", short),
+        summary: format!(
+            "Manual workflow request captured from {} (approval required before creation).",
+            source
+        ),
+        trigger: "Manual workflow request".to_string(),
+        actions: vec!["n8n Workflow".to_string()],
+        confidence: 0.6,
+        n8n_prompt: prompt_trimmed.to_string(),
+        evidence: vec![
+            format!("source={}", source),
+            format!("prompt={}", summarize_prompt(prompt_trimmed, 160)),
+        ],
+        pattern_id: None,
+    };
+
+    let fp = proposal.fingerprint();
+    let inserted = db::insert_recommendation(&proposal)?;
+    let rec_id = find_recommendation_id_by_fingerprint(&fp)?
+        .ok_or_else(|| anyhow::anyhow!("failed to resolve recommendation id after insert"))?;
+    Ok((rec_id, inserted))
 }
 
 fn load_mock_workflow_proposal() -> anyhow::Result<recommendation::AutomationProposal> {
@@ -73,10 +112,11 @@ async fn ingest_mock_workflow_recommendation(
 
     if env_flag("STEER_TEST_ASSUME_APPROVED") {
         recommendation_executor::maybe_assume_approved_for_test(rec_id)?;
-        match recommendation_executor::execute_approved_recommendation(rec_id, llm_client).await {
-            Ok(workflow_id) => println!(
-                "✅ [TEST] approve-assumed pipeline completed. Workflow ID: {}",
-                workflow_id
+        match recommendation_executor::approve_and_execute_recommendation(rec_id, llm_client).await
+        {
+            Ok(outcome) => println!(
+                "✅ [TEST] approve-assumed pipeline completed. Workflow ID: {} (reused={})",
+                outcome.workflow_id, outcome.reused_existing
             ),
             Err(e) => println!("❌ [TEST] approve-assumed pipeline failed: {}", e),
         }
@@ -720,41 +760,27 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
                 };
-                let rec = match db::get_recommendation(id) {
-                    Ok(Some(r)) => r,
-                    Ok(None) => {
-                        println!("No recommendation found for id {}", id);
-                        continue;
-                    }
-                    Err(e) => {
-                        println!("❌ Failed to read recommendation: {}", e);
-                        continue;
-                    }
-                };
-
-                if rec.status.eq_ignore_ascii_case("rejected") {
-                    println!(
-                        "❌ Recommendation {} is rejected and cannot be approved.",
-                        id
-                    );
-                    continue;
-                }
-                if !rec.status.eq_ignore_ascii_case("approved") {
-                    if let Err(e) = db::update_recommendation_review_status(id, "approved") {
-                        println!("❌ Failed to update recommendation status: {}", e);
-                        continue;
-                    }
-                }
-
-                println!("🏗️  Building n8n workflow for '{}'...", rec.title);
-                match recommendation_executor::execute_approved_recommendation(
+                println!("🏗️  Running approval pipeline for recommendation {}...", id);
+                match recommendation_executor::approve_and_execute_recommendation(
                     id,
                     llm_client.clone(),
                 )
                 .await
                 {
-                    Ok(workflow_id) => {
-                        println!("✅ Workflow created! ID: {}", workflow_id);
+                    Ok(outcome) => {
+                        if outcome.reused_existing {
+                            println!(
+                                "♻️  Workflow reused (already provisioned). ID: {}",
+                                outcome.workflow_id
+                            );
+                        } else {
+                            println!("✅ Workflow created! ID: {}", outcome.workflow_id);
+                        }
+                        if outcome.approved_now {
+                            println!("📝 Recommendation {} marked as approved.", id);
+                        } else {
+                            println!("ℹ️ Recommendation {} was already approved.", id);
+                        }
                     }
                     Err(e) => {
                         println!("❌ Approval pipeline failed: {}", e);
@@ -778,14 +804,21 @@ async fn main() -> anyhow::Result<()> {
                     println!("❌ approve_test precheck failed: {}", e);
                     continue;
                 }
-                match recommendation_executor::execute_approved_recommendation(
+                match recommendation_executor::approve_and_execute_recommendation(
                     id,
                     llm_client.clone(),
                 )
                 .await
                 {
-                    Ok(workflow_id) => {
-                        println!("✅ [TEST] Workflow created! ID: {}", workflow_id);
+                    Ok(outcome) => {
+                        if outcome.reused_existing {
+                            println!(
+                                "♻️  [TEST] Workflow reused (already provisioned). ID: {}",
+                                outcome.workflow_id
+                            );
+                        } else {
+                            println!("✅ [TEST] Workflow created! ID: {}", outcome.workflow_id);
+                        }
                     }
                     Err(e) => {
                         println!("❌ [TEST] Approval pipeline failed: {}", e);
@@ -838,42 +871,23 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
                 let prompt = parts[1..].join(" ");
-
-                if let Some(brain) = &llm_client {
-                    println!("🏗️  Designing n8n workflow for: '{}'...", prompt);
-                    // 1. Generate JSON
-                    match brain.build_n8n_workflow(&prompt).await {
-                        Ok(json_str) => {
-                            println!("🤖 Blueprint generated. Importing to n8n...");
-                            // 2. Import to n8n
-                            let n8n_url = std::env::var("N8N_API_URL")
-                                .unwrap_or_else(|_| "http://localhost:5678".to_string());
-                            let n8n_key = std::env::var("N8N_API_KEY").unwrap_or_default();
-                            let n8n =
-                                n8n_api::N8nApi::new(&format!("{}/api/v1", n8n_url), &n8n_key);
-
-                            // Parse JSON string to Value
-                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                                match n8n.create_workflow("Agent Generated Workflow", &val, true).await {
-                                    Ok(id) => println!("✅ Workflow Created! ID: {}\n   (Check your n8n dashboard)", id),
-                                    Err(e) => {
-                                        println!("❌ API Import failed: {}", e);
-                                        println!("👻 Activating Visual Fallback (Phantom Hand)...");
-                                        // Trigger visual fallback
-                                        let fallback = visual_driver::n8n_fallback_create_workflow();
-                                        if let Err(ve) = fallback.execute(None).await {
-                                            println!("❌ Visual Fallback also failed: {}", ve);
-                                        }
-                                    },
-                                }
-                            } else {
-                                println!("❌ LLM produced invalid JSON.");
-                            }
+                match queue_manual_workflow_recommendation(&prompt, "cli.build_workflow") {
+                    Ok((rec_id, inserted)) => {
+                        if inserted {
+                            println!("📝 Recommendation queued [{}] as pending approval.", rec_id);
+                        } else {
+                            println!(
+                                "📝 Existing recommendation reused [{}] as pending/approved history.",
+                                rec_id
+                            );
                         }
-                        Err(e) => println!("❌ Generation failed: {}", e),
+                        println!(
+                            "   Approval gate enforced: run `approve {}` to create in n8n.",
+                            rec_id
+                        );
+                        println!("   Rejection path: run `reject {}`.", rec_id);
                     }
-                } else {
-                    println!("⚠️  LLM Client not available.");
+                    Err(e) => println!("❌ Failed to queue workflow recommendation: {}", e),
                 }
             }
             "telegram" => {

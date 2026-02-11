@@ -107,25 +107,26 @@ impl TelegramBot {
                                             bot_clone.llm.clone(),
                                             bot_clone.tx_analyzer.clone(),
                                         );
+                                        let session_key = format!("telegram_chat_{}", chat_id);
 
-                                        // TODO: Pass Telegram context to Surf so it knows where to reply?
-                                        // For now, we just run the task.
-                                        // But Agent needs to REPLY.
-                                        // We can inject "GOAL: <text> (Reply to Telegram Chat ID: <id>)"
-                                        // or better, adding a "telegram_reply" action that uses this ID.
-                                        // For MVP, if surf succeeds, we send "Done".
-
-                                        match planner.run_goal_tracked(&text_clone, None).await {
+                                        match planner
+                                            .run_goal_tracked(&text_clone, Some(&session_key))
+                                            .await
+                                        {
                                             Ok(outcome) => {
-                                                let _ = bot_clone
-                                                    .send_message(
-                                                        chat_id,
-                                                        &format!(
-                                                            "✅ Task Completed. (run_id={})",
-                                                            outcome.run_id
-                                                        ),
+                                                let reply = if outcome.business_complete {
+                                                    format!(
+                                                        "✅ Task Completed. (run_id={})",
+                                                        outcome.run_id
                                                     )
-                                                    .await;
+                                                } else {
+                                                    format!(
+                                                        "⚠️ 실행은 완료됐지만 최종 완료 조건이 충족되지 않았습니다 (run_id={}, status={}). 로그/증거를 확인하세요.",
+                                                        outcome.run_id, outcome.status
+                                                    )
+                                                };
+                                                let _ =
+                                                    bot_clone.send_message(chat_id, &reply).await;
                                             }
                                             Err(e) => {
                                                 let _ = bot_clone

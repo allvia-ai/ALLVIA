@@ -6,7 +6,7 @@ use crate::controller::supervisor::Supervisor;
 use crate::db;
 use crate::llm_gateway::LLMClient;
 use crate::schema::EventEnvelope;
-use crate::session_store::Session;
+use crate::session_store::{Session, SessionStatus};
 use crate::visual_driver::{SmartStep, VisualDriver};
 use anyhow::Result;
 use chrono::Utc;
@@ -30,6 +30,18 @@ pub struct RunGoalOutcome {
     pub business_complete: bool,
     pub status: String,
     pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RunGoalExecutionSummary {
+    planner_complete: bool,
+    execution_complete: bool,
+    business_complete: bool,
+    business_note: String,
+    step_count: usize,
+    failed_steps: usize,
+    mail_send_required: bool,
+    mail_send_confirmed: bool,
 }
 
 impl Planner {
@@ -61,6 +73,80 @@ impl Planner {
 
     fn goal_contains_any(goal_lower: &str, needles: &[&str]) -> bool {
         needles.iter().any(|needle| goal_lower.contains(needle))
+    }
+
+    fn goal_requires_mail_send(goal: &str) -> bool {
+        let lower = goal.to_lowercase();
+        let mentions_mail =
+            lower.contains("mail") || lower.contains("메일") || lower.contains("이메일");
+        let mentions_send =
+            lower.contains("send") || lower.contains("보내") || lower.contains("발송");
+        mentions_mail && mentions_send
+    }
+
+    fn step_has_mail_send_confirmed(step: &crate::session_store::SessionStep) -> bool {
+        if let Some(data) = &step.data {
+            if data
+                .get("send_status")
+                .and_then(|v| v.as_str())
+                .map(|v| v == "sent_confirmed")
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+        let desc = step.description.to_lowercase();
+        desc.contains("mail send completed") || desc.contains("(mail sent)")
+    }
+
+    fn summarize_execution(
+        goal: &str,
+        session: &Session,
+        history: &[String],
+        planner_complete: bool,
+    ) -> RunGoalExecutionSummary {
+        let step_count = session.steps.len();
+        let failed_steps = session
+            .steps
+            .iter()
+            .filter(|s| s.status != "success")
+            .count();
+        let execution_complete = planner_complete && failed_steps == 0;
+        let mail_send_required = Self::goal_requires_mail_send(goal);
+        let mail_send_confirmed = session.steps.iter().any(Self::step_has_mail_send_confirmed)
+            || Self::history_contains_case_insensitive(history, "mail send completed")
+            || Self::history_contains_case_insensitive(history, "(mail sent)");
+
+        let (business_complete, business_note) = if !execution_complete {
+            (
+                false,
+                format!(
+                    "action execution had failures (failed_steps={} / total_steps={})",
+                    failed_steps, step_count
+                ),
+            )
+        } else if mail_send_required && !mail_send_confirmed {
+            (
+                false,
+                "mail send required by goal but sent confirmation was not detected".to_string(),
+            )
+        } else {
+            (
+                true,
+                "planner/execution/business checks passed from run evidence".to_string(),
+            )
+        };
+
+        RunGoalExecutionSummary {
+            planner_complete,
+            execution_complete,
+            business_complete,
+            business_note,
+            step_count,
+            failed_steps,
+            mail_send_required,
+            mail_send_confirmed,
+        }
     }
 
     fn is_textual_app(app: &str) -> bool {
@@ -768,20 +854,34 @@ impl Planner {
             Some("planner.run_goal started"),
         );
 
-        match self.run_goal(goal, session_key).await {
-            Ok(_) => {
-                let planner_complete = true;
-                let execution_complete = true;
-                let business_complete = false;
-                let summary = Some(
-                    "surf goal execution completed (business verification pending)".to_string(),
-                );
+        match self.run_goal_with_summary(goal, session_key).await {
+            Ok(exec_summary) => {
+                let planner_complete = exec_summary.planner_complete;
+                let execution_complete = exec_summary.execution_complete;
+                let business_complete = exec_summary.business_complete;
+                let status = if business_complete {
+                    "business_completed"
+                } else {
+                    "business_failed"
+                };
+                let summary = if business_complete {
+                    Some("surf goal execution and business checks completed".to_string())
+                } else {
+                    Some(format!(
+                        "surf goal completed planner/execution but business check failed: {}",
+                        exec_summary.business_note
+                    ))
+                };
                 let details = serde_json::json!({
                     "source": "planner.run_goal_tracked",
                     "goal": normalized_goal,
-                    "status": "execution_completed",
-                    "business_complete": false,
-                    "business_note": "Requires semantic verification from app output evidence"
+                    "status": status,
+                    "business_complete": business_complete,
+                    "business_note": exec_summary.business_note,
+                    "step_count": exec_summary.step_count,
+                    "failed_steps": exec_summary.failed_steps,
+                    "mail_send_required": exec_summary.mail_send_required,
+                    "mail_send_confirmed": exec_summary.mail_send_confirmed
                 })
                 .to_string();
 
@@ -805,40 +905,54 @@ impl Planner {
                     &run_id,
                     "execution",
                     2,
-                    "completed",
-                    Some("action execution completed"),
+                    if execution_complete {
+                        "completed"
+                    } else {
+                        "failed"
+                    },
+                    Some(&format!(
+                        "step_count={} failed_steps={}",
+                        exec_summary.step_count, exec_summary.failed_steps
+                    )),
                 );
                 let _ = db::record_task_stage_assertion(
                     &run_id,
                     "execution",
                     "execution_complete",
                     "true",
-                    "true",
-                    true,
-                    Some("No execution error returned"),
+                    if execution_complete { "true" } else { "false" },
+                    execution_complete,
+                    Some("All recorded action steps must be successful"),
                 );
                 let _ = db::record_task_stage_run(
                     &run_id,
                     "business",
                     3,
-                    "pending_verification",
-                    Some("business verification pending semantic evidence"),
+                    if business_complete {
+                        "completed"
+                    } else {
+                        "failed"
+                    },
+                    Some(&exec_summary.business_note),
                 );
                 let _ = db::record_task_stage_assertion(
                     &run_id,
                     "business",
                     "business_complete",
                     "true",
-                    "unknown",
-                    false,
-                    Some("run_goal returned Ok, but business evidence was not asserted here"),
+                    if business_complete { "true" } else { "false" },
+                    business_complete,
+                    Some(&format!(
+                        "mail_send_required={} mail_send_confirmed={}",
+                        exec_summary.mail_send_required, exec_summary.mail_send_confirmed
+                    )),
                 );
                 let _ = db::update_task_run_outcome(
                     &run_id,
                     planner_complete,
                     execution_complete,
                     business_complete,
-                    "execution_completed",
+                    status,
                     summary.as_deref(),
                     Some(&details),
                 );
@@ -848,7 +962,7 @@ impl Planner {
                     planner_complete,
                     execution_complete,
                     business_complete,
-                    status: "execution_completed".to_string(),
+                    status: status.to_string(),
                     summary,
                 })
             }
@@ -921,9 +1035,19 @@ impl Planner {
     }
 
     pub async fn run_goal(&self, goal: &str, session_key: Option<&str>) -> Result<()> {
+        let _ = self.run_goal_with_summary(goal, session_key).await?;
+        Ok(())
+    }
+
+    async fn run_goal_with_summary(
+        &self,
+        goal: &str,
+        session_key: Option<&str>,
+    ) -> Result<RunGoalExecutionSummary> {
         println!("🌊 Starting Planned Surf: '{}'", goal);
         let scenario_mode = Self::scenario_mode_enabled();
         let allow_deterministic_fallback = Self::env_truthy("STEER_ALLOW_DETERMINISTIC_FALLBACK");
+        let allow_review_loop_override = Self::env_truthy("STEER_ALLOW_REVIEW_LOOP_OVERRIDE");
         let require_primary_planner =
             Self::env_truthy_default("STEER_REQUIRE_PRIMARY_PLANNER", true);
         let allow_scenario_mode = Self::env_truthy("STEER_ALLOW_SCENARIO_MODE");
@@ -1162,37 +1286,47 @@ impl Planner {
 
                         if !has_hard_blocker && !has_notes_content_issue {
                             if allow_deterministic_fallback {
-                                if let Some(loop_break_plan) =
-                                    Self::fallback_plan_from_goal(goal, &history)
-                                {
-                                    Self::record_fallback_action(
-                                        &mut history,
-                                        &format!("review_loop_{}rejections", recent_rejections),
-                                        &loop_break_plan,
-                                    );
-                                    plan = loop_break_plan;
-                                    supervisor_action = "accept".to_string();
-                                } else {
-                                    let action_name = plan["action"].as_str().unwrap_or("unknown");
-                                    if matches!(
-                                        action_name,
-                                        "open_app"
-                                            | "open_url"
-                                            | "shortcut"
-                                            | "type"
-                                            | "paste"
-                                            | "copy"
-                                            | "select_all"
-                                            | "read"
-                                            | "read_clipboard"
-                                            | "click_visual"
-                                    ) {
-                                        println!(
-                                            "   🔁 Review-loop override: forcing '{}' after {} rejections.",
-                                            action_name, recent_rejections
+                                if allow_review_loop_override {
+                                    if let Some(loop_break_plan) =
+                                        Self::fallback_plan_from_goal(goal, &history)
+                                    {
+                                        Self::record_fallback_action(
+                                            &mut history,
+                                            &format!("review_loop_{}rejections", recent_rejections),
+                                            &loop_break_plan,
                                         );
+                                        plan = loop_break_plan;
                                         supervisor_action = "accept".to_string();
+                                    } else {
+                                        let action_name =
+                                            plan["action"].as_str().unwrap_or("unknown");
+                                        if matches!(
+                                            action_name,
+                                            "open_app"
+                                                | "open_url"
+                                                | "shortcut"
+                                                | "type"
+                                                | "paste"
+                                                | "copy"
+                                                | "select_all"
+                                                | "read"
+                                                | "read_clipboard"
+                                                | "click_visual"
+                                        ) {
+                                            println!(
+                                                "   🔁 Review-loop override: forcing '{}' after {} rejections.",
+                                                action_name, recent_rejections
+                                            );
+                                            supervisor_action = "accept".to_string();
+                                        }
                                     }
+                                } else {
+                                    history.push(
+                                        "FALLBACK_BLOCKED: review-loop override requires STEER_ALLOW_REVIEW_LOOP_OVERRIDE=1"
+                                            .to_string(),
+                                    );
+                                    let msg = "Supervisor review loop: deterministic override disabled by policy";
+                                    return Err(anyhow::anyhow!(msg));
                                 }
                             } else {
                                 history.push(
@@ -1371,9 +1505,18 @@ impl Planner {
             }
         }
         if goal_completed {
-            return Ok(());
+            let summary = Self::summarize_execution(goal, &session, &history, true);
+            session.status = if summary.business_complete {
+                SessionStatus::Completed
+            } else {
+                SessionStatus::Failed
+            };
+            let _ = crate::session_store::save_session(&session);
+            return Ok(summary);
         }
 
+        session.status = SessionStatus::Failed;
+        let _ = crate::session_store::save_session(&session);
         Err(anyhow::anyhow!(
             "Planner stopped without completion (max steps reached or unresolved review loop)."
         ))

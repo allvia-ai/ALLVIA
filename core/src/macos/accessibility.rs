@@ -1,6 +1,6 @@
 use accessibility_sys::{
-    AXUIElementCopyAttributeValue, AXUIElementCopyElementAtPosition, AXUIElementCreateSystemWide,
-    AXUIElementRef,
+    AXUIElementCopyAttributeValue, AXUIElementCopyElementAtPosition, AXUIElementCreateApplication,
+    AXUIElementCreateSystemWide, AXUIElementRef,
 };
 use core_foundation::array::CFArray;
 use core_foundation::base::{CFTypeRef, TCFType};
@@ -67,11 +67,38 @@ pub fn snapshot(_scope: Option<String>) -> Value {
             match out {
                 Some(v) => v,
                 None => {
-                    let front_name = frontmost_app_name_via_osascript().unwrap_or_default();
-                    return json!({
-                        "error": "No focused application",
-                        "frontmost_app_hint": front_name
-                    });
+                    let (front_name, front_pid) =
+                        frontmost_app_info_via_osascript().unwrap_or_default();
+                    if let Some(pid) = front_pid {
+                        let fallback_app = AXUIElementCreateApplication(pid);
+                        if !fallback_app.is_null() {
+                            fallback_app
+                        } else {
+                            return json!({
+                                "role": "AXApplication",
+                                "title": front_name,
+                                "focused_window": {
+                                    "role": "AXWindow",
+                                    "title": "",
+                                    "children": []
+                                },
+                                "warning": "No focused application",
+                                "frontmost_app_hint": front_name
+                            });
+                        }
+                    } else {
+                        return json!({
+                            "role": "AXApplication",
+                            "title": front_name,
+                            "focused_window": {
+                                "role": "AXWindow",
+                                "title": "",
+                                "children": []
+                            },
+                            "warning": "No focused application",
+                            "frontmost_app_hint": front_name
+                        });
+                    }
                 }
             }
         };
@@ -79,13 +106,30 @@ pub fn snapshot(_scope: Option<String>) -> Value {
         let _focused_app = AxElement(focused_app_ref);
 
         // Get App Title
-        let app_title = get_string_attribute(focused_app_ref, "AXTitle").unwrap_or_default();
+        let fallback_front_name = frontmost_app_name_via_osascript().unwrap_or_default();
+        let app_title = {
+            let via_ax = get_string_attribute(focused_app_ref, "AXTitle").unwrap_or_default();
+            if via_ax.is_empty() {
+                fallback_front_name
+            } else {
+                via_ax
+            }
+        };
 
         // 3. Focused Window
         let focused_window_ref = match get_attribute(focused_app_ref, "AXFocusedWindow") {
             Some(r) => r as AXUIElementRef,
             None => {
-                return json!({ "role": "AXApplication", "title": app_title, "error": "No focused window" })
+                return json!({
+                    "role": "AXApplication",
+                    "title": app_title,
+                    "focused_window": {
+                        "role": "AXWindow",
+                        "title": "",
+                        "children": []
+                    },
+                    "warning": "No focused window"
+                })
             }
         };
         let _focused_window = AxElement(focused_window_ref);
@@ -109,20 +153,34 @@ pub fn snapshot(_scope: Option<String>) -> Value {
 }
 
 fn frontmost_app_name_via_osascript() -> Option<String> {
+    frontmost_app_info_via_osascript().and_then(|(name, _)| {
+        if name.trim().is_empty() {
+            None
+        } else {
+            Some(name)
+        }
+    })
+}
+
+fn frontmost_app_info_via_osascript() -> Option<(String, Option<i32>)> {
     let output = Command::new("osascript")
         .arg("-e")
-        .arg("tell application \"System Events\" to return name of first application process whose frontmost is true")
+        .arg("tell application \"System Events\" to set p to first application process whose frontmost is true")
+        .arg("-e")
+        .arg("tell application \"System Events\" to return (name of p as text) & tab & (unix id of p as text)")
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
+        return None;
     }
+    let mut parts = raw.split('\t');
+    let name = parts.next().unwrap_or_default().trim().to_string();
+    let pid = parts.next().and_then(|v| v.trim().parse::<i32>().ok());
+    Some((name, pid))
 }
 
 unsafe fn traverse_children(element: AXUIElementRef, depth: usize, max_depth: usize) -> Vec<Value> {
@@ -369,11 +427,17 @@ pub fn find_text_on_screen(query: &str) -> Option<String> {
         let _system = AxElement(system_wide);
 
         // Get focused application
-        let focused_app_ref = get_attribute(system_wide, "AXFocusedApplication");
-        if focused_app_ref.is_none() {
+        let focused_app = if let Some(r) = get_attribute(system_wide, "AXFocusedApplication") {
+            r as AXUIElementRef
+        } else if let Some((_name, Some(pid))) = frontmost_app_info_via_osascript() {
+            let app = AXUIElementCreateApplication(pid);
+            if app.is_null() {
+                return None;
+            }
+            app
+        } else {
             return None;
-        }
-        let focused_app = focused_app_ref.unwrap() as AXUIElementRef;
+        };
         let _focused_app_guard = AxElement(focused_app);
 
         // Search through UI hierarchy

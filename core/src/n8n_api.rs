@@ -3,6 +3,7 @@ use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,20 +270,21 @@ impl N8nApi {
         }
 
         // 5. Run CLI Import
+        let ids_before_cli = self.list_workflow_ids_by_name(name).unwrap_or_default();
         if let Err(e) = self.create_workflow_cli(name, &normalized, active).await {
             return Err(anyhow::anyhow!("❌ CLI Fallback Failed: {}", e));
         }
 
-        // 6. Retrieve ID from DB (Crucial Step for Management)
-        // Since CLI doesn't return ID, we query the DB by name
-        self.retrieve_workflow_id_by_name(name)
+        // 6. Retrieve ID from DB:
+        // Since CLI doesn't return workflow ID, diff IDs before/after import to avoid name collisions.
+        self.retrieve_workflow_id_by_name(name, &ids_before_cli)
     }
 
     async fn create_workflow_api(
         &self,
         name: &str,
         workflow_json: &Value,
-        _active: bool,
+        active: bool,
     ) -> Result<String> {
         let url = format!("{}/workflows", self.base_url);
 
@@ -310,7 +312,36 @@ impl N8nApi {
 
         let resp_json: Value = resp.json().await?;
         let id = resp_json["id"].as_str().unwrap_or("unknown").to_string();
+        if active {
+            if let Err(activate_err) = self.activate_workflow(&id).await {
+                // Some n8n versions expose activation differently; attempt generic update fallback.
+                self.update_workflow_active(&id, true).await.map_err(|patch_err| {
+                    anyhow::anyhow!(
+                        "workflow created (id={}) but activation failed: {} | fallback update failed: {}",
+                        id,
+                        activate_err,
+                        patch_err
+                    )
+                })?;
+            }
+        }
         Ok(id)
+    }
+
+    async fn update_workflow_active(&self, id: &str, active: bool) -> Result<()> {
+        let url = format!("{}/workflows/{}", self.base_url, id);
+        let resp = self
+            .client
+            .patch(&url)
+            .header("X-N8N-API-KEY", &self.api_key)
+            .json(&json!({ "active": active }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let error_text = resp.text().await?;
+            return Err(anyhow::anyhow!("n8n workflow update error: {}", error_text));
+        }
+        Ok(())
     }
 
     async fn create_workflow_cli(
@@ -360,31 +391,45 @@ impl N8nApi {
             ));
         }
 
-        println!("✅ CLI Import successful! Now fixing ownership...");
-
-        if let Err(e) = self.fix_workflow_ownership() {
-            println!("⚠️ Ownership fix failed: {}", e);
-        }
+        println!("✅ CLI Import successful!");
 
         Ok("cli-imported".to_string())
     }
 
-    // Helper to find ID after CLI import
-    fn retrieve_workflow_id_by_name(&self, name: &str) -> Result<String> {
+    fn list_workflow_ids_by_name(&self, name: &str) -> Result<Vec<String>> {
         use rusqlite::Connection;
         let home = std::env::var("HOME").unwrap_or("/".to_string());
         let db_path = format!("{}/.n8n/database.sqlite", home);
 
         let conn = Connection::open(db_path)?;
-        let id: String = conn
-            .query_row(
-                "SELECT id FROM workflow_entity WHERE name = ?1 ORDER BY updatedAt DESC LIMIT 1",
-                [name],
-                |row| row.get(0),
-            )
-            .map_err(|_| anyhow::anyhow!("Could not find imported workflow ID in DB"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM workflow_entity WHERE name = ?1 ORDER BY updatedAt DESC LIMIT 20",
+        )?;
+        let mut rows = stmt.query([name])?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next()? {
+            ids.push(row.get::<usize, String>(0)?);
+        }
+        Ok(ids)
+    }
 
-        Ok(id)
+    // Helper to find ID after CLI import
+    fn retrieve_workflow_id_by_name(&self, name: &str, before_ids: &[String]) -> Result<String> {
+        let ids = self.list_workflow_ids_by_name(name)?;
+        if ids.is_empty() {
+            return Err(anyhow::anyhow!("Could not find imported workflow ID in DB"));
+        }
+
+        let before_set: HashSet<&str> = before_ids.iter().map(|s| s.as_str()).collect();
+        for id in &ids {
+            if !before_set.contains(id.as_str()) {
+                return Ok(id.clone());
+            }
+        }
+
+        ids.into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Could not find imported workflow ID in DB"))
     }
 
     fn build_minimal_workflow(name: &str) -> Value {
@@ -422,79 +467,6 @@ impl N8nApi {
             "settings": { "saveManualExecutions": true },
             "active": false
         })
-    }
-
-    /// HACK: Directly modify n8n SQLite DB to assign project ownership to imported workflows (n8n v1+)
-    /// SECURITY: Requires N8N_ALLOW_DB_MODIFY=true to execute
-    fn fix_workflow_ownership(&self) -> Result<()> {
-        use rusqlite::Connection;
-
-        // Security: Require explicit opt-in for direct DB modifications
-        let allow_db_modify = std::env::var("N8N_ALLOW_DB_MODIFY")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
-
-        if !allow_db_modify {
-            println!(
-                "⚠️ [n8n] Direct DB modification skipped. Set N8N_ALLOW_DB_MODIFY=true to enable."
-            );
-            return Ok(());
-        }
-
-        let home = std::env::var("HOME").unwrap_or("/".to_string());
-        let db_path = format!("{}/.n8n/database.sqlite", home);
-
-        if !std::path::Path::new(&db_path).exists() {
-            return Ok(());
-        }
-
-        let conn = Connection::open(db_path)?;
-
-        // 1. Get the user's personal Project ID
-        // n8n v1: User -> ProjectRelation -> Project
-        let project_id: String = conn
-            .query_row(
-                "SELECT projectId FROM project_relation 
-             WHERE userId = (SELECT id FROM user ORDER BY createdAt ASC LIMIT 1) 
-             LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|_| anyhow::anyhow!("No project found for user"))?;
-
-        if !project_id.is_empty() {
-            println!("🔧 Linking workflows to Project ID: {}", project_id);
-
-            // 2. Find workflows that have NO entry in shared_workflow
-            let mut stmt = conn.prepare(
-                "SELECT id FROM workflow_entity 
-                 WHERE id NOT IN (SELECT workflowId FROM shared_workflow)",
-            )?;
-
-            let orphan_ids: Vec<String> = stmt
-                .query_map([], |row| row.get(0))?
-                .filter_map(Result::ok)
-                .collect();
-
-            let mut count = 0;
-            for wid in orphan_ids {
-                // 3. Insert into shared_workflow
-                let res = conn.execute(
-                    "INSERT INTO shared_workflow (workflowId, projectId, role, createdAt, updatedAt) 
-                     VALUES (?1, ?2, 'workflow:owner', datetime('now'), datetime('now'))",
-                    [&wid, &project_id],
-                );
-                if res.is_ok() {
-                    count += 1;
-                }
-            }
-
-            if count > 0 {
-                println!("✨ Fixed visibility for {} workflows.", count);
-            }
-        }
-
-        Ok(())
     }
 
     /// Activate a workflow
