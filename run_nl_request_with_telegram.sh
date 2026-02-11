@@ -12,6 +12,9 @@ set -e
 
 REQUEST_TEXT="$1"
 TASK_NAME="${2:-자연어 요청 실행}"
+REQUEST_TEXT_EXEC="$REQUEST_TEXT"
+REQUEST_TEXT_FOR_VERIFY="$REQUEST_TEXT"
+RUN_SCOPE_MARKER=""
 
 if [ -z "$REQUEST_TEXT" ]; then
     echo "Usage: $0 \"자연어 요청\" [\"작업 이름\"]"
@@ -196,8 +199,9 @@ send_telegram_with_timeout() {
 }
 
 extract_expected_tokens_from_request() {
+    local source_text="${REQUEST_TEXT_FOR_VERIFY:-$REQUEST_TEXT}"
     {
-        printf '%s\n' "$REQUEST_TEXT" | perl -ne '
+        printf '%s\n' "$source_text" | perl -ne '
             while (/"([^"]+)"|'\''([^'\'']+)'\''/g) {
                 my $s = defined($1) && $1 ne "" ? $1 : $2;
                 $s =~ s/^\s+|\s+$//g;
@@ -206,7 +210,7 @@ extract_expected_tokens_from_request() {
             }
         '
         # Also capture non-quoted status/value style requirements.
-        printf '%s\n' "$REQUEST_TEXT" | perl -ne '
+        printf '%s\n' "$source_text" | perl -ne '
             while (/(?:status|상태)\s*:\s*([A-Za-z0-9 _-]{3,80})/ig) {
                 my $s = $1;
                 $s =~ s/^\s+|\s+$//g;
@@ -230,6 +234,7 @@ is_noise_token() {
 
 token_presence_location() {
     local token="$1"
+    local marker="${2:-}"
     local result=""
     local timeout_sec="${STEER_OSASCRIPT_TIMEOUT_SEC:-8}"
     local tmp_out=""
@@ -239,9 +244,11 @@ token_presence_location() {
     tmp_err="$(mktemp -t steer_osa_err.XXXXXX)"
 
     (
-        osascript - "$token" <<'APPLESCRIPT'
+        osascript - "$token" "$marker" <<'APPLESCRIPT'
 on run argv
     set tokenText to item 1 of argv
+    set markerText to ""
+    if (count of argv) > 1 then set markerText to item 2 of argv
 
     try
         tell application "Notes"
@@ -270,14 +277,15 @@ on run argv
                     on error
                         set nName to ""
                     end try
-                    if nName contains tokenText then return "NOTE_TITLE"
 
                     try
                         set nBody to body of latestNote as text
                     on error
                         set nBody to ""
                     end try
-                    if nBody contains tokenText then return "NOTE_BODY"
+                    set scopeOk to (markerText is "" or nBody contains markerText or nName contains markerText)
+                    if scopeOk and nName contains tokenText then return "NOTE_TITLE"
+                    if scopeOk and nBody contains tokenText then return "NOTE_BODY"
                 end if
             end if
         end tell
@@ -295,15 +303,43 @@ on run argv
                 on error
                     set s to ""
                 end try
-                if s contains tokenText then return "MAIL_SUBJECT"
 
                 try
                     set c to content of m as text
                 on error
                     set c to ""
                 end try
-                if c contains tokenText then return "MAIL_BODY"
+                set scopeOk to (markerText is "" or c contains markerText or s contains markerText)
+                if scopeOk and s contains tokenText then return "MAIL_SUBJECT"
+                if scopeOk and c contains tokenText then return "MAIL_BODY"
             end if
+
+            repeat with ac in accounts
+                try
+                    set sentMbx to sent mailbox of ac
+                    if sentMbx is not missing value then
+                        set sentCount to count of messages of sentMbx
+                        if sentCount > 0 then
+                            set lowerBound to sentCount - 40
+                            if lowerBound < 1 then set lowerBound to 1
+                            repeat with idx from sentCount to lowerBound by -1
+                                set sm to message idx of sentMbx
+                                set ss to ""
+                                set sc to ""
+                                try
+                                    set ss to subject of sm as text
+                                end try
+                                try
+                                    set sc to content of sm as text
+                                end try
+                                set sentScopeOk to (markerText is "" or sc contains markerText or ss contains markerText)
+                                if sentScopeOk and ss contains tokenText then return "MAIL_SENT_SUBJECT"
+                                if sentScopeOk and sc contains tokenText then return "MAIL_SENT_BODY"
+                            end repeat
+                        end if
+                    end if
+                end try
+            end repeat
         end tell
     on error
         return "CHECK_ERROR"
@@ -318,7 +354,8 @@ on run argv
                 on error
                     set t to ""
                 end try
-                if t contains tokenText then return "TEXTEDIT_BODY"
+                set scopeOk to (markerText is "" or t contains markerText)
+                if scopeOk and t contains tokenText then return "TEXTEDIT_BODY"
             end if
         end tell
     on error
@@ -375,6 +412,13 @@ FAIL_ON_FALLBACK_VALUE="${STEER_FAIL_ON_FALLBACK:-1}"
 NOTIFIER_TIMEOUT_SEC="${STEER_NOTIFIER_TIMEOUT_SEC:-25}"
 REQUIRE_PRIMARY_PLANNER_VALUE="${STEER_REQUIRE_PRIMARY_PLANNER:-1}"
 LOCK_DISABLED_VALUE="${STEER_LOCK_DISABLED:-0}"
+RUN_SCOPE_ENABLED="${STEER_SEMANTIC_RUN_SCOPE:-1}"
+
+if [ "$RUN_SCOPE_ENABLED" = "1" ]; then
+    RUN_SCOPE_MARKER="RUN_SCOPE_${TS}"
+    REQUEST_TEXT_EXEC="${REQUEST_TEXT} 마지막 줄에 \"${RUN_SCOPE_MARKER}\"를 정확히 입력하세요."
+    REQUEST_TEXT_FOR_VERIFY="$REQUEST_TEXT_EXEC"
+fi
 
 if [ "$REQUIRE_PRIMARY_PLANNER_VALUE" = "1" ] && [ "$SCENARIO_MODE_VALUE" = "1" ] && [ "${STEER_ALLOW_SCENARIO_MODE:-0}" != "1" ]; then
     echo "❌ 정책 위반: STEER_SCENARIO_MODE=1 이지만 STEER_ALLOW_SCENARIO_MODE=1 승인 없이 fallback 모드 실행은 금지됩니다."
@@ -389,6 +433,9 @@ echo "Task: ${TASK_NAME}"
 echo "Mode: STEER_SCENARIO_MODE=${SCENARIO_MODE_VALUE}"
 echo "Node Capture: STEER_NODE_CAPTURE=1, STEER_NODE_CAPTURE_ALL=${NODE_CAPTURE_ALL_VALUE}"
 echo "Fallback Policy: STEER_FAIL_ON_FALLBACK=${FAIL_ON_FALLBACK_VALUE}"
+if [ -n "$RUN_SCOPE_MARKER" ]; then
+    echo "Semantic Scope Marker: ${RUN_SCOPE_MARKER}"
+fi
 if [ -n "$CLI_LLM_VALUE" ]; then
     echo "CLI LLM: STEER_CLI_LLM=${CLI_LLM_VALUE}"
 else
@@ -449,14 +496,14 @@ run_surf_with_input_guard() {
                 STEER_NODE_CAPTURE_ALL="$NODE_CAPTURE_ALL_VALUE" \
                 STEER_NODE_CAPTURE_DIR="$NODE_DIR" \
                 STEER_LOCK_DISABLED="$LOCK_DISABLED_VALUE" \
-                cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$REQUEST_TEXT" &> "$LOG_FILE"
+                cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$REQUEST_TEXT_EXEC" &> "$LOG_FILE"
         else
             STEER_SCENARIO_MODE="$SCENARIO_MODE_VALUE" \
                 STEER_NODE_CAPTURE=1 \
                 STEER_NODE_CAPTURE_ALL="$NODE_CAPTURE_ALL_VALUE" \
                 STEER_NODE_CAPTURE_DIR="$NODE_DIR" \
                 STEER_LOCK_DISABLED="$LOCK_DISABLED_VALUE" \
-                cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$REQUEST_TEXT" &> "$LOG_FILE"
+                cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$REQUEST_TEXT_EXEC" &> "$LOG_FILE"
         fi
         return $?
     fi
@@ -477,14 +524,14 @@ run_surf_with_input_guard() {
             STEER_NODE_CAPTURE_ALL="$NODE_CAPTURE_ALL_VALUE" \
             STEER_NODE_CAPTURE_DIR="$NODE_DIR" \
             STEER_LOCK_DISABLED="$LOCK_DISABLED_VALUE" \
-            cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$REQUEST_TEXT" &> "$LOG_FILE" &
+            cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$REQUEST_TEXT_EXEC" &> "$LOG_FILE" &
     else
         STEER_SCENARIO_MODE="$SCENARIO_MODE_VALUE" \
             STEER_NODE_CAPTURE=1 \
             STEER_NODE_CAPTURE_ALL="$NODE_CAPTURE_ALL_VALUE" \
             STEER_NODE_CAPTURE_DIR="$NODE_DIR" \
             STEER_LOCK_DISABLED="$LOCK_DISABLED_VALUE" \
-            cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$REQUEST_TEXT" &> "$LOG_FILE" &
+            cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$REQUEST_TEXT_EXEC" &> "$LOG_FILE" &
     fi
     run_pid=$!
 
@@ -538,6 +585,7 @@ if grep -Eiq "fallback action|FALLBACK_ACTION:" "$LOG_FILE"; then
 fi
 
 SEMANTIC_LINES=""
+FILTERED_TOKENS=()
 if [ "${STEER_SEMANTIC_VERIFY:-1}" = "1" ]; then
     RAW_TOKENS=()
     while IFS= read -r token; do
@@ -563,9 +611,9 @@ if [ "${STEER_SEMANTIC_VERIFY:-1}" = "1" ]; then
         for token in "${FILTERED_TOKENS[@]}"; do
             checked_count=$((checked_count + 1))
             normalized_token="$(normalize_semantic_token "$token")"
-            location="$(token_presence_location "$token")"
+            location="$(token_presence_location "$token" "$RUN_SCOPE_MARKER")"
             if semantic_location_missing "$location" && [ -n "$normalized_token" ] && [ "$normalized_token" != "$token" ]; then
-                location="$(token_presence_location "$normalized_token")"
+                location="$(token_presence_location "$normalized_token" "$RUN_SCOPE_MARKER")"
             fi
             if semantic_location_missing "$location"; then
                 missing_count=$((missing_count + 1))
@@ -575,6 +623,9 @@ if [ "${STEER_SEMANTIC_VERIFY:-1}" = "1" ]; then
             fi
         done
         SEMANTIC_LINES="${SEMANTIC_LINES}- 의미검증 토큰 수: ${checked_count}"$'\n'
+        if [ -n "$RUN_SCOPE_MARKER" ]; then
+            SEMANTIC_LINES="${SEMANTIC_LINES}- 의미검증 run-scope marker: ${RUN_SCOPE_MARKER}"$'\n'
+        fi
     fi
 
     if [ "$missing_count" -gt 0 ]; then
@@ -585,16 +636,35 @@ else
     SEMANTIC_LINES="${SEMANTIC_LINES}- 의미검증 비활성(STEER_SEMANTIC_VERIFY=0)"$'\n'
 fi
 
-if printf '%s' "$REQUEST_TEXT" | grep -Eiq '보내|발송|send'; then
+if printf '%s' "$REQUEST_TEXT_FOR_VERIFY" | grep -Eiq '보내|발송|send'; then
     mail_send_logged=0
-    if grep -Eiq "Shortcut 'd'.*shift|send.*mail|mail sent" "$LOG_FILE"; then
+    if grep -Eiq "Shortcut 'd'.*shift.*Mail sent|Mail send completed|\"send_status\"[[:space:]]*:[[:space:]]*\"sent_confirmed\"|mail sent" "$LOG_FILE"; then
         mail_send_logged=1
     fi
     outgoing_count="$(mail_outgoing_count || echo -1)"
-    if [ "$mail_send_logged" -eq 1 ] && [ "$outgoing_count" = "0" ]; then
-        SEMANTIC_LINES="${SEMANTIC_LINES}- 메일 발송 검증 ✅ (send-action 로그 + outgoing=0)"$'\n'
+
+    mail_verify_token=""
+    if [ -n "$RUN_SCOPE_MARKER" ]; then
+        mail_verify_token="$RUN_SCOPE_MARKER"
+    elif [ "${#FILTERED_TOKENS[@]}" -gt 0 ]; then
+        mail_verify_token="${FILTERED_TOKENS[0]}"
+    fi
+
+    mail_sent_location="NOT_CHECKED"
+    if [ -n "$mail_verify_token" ]; then
+        mail_sent_location="$(token_presence_location "$mail_verify_token" "$RUN_SCOPE_MARKER")"
+    fi
+    mail_sent_ok=0
+    case "$mail_sent_location" in
+        MAIL_SENT_SUBJECT|MAIL_SENT_BODY)
+            mail_sent_ok=1
+            ;;
+    esac
+
+    if [ "$mail_send_logged" -eq 1 ] && [ "$mail_sent_ok" -eq 1 ]; then
+        SEMANTIC_LINES="${SEMANTIC_LINES}- 메일 발송 검증 ✅ (send-action 로그 + sent mailbox 확인, outgoing=${outgoing_count})"$'\n'
     else
-        SEMANTIC_LINES="${SEMANTIC_LINES}- 메일 발송 검증 ❌ (send-action 로그=${mail_send_logged}, outgoing=${outgoing_count})"$'\n'
+        SEMANTIC_LINES="${SEMANTIC_LINES}- 메일 발송 검증 ❌ (send-action 로그=${mail_send_logged}, outgoing=${outgoing_count}, sent_location=${mail_sent_location}, token=${mail_verify_token:-none})"$'\n'
         STATUS="failed"
     fi
 fi

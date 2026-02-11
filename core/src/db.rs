@@ -299,6 +299,59 @@ pub fn init() -> anyhow::Result<()> {
         )",
         [],
     )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS task_runs (
+            run_id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            finished_at TEXT,
+            intent TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            planner_complete INTEGER NOT NULL DEFAULT 0,
+            execution_complete INTEGER NOT NULL DEFAULT 0,
+            business_complete INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            summary TEXT,
+            details TEXT
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS task_stage_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            stage_name TEXT NOT NULL,
+            stage_order INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT NOT NULL,
+            details TEXT
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS task_stage_assertions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            stage_name TEXT NOT NULL,
+            assertion_key TEXT NOT NULL,
+            expected TEXT NOT NULL,
+            actual TEXT NOT NULL,
+            passed INTEGER NOT NULL,
+            evidence TEXT,
+            created_at TEXT NOT NULL
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_task_stage_runs_run_id
+         ON task_stage_runs(run_id, stage_order)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_task_stage_assertions_run_id
+         ON task_stage_assertions(run_id, stage_name)",
+        [],
+    )?;
 
     // Store connection
     {
@@ -642,6 +695,46 @@ pub struct NLRun {
     pub status: String,
     pub summary: Option<String>,
     pub details: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskRunRecord {
+    pub run_id: String,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+    pub intent: String,
+    pub prompt: String,
+    pub planner_complete: bool,
+    pub execution_complete: bool,
+    pub business_complete: bool,
+    pub status: String,
+    pub summary: Option<String>,
+    pub details: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskStageRunRecord {
+    pub id: i64,
+    pub run_id: String,
+    pub stage_name: String,
+    pub stage_order: i64,
+    pub status: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub details: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskStageAssertionRecord {
+    pub id: i64,
+    pub run_id: String,
+    pub stage_name: String,
+    pub assertion_key: String,
+    pub expected: String,
+    pub actual: String,
+    pub passed: bool,
+    pub evidence: Option<String>,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1380,6 +1473,280 @@ pub fn insert_nl_run(
     Ok(())
 }
 
+pub fn create_task_run(run_id: &str, intent: &str, prompt: &str, status: &str) -> Result<()> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        let created_at = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR REPLACE INTO task_runs (
+                run_id, created_at, finished_at, intent, prompt,
+                planner_complete, execution_complete, business_complete,
+                status, summary, details
+             ) VALUES (?1, ?2, NULL, ?3, ?4, 0, 0, 0, ?5, NULL, NULL)",
+            params![run_id, created_at, intent, prompt, status],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn record_task_stage_run(
+    run_id: &str,
+    stage_name: &str,
+    stage_order: i64,
+    status: &str,
+    details: Option<&str>,
+) -> Result<()> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO task_stage_runs (
+                run_id, stage_name, stage_order, status, started_at, finished_at, details
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![run_id, stage_name, stage_order, status, now, now, details],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn record_task_stage_assertion(
+    run_id: &str,
+    stage_name: &str,
+    assertion_key: &str,
+    expected: &str,
+    actual: &str,
+    passed: bool,
+    evidence: Option<&str>,
+) -> Result<()> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        let created_at = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO task_stage_assertions (
+                run_id, stage_name, assertion_key, expected, actual, passed, evidence, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                run_id,
+                stage_name,
+                assertion_key,
+                expected,
+                actual,
+                passed as i64,
+                evidence,
+                created_at
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn update_task_run_outcome(
+    run_id: &str,
+    planner_complete: bool,
+    execution_complete: bool,
+    business_complete: bool,
+    status: &str,
+    summary: Option<&str>,
+    details: Option<&str>,
+) -> Result<()> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        let finished_at = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE task_runs
+             SET finished_at = ?1,
+                 planner_complete = ?2,
+                 execution_complete = ?3,
+                 business_complete = ?4,
+                 status = ?5,
+                 summary = ?6,
+                 details = ?7
+             WHERE run_id = ?8",
+            params![
+                finished_at,
+                planner_complete as i64,
+                execution_complete as i64,
+                business_complete as i64,
+                status,
+                summary,
+                details,
+                run_id
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn get_task_run(run_id: &str) -> Result<Option<TaskRunRecord>> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        let mut stmt = conn.prepare(
+            "SELECT run_id, created_at, finished_at, intent, prompt,
+                    planner_complete, execution_complete, business_complete,
+                    status, summary, details
+             FROM task_runs
+             WHERE run_id = ?1
+             LIMIT 1",
+        )?;
+
+        let mut rows = stmt.query(params![run_id])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(TaskRunRecord {
+                run_id: row.get(0)?,
+                created_at: row.get(1)?,
+                finished_at: row.get(2).ok(),
+                intent: row.get(3)?,
+                prompt: row.get(4)?,
+                planner_complete: row.get::<_, i64>(5)? != 0,
+                execution_complete: row.get::<_, i64>(6)? != 0,
+                business_complete: row.get::<_, i64>(7)? != 0,
+                status: row.get(8)?,
+                summary: row.get(9).ok(),
+                details: row.get(10).ok(),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+pub fn list_task_runs(limit: i64, status: Option<&str>) -> Result<Vec<TaskRunRecord>> {
+    let bounded_limit = limit.clamp(1, 500);
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        let normalized_status = status.map(|s| s.trim()).filter(|s| !s.is_empty());
+        let mut out = Vec::new();
+
+        if let Some(status_filter) = normalized_status {
+            let mut stmt = conn.prepare(
+                "SELECT run_id, created_at, finished_at, intent, prompt,
+                        planner_complete, execution_complete, business_complete,
+                        status, summary, details
+                 FROM task_runs
+                 WHERE status = ?1
+                 ORDER BY created_at DESC
+                 LIMIT ?2",
+            )?;
+
+            let rows = stmt.query_map(params![status_filter, bounded_limit], |row| {
+                Ok(TaskRunRecord {
+                    run_id: row.get(0)?,
+                    created_at: row.get(1)?,
+                    finished_at: row.get(2).ok(),
+                    intent: row.get(3)?,
+                    prompt: row.get(4)?,
+                    planner_complete: row.get::<_, i64>(5)? != 0,
+                    execution_complete: row.get::<_, i64>(6)? != 0,
+                    business_complete: row.get::<_, i64>(7)? != 0,
+                    status: row.get(8)?,
+                    summary: row.get(9).ok(),
+                    details: row.get(10).ok(),
+                })
+            })?;
+
+            for row in rows {
+                out.push(row?);
+            }
+            return Ok(out);
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT run_id, created_at, finished_at, intent, prompt,
+                    planner_complete, execution_complete, business_complete,
+                    status, summary, details
+             FROM task_runs
+             ORDER BY created_at DESC
+             LIMIT ?1",
+        )?;
+
+        let rows = stmt.query_map(params![bounded_limit], |row| {
+            Ok(TaskRunRecord {
+                run_id: row.get(0)?,
+                created_at: row.get(1)?,
+                finished_at: row.get(2).ok(),
+                intent: row.get(3)?,
+                prompt: row.get(4)?,
+                planner_complete: row.get::<_, i64>(5)? != 0,
+                execution_complete: row.get::<_, i64>(6)? != 0,
+                business_complete: row.get::<_, i64>(7)? != 0,
+                status: row.get(8)?,
+                summary: row.get(9).ok(),
+                details: row.get(10).ok(),
+            })
+        })?;
+
+        for row in rows {
+            out.push(row?);
+        }
+        return Ok(out);
+    }
+    Ok(Vec::new())
+}
+
+pub fn list_task_stage_runs(run_id: &str) -> Result<Vec<TaskStageRunRecord>> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        let mut stmt = conn.prepare(
+            "SELECT id, run_id, stage_name, stage_order, status, started_at, finished_at, details
+             FROM task_stage_runs
+             WHERE run_id = ?1
+             ORDER BY stage_order ASC, id ASC",
+        )?;
+
+        let rows = stmt.query_map(params![run_id], |row| {
+            Ok(TaskStageRunRecord {
+                id: row.get(0)?,
+                run_id: row.get(1)?,
+                stage_name: row.get(2)?,
+                stage_order: row.get(3)?,
+                status: row.get(4)?,
+                started_at: row.get(5)?,
+                finished_at: row.get(6)?,
+                details: row.get(7).ok(),
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        return Ok(out);
+    }
+    Ok(Vec::new())
+}
+
+pub fn list_task_stage_assertions(run_id: &str) -> Result<Vec<TaskStageAssertionRecord>> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        let mut stmt = conn.prepare(
+            "SELECT id, run_id, stage_name, assertion_key, expected, actual, passed, evidence, created_at
+             FROM task_stage_assertions
+             WHERE run_id = ?1
+             ORDER BY id ASC",
+        )?;
+
+        let rows = stmt.query_map(params![run_id], |row| {
+            Ok(TaskStageAssertionRecord {
+                id: row.get(0)?,
+                run_id: row.get(1)?,
+                stage_name: row.get(2)?,
+                assertion_key: row.get(3)?,
+                expected: row.get(4)?,
+                actual: row.get(5)?,
+                passed: row.get::<_, i64>(6)? != 0,
+                evidence: row.get(7).ok(),
+                created_at: row.get(8)?,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        return Ok(out);
+    }
+    Ok(Vec::new())
+}
+
 pub fn list_nl_runs(limit: i64) -> Result<Vec<NLRun>> {
     let mut lock = get_db_lock();
     if let Some(conn) = lock.as_mut() {
@@ -1856,8 +2223,7 @@ pub fn update_recommendation_review_status(id: i64, status: &str) -> Result<()> 
     if !allowed {
         return Err(rusqlite::Error::InvalidParameterName(format!(
             "invalid recommendation transition: {} -> {}",
-            current,
-            normalized
+            current, normalized
         )));
     }
 
@@ -1877,6 +2243,72 @@ pub fn mark_recommendation_failed(id: i64, error: &str) -> Result<()> {
              last_error = ?1
              WHERE id = ?2",
             params![error, id],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn claim_recommendation_provisioning(id: i64, claim_token: &str) -> Result<Option<String>> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        let mut stmt = conn.prepare(
+            "SELECT workflow_id
+             FROM recommendations
+             WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        let Some(row) = rows.next()? else {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "recommendation {} not found",
+                id
+            )));
+        };
+
+        let existing_workflow_id: Option<String> = row.get(0)?;
+        if let Some(existing) = existing_workflow_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(Some(existing.to_string()));
+        }
+
+        let changed = conn.execute(
+            "UPDATE recommendations
+             SET workflow_id = ?1
+             WHERE id = ?2
+               AND (workflow_id IS NULL OR TRIM(workflow_id) = '')",
+            params![claim_token, id],
+        )?;
+
+        if changed > 0 {
+            return Ok(None);
+        }
+
+        let mut reload_stmt = conn.prepare(
+            "SELECT workflow_id
+             FROM recommendations
+             WHERE id = ?1",
+        )?;
+        let mut reload_rows = reload_stmt.query(params![id])?;
+        if let Some(reload_row) = reload_rows.next()? {
+            let current: Option<String> = reload_row.get(0)?;
+            if let Some(current) = current.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                return Ok(Some(current.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+pub fn release_recommendation_provisioning_claim(id: i64, claim_token: &str) -> Result<()> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        conn.execute(
+            "UPDATE recommendations
+             SET workflow_id = NULL
+             WHERE id = ?1 AND workflow_id = ?2",
+            params![id, claim_token],
         )?;
     }
     Ok(())

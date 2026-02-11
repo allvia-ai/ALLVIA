@@ -32,6 +32,12 @@ SUBJECT_S2="Downloads Triage S2_${TIMESTAMP}"
 SUBJECT_S3="Calc Result S3_${TIMESTAMP}"
 SUBJECT_S4="Productivity Research S4_${TIMESTAMP}"
 SUBJECT_S5="Budget Check S5_${TIMESTAMP}"
+MARKER_S1="RUN_SCOPE_S1_${TIMESTAMP}"
+MARKER_S2="RUN_SCOPE_S2_${TIMESTAMP}"
+MARKER_S3="RUN_SCOPE_S3_${TIMESTAMP}"
+MARKER_S4="RUN_SCOPE_S4_${TIMESTAMP}"
+MARKER_S5="RUN_SCOPE_S5_${TIMESTAMP}"
+CURRENT_SCENARIO_MARKER=""
 
 if [ "$REQUIRE_PRIMARY_PLANNER_VALUE" = "1" ] && [ "$SCENARIO_MODE_VALUE" = "1" ] && [ "${STEER_ALLOW_SCENARIO_MODE:-0}" != "1" ]; then
     echo "❌ 정책 위반: STEER_SCENARIO_MODE=1 이지만 STEER_ALLOW_SCENARIO_MODE=1 승인 없이 fallback 모드 실행은 금지됩니다."
@@ -262,6 +268,7 @@ mail_outgoing_count() {
 
 token_presence_location() {
     local token="$1"
+    local marker="${2:-}"
     local result=""
     local timeout_sec="${STEER_OSASCRIPT_TIMEOUT_SEC:-8}"
     local tmp_out=""
@@ -271,9 +278,11 @@ token_presence_location() {
     tmp_err="$(mktemp -t steer_osa_err.XXXXXX)"
 
     (
-        osascript - "$token" <<'APPLESCRIPT'
+        osascript - "$token" "$marker" <<'APPLESCRIPT'
 on run argv
     set tokenText to item 1 of argv
+    set markerText to ""
+    if (count of argv) > 1 then set markerText to item 2 of argv
 
     try
         tell application "Notes"
@@ -302,14 +311,15 @@ on run argv
                     on error
                         set nName to ""
                     end try
-                    if nName contains tokenText then return "NOTE_TITLE"
 
                     try
                         set nBody to body of latestNote as text
                     on error
                         set nBody to ""
                     end try
-                    if nBody contains tokenText then return "NOTE_BODY"
+                    set scopeOk to (markerText is "" or nBody contains markerText or nName contains markerText)
+                    if scopeOk and nName contains tokenText then return "NOTE_TITLE"
+                    if scopeOk and nBody contains tokenText then return "NOTE_BODY"
                 end if
             end if
         end tell
@@ -327,15 +337,43 @@ on run argv
                 on error
                     set s to ""
                 end try
-                if s contains tokenText then return "MAIL_SUBJECT"
 
                 try
                     set c to content of m as text
                 on error
                     set c to ""
                 end try
-                if c contains tokenText then return "MAIL_BODY"
+                set scopeOk to (markerText is "" or c contains markerText or s contains markerText)
+                if scopeOk and s contains tokenText then return "MAIL_SUBJECT"
+                if scopeOk and c contains tokenText then return "MAIL_BODY"
             end if
+
+            repeat with ac in accounts
+                try
+                    set sentMbx to sent mailbox of ac
+                    if sentMbx is not missing value then
+                        set sentCount to count of messages of sentMbx
+                        if sentCount > 0 then
+                            set lowerBound to sentCount - 40
+                            if lowerBound < 1 then set lowerBound to 1
+                            repeat with idx from sentCount to lowerBound by -1
+                                set sm to message idx of sentMbx
+                                set ss to ""
+                                set sc to ""
+                                try
+                                    set ss to subject of sm as text
+                                end try
+                                try
+                                    set sc to content of sm as text
+                                end try
+                                set sentScopeOk to (markerText is "" or sc contains markerText or ss contains markerText)
+                                if sentScopeOk and ss contains tokenText then return "MAIL_SENT_SUBJECT"
+                                if sentScopeOk and sc contains tokenText then return "MAIL_SENT_BODY"
+                            end repeat
+                        end if
+                    end if
+                end try
+            end repeat
         end tell
     on error
         return "CHECK_ERROR"
@@ -350,7 +388,8 @@ on run argv
                 on error
                     set t to ""
                 end try
-                if t contains tokenText then return "TEXTEDIT_BODY"
+                set scopeOk to (markerText is "" or t contains markerText)
+                if scopeOk and t contains tokenText then return "TEXTEDIT_BODY"
             end if
         end tell
     on error
@@ -440,23 +479,29 @@ capture_and_notify() {
 
     local semantic_lines=""
     local semantic_missing=0
+    local mail_subject_for_verify=""
     if [ "${STEER_SEMANTIC_VERIFY:-1}" = "1" ]; then
         local expected_tokens=()
         case "$scenario_num" in
             1)
-                expected_tokens=("$SUBJECT_S1" "Calendar opened" "Notes draft ready" "Mail prep pending" "Shared via TextEdit")
+                expected_tokens=("$SUBJECT_S1" "Calendar opened" "Notes draft ready" "Mail prep pending" "Shared via TextEdit" "$MARKER_S1")
+                mail_subject_for_verify="$SUBJECT_S1"
                 ;;
             2)
-                expected_tokens=("$SUBJECT_S2" "1. invoice.pdf" "2. screenshot.png" "3. notes.txt")
+                expected_tokens=("$SUBJECT_S2" "1. invoice.pdf" "2. screenshot.png" "3. notes.txt" "$MARKER_S2")
+                mail_subject_for_verify="$SUBJECT_S2"
                 ;;
             3)
-                expected_tokens=("$SUBJECT_S3" "120*1300=" "Done")
+                expected_tokens=("$SUBJECT_S3" "120*1300=" "Done" "$MARKER_S3")
+                mail_subject_for_verify="$SUBJECT_S3"
                 ;;
             4)
-                expected_tokens=("$SUBJECT_S4" "focus music" "pomodoro timer" "daily review template")
+                expected_tokens=("$SUBJECT_S4" "focus music" "pomodoro timer" "daily review template" "$MARKER_S4")
+                mail_subject_for_verify="$SUBJECT_S4"
                 ;;
             5)
-                expected_tokens=("$SUBJECT_S5" "Base: 120 USD")
+                expected_tokens=("$SUBJECT_S5" "Base: 120 USD" "$MARKER_S5")
+                mail_subject_for_verify="$SUBJECT_S5"
                 ;;
         esac
 
@@ -465,9 +510,9 @@ capture_and_notify() {
             [ -z "$token" ] && continue
             semantic_checked=$((semantic_checked + 1))
             normalized_token="$(normalize_semantic_token "$token")"
-            location="$(token_presence_location "$token")"
+            location="$(token_presence_location "$token" "$CURRENT_SCENARIO_MARKER")"
             if semantic_location_missing "$location" && [ -n "$normalized_token" ] && [ "$normalized_token" != "$token" ]; then
-                location="$(token_presence_location "$normalized_token")"
+                location="$(token_presence_location "$normalized_token" "$CURRENT_SCENARIO_MARKER")"
             fi
             if semantic_location_missing "$location"; then
                 semantic_missing=$((semantic_missing + 1))
@@ -477,6 +522,9 @@ capture_and_notify() {
             fi
         done
         semantic_lines="${semantic_lines}- 의미검증 토큰 수: ${semantic_checked}"$'\n'
+        if [ -n "$CURRENT_SCENARIO_MARKER" ]; then
+            semantic_lines="${semantic_lines}- 의미검증 run-scope marker: ${CURRENT_SCENARIO_MARKER}"$'\n'
+        fi
 
         if [ "$semantic_missing" -gt 0 ]; then
             status="failed"
@@ -488,15 +536,29 @@ capture_and_notify() {
 
     if [ "${STEER_REQUIRE_MAIL_SEND:-1}" = "1" ]; then
         local mail_send_logged=0
-        if grep -Eiq "Shortcut 'd'.*shift|send.*mail|mail sent" "$log_file"; then
+        if grep -Eiq "Shortcut 'd'.*shift.*Mail sent|Mail send completed|\"send_status\"[[:space:]]*:[[:space:]]*\"sent_confirmed\"|mail sent" "$log_file"; then
             mail_send_logged=1
         fi
         local outgoing_count
         outgoing_count="$(mail_outgoing_count || echo -1)"
-        if [ "$mail_send_logged" -eq 1 ] && [ "$outgoing_count" = "0" ]; then
-            semantic_lines="${semantic_lines}- 메일 발송 검증 ✅ (send-action 로그 + outgoing=0)"$'\n'
+        local mail_verify_token="${CURRENT_SCENARIO_MARKER:-}"
+        if [ -z "$mail_verify_token" ] && [ -n "$mail_subject_for_verify" ]; then
+            mail_verify_token="$mail_subject_for_verify"
+        fi
+        local mail_sent_location="NOT_CHECKED"
+        if [ -n "$mail_verify_token" ]; then
+            mail_sent_location="$(token_presence_location "$mail_verify_token" "$CURRENT_SCENARIO_MARKER")"
+        fi
+        local mail_sent_ok=0
+        case "$mail_sent_location" in
+            MAIL_SENT_SUBJECT|MAIL_SENT_BODY)
+                mail_sent_ok=1
+                ;;
+        esac
+        if [ "$mail_send_logged" -eq 1 ] && [ "$mail_sent_ok" -eq 1 ]; then
+            semantic_lines="${semantic_lines}- 메일 발송 검증 ✅ (send-action 로그 + sent mailbox 확인, outgoing=${outgoing_count})"$'\n'
         else
-            semantic_lines="${semantic_lines}- 메일 발송 검증 ❌ (send-action 로그=${mail_send_logged}, outgoing=${outgoing_count})"$'\n'
+            semantic_lines="${semantic_lines}- 메일 발송 검증 ❌ (send-action 로그=${mail_send_logged}, outgoing=${outgoing_count}, sent_location=${mail_sent_location}, token=${mail_verify_token:-none})"$'\n'
             status="failed"
         fi
     fi
@@ -699,8 +761,9 @@ echo "---------------------------------------------------"
 echo "📅 Scenario 1: Calendar → Safari → Notes → Mail"
 LOG_FILE="scenario_results/complex_scenario_1_${TIMESTAMP}.log"
 SCENARIO_GOAL="Multi-app draft chain without screen-reading dependency."
+CURRENT_SCENARIO_MARKER="$MARKER_S1"
 echo "Goal: ${SCENARIO_GOAL}"
-CMD="Calendar를 열고 전면으로 가져오세요. Notes를 열어 새 메모(Cmd+N)를 만들고 제목을 \"${SUBJECT_S1}\"로 입력한 뒤 아래 3줄을 그대로 입력하세요: \"Calendar opened\", \"Notes draft ready\", \"Mail prep pending\". 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. TextEdit를 열어 새 문서(Cmd+N)에 붙여넣기(Cmd+V)하고 다음 줄에 \"Shared via TextEdit\"를 입력하세요. 다시 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S1}\"를 입력한 뒤 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
+CMD="Calendar를 열고 전면으로 가져오세요. Notes를 열어 새 메모(Cmd+N)를 만들고 제목을 \"${SUBJECT_S1}\"로 입력한 뒤 아래 3줄을 그대로 입력하세요: \"Calendar opened\", \"Notes draft ready\", \"Mail prep pending\". 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. TextEdit를 열어 새 문서(Cmd+N)에 붙여넣기(Cmd+V)하고 다음 줄에 \"Shared via TextEdit\"를 입력하세요. 다음 줄에 \"${MARKER_S1}\"를 정확히 입력하세요. 다시 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S1}\"를 입력한 뒤 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
 
 if run_agent_scenario "$CMD" "$LOG_FILE" 1; then
     echo "✅ Scenario 1 Complete."
@@ -718,8 +781,9 @@ echo "---------------------------------------------------"
 echo "📂 Scenario 2: Finder → TextEdit → Notes"
 LOG_FILE="scenario_results/complex_scenario_2_${TIMESTAMP}.log"
 SCENARIO_GOAL="Finder/TextEdit/Notes/Mail transfer chain."
+CURRENT_SCENARIO_MARKER="$MARKER_S2"
 echo "Goal: ${SCENARIO_GOAL}"
-CMD="Finder를 열어 Downloads 폴더로 이동하세요. TextEdit를 열어 새 문서(Cmd+N)를 만들고 제목 \"${SUBJECT_S2}\"를 입력한 뒤 아래 3줄을 그대로 입력하세요: \"1. invoice.pdf\", \"2. screenshot.png\", \"3. notes.txt\". 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Notes를 열어 새 메모(Cmd+N)를 만들고 붙여넣기(Cmd+V)하세요. 다시 전체 선택(Cmd+A) 후 복사(Cmd+C)하고 Mail을 열어 새 이메일(Cmd+N) 초안을 만든 뒤 제목 \"${SUBJECT_S2}\"를 입력하고 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
+CMD="Finder를 열어 Downloads 폴더로 이동하세요. TextEdit를 열어 새 문서(Cmd+N)를 만들고 제목 \"${SUBJECT_S2}\"를 입력한 뒤 아래 3줄을 그대로 입력하세요: \"1. invoice.pdf\", \"2. screenshot.png\", \"3. notes.txt\". 다음 줄에 \"${MARKER_S2}\"를 정확히 입력하세요. 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Notes를 열어 새 메모(Cmd+N)를 만들고 붙여넣기(Cmd+V)하세요. 다시 전체 선택(Cmd+A) 후 복사(Cmd+C)하고 Mail을 열어 새 이메일(Cmd+N) 초안을 만든 뒤 제목 \"${SUBJECT_S2}\"를 입력하고 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
 
 if run_agent_scenario "$CMD" "$LOG_FILE" 2; then
     echo "✅ Scenario 2 Complete."
@@ -737,8 +801,9 @@ echo "---------------------------------------------------"
 echo "📈 Scenario 3: Safari → Calculator → Notes"
 LOG_FILE="scenario_results/complex_scenario_3_${TIMESTAMP}.log"
 SCENARIO_GOAL="Browser + calculation + document handoff chain."
+CURRENT_SCENARIO_MARKER="$MARKER_S3"
 echo "Goal: ${SCENARIO_GOAL}"
-CMD="Safari를 열고 https://www.google.com 으로 이동하세요. 새 탭(Cmd+T)을 열고 https://www.wikipedia.org 로 이동하세요. Calculator를 열어 \"120*1300=\" 을 입력해 계산한 뒤 복사(Cmd+C)하세요. Notes를 열어 새 메모(Cmd+N)를 만들고 제목 \"${SUBJECT_S3}\"를 입력한 뒤 다음 줄에 \"120*1300=\"를 입력하고 다음 줄에 붙여넣기(Cmd+V)하세요. TextEdit를 열어 새 문서(Cmd+N)에 방금 메모 내용을 붙여넣기(Cmd+V)하고 마지막 줄에 \"Done\"을 입력하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S3}\"를 입력한 뒤 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
+CMD="Safari를 열고 https://www.google.com 으로 이동하세요. 새 탭(Cmd+T)을 열고 https://www.wikipedia.org 로 이동하세요. Calculator를 열어 \"120*1300=\" 을 입력해 계산한 뒤 복사(Cmd+C)하세요. Notes를 열어 새 메모(Cmd+N)를 만들고 제목 \"${SUBJECT_S3}\"를 입력한 뒤 다음 줄에 \"120*1300=\"를 입력하고 다음 줄에 붙여넣기(Cmd+V)하세요. TextEdit를 열어 새 문서(Cmd+N)에 방금 메모 내용을 붙여넣기(Cmd+V)하고 마지막 줄에 \"Done\"을 입력하세요. 다음 줄에 \"${MARKER_S3}\"를 정확히 입력하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S3}\"를 입력한 뒤 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
 
 if run_agent_scenario "$CMD" "$LOG_FILE" 3; then
     echo "✅ Scenario 3 Complete."
@@ -756,8 +821,9 @@ echo "---------------------------------------------------"
 echo "🧠 Scenario 4: Notes → Safari → TextEdit"
 LOG_FILE="scenario_results/complex_scenario_4_${TIMESTAMP}.log"
 SCENARIO_GOAL="Idea note -> web query -> report -> mail draft chain."
+CURRENT_SCENARIO_MARKER="$MARKER_S4"
 echo "Goal: ${SCENARIO_GOAL}"
-CMD="Notes를 열어 새 메모(Cmd+N)를 만들고 아래 3줄을 그대로 입력하세요: \"focus music\", \"pomodoro timer\", \"daily review template\". 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Safari를 열고 https://www.google.com 으로 이동한 뒤 붙여넣기(Cmd+V)하고 Enter를 누르세요. 주소창에 포커스(Cmd+L) 후 복사(Cmd+C)하세요. TextEdit를 열어 새 문서(Cmd+N)에 \"${SUBJECT_S4}\" 제목을 입력하고 다음 줄에 붙여넣기(Cmd+V)하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S4}\"를 입력한 뒤 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
+CMD="Notes를 열어 새 메모(Cmd+N)를 만들고 아래 3줄을 그대로 입력하세요: \"focus music\", \"pomodoro timer\", \"daily review template\". 다음 줄에 \"${MARKER_S4}\"를 정확히 입력하세요. 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Safari를 열고 https://www.google.com 으로 이동한 뒤 붙여넣기(Cmd+V)하고 Enter를 누르세요. 주소창에 포커스(Cmd+L) 후 복사(Cmd+C)하세요. TextEdit를 열어 새 문서(Cmd+N)에 \"${SUBJECT_S4}\" 제목을 입력하고 다음 줄에 붙여넣기(Cmd+V)하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S4}\"를 입력한 뒤 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
 
 if run_agent_scenario "$CMD" "$LOG_FILE" 4; then
     echo "✅ Scenario 4 Complete."
@@ -775,8 +841,9 @@ echo "---------------------------------------------------"
 echo "💱 Scenario 5: Safari → Calculator → Notes → Mail"
 LOG_FILE="scenario_results/complex_scenario_5_${TIMESTAMP}.log"
 SCENARIO_GOAL="Finder/Calculator/Notes/Mail budget draft chain."
+CURRENT_SCENARIO_MARKER="$MARKER_S5"
 echo "Goal: ${SCENARIO_GOAL}"
-CMD="Finder를 열어 Desktop으로 이동하세요. Calculator를 열어 \"120*1450=\" 을 입력해 계산하고 결과를 복사(Cmd+C)하세요. Notes를 열어 새 메모(Cmd+N)를 만들고 제목 \"${SUBJECT_S5}\"를 입력한 뒤 다음 줄에 \"Base: 120 USD\"를 입력하고 다음 줄에 붙여넣기(Cmd+V)하세요. 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S5}\"를 입력한 다음 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
+CMD="Finder를 열어 Desktop으로 이동하세요. Calculator를 열어 \"120*1450=\" 을 입력해 계산하고 결과를 복사(Cmd+C)하세요. Notes를 열어 새 메모(Cmd+N)를 만들고 제목 \"${SUBJECT_S5}\"를 입력한 뒤 다음 줄에 \"Base: 120 USD\"를 입력하고 다음 줄에 붙여넣기(Cmd+V)하세요. 다음 줄에 \"${MARKER_S5}\"를 정확히 입력하세요. 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S5}\"를 입력한 다음 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
 
 if run_agent_scenario "$CMD" "$LOG_FILE" 5; then
     echo "✅ Scenario 5 Complete."

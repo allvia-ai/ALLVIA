@@ -83,15 +83,18 @@ impl Scheduler {
                             crate::controller::planner::Planner::new(llm_clone.clone(), None);
                         let mut attempt: u32 = 0;
                         loop {
-                            match planner.run_goal(&prompt, None).await {
-                                Ok(_) => {
+                            match planner.run_goal_tracked(&prompt, None).await {
+                                Ok(outcome) => {
                                     if attempt > 0 {
                                         println!(
-                                            "✅ Routine '{}' Recovered after {} retries",
-                                            prompt, attempt
+                                            "✅ Routine '{}' Recovered after {} retries (run_id={})",
+                                            prompt, attempt, outcome.run_id
                                         );
                                     } else {
-                                        println!("✅ Routine '{}' Completed", prompt);
+                                        println!(
+                                            "✅ Routine '{}' Completed (run_id={})",
+                                            prompt, outcome.run_id
+                                        );
                                     }
                                     if let Some(id) = run_id {
                                         let _ = db::finish_routine_run(id, "success", None);

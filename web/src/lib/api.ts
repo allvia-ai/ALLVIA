@@ -26,6 +26,9 @@ import {
     ApprovalPolicySchema,
     NLRunMetricsSchema,
     NLRunSchema,
+    TaskRunSchema,
+    TaskStageRunSchema,
+    TaskStageAssertionSchema,
     ContextSelectionSchema,
     ProjectScanSchema,
     JudgmentSchema,
@@ -55,6 +58,9 @@ import {
     type ApprovalPolicy,
     type NLRunMetrics,
     type NLRun,
+    type TaskRun,
+    type TaskStageRun,
+    type TaskStageAssertion,
     type ContextSelection,
     type ProjectScan,
     type Judgment,
@@ -322,6 +328,29 @@ export async function fetchNlRuns(limit: number = 20): Promise<NLRun[]> {
 export async function fetchNlRunMetrics(limit: number = 50): Promise<NLRunMetrics> {
     const { data } = await api.get(`/agent/nl-metrics?limit=${limit}`);
     return NLRunMetricsSchema.parse(data);
+}
+
+export async function fetchTaskRuns(limit: number = 50, status?: string): Promise<TaskRun[]> {
+    const query = new URLSearchParams();
+    query.set("limit", String(limit));
+    if (status && status.trim()) query.set("status", status.trim());
+    const { data } = await api.get(`/agent/task-runs?${query.toString()}`);
+    return z.array(TaskRunSchema).parse(data);
+}
+
+export async function fetchTaskRun(runId: string): Promise<TaskRun> {
+    const { data } = await api.get(`/agent/task-runs/${encodeURIComponent(runId)}`);
+    return TaskRunSchema.parse(data);
+}
+
+export async function fetchTaskRunStages(runId: string): Promise<TaskStageRun[]> {
+    const { data } = await api.get(`/agent/task-runs/${encodeURIComponent(runId)}/stages`);
+    return z.array(TaskStageRunSchema).parse(data);
+}
+
+export async function fetchTaskRunAssertions(runId: string): Promise<TaskStageAssertion[]> {
+    const { data } = await api.get(`/agent/task-runs/${encodeURIComponent(runId)}/assertions`);
+    return z.array(TaskStageAssertionSchema).parse(data);
 }
 
 export async function fetchApprovalPolicies(limit: number = 20): Promise<ApprovalPolicy[]> {

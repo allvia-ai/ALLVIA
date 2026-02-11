@@ -6,8 +6,8 @@ use core_foundation::array::CFArray;
 use core_foundation::base::{CFTypeRef, TCFType};
 use core_foundation::string::CFString;
 use serde_json::{json, Value};
-use std::ptr;
 use std::process::Command;
+use std::ptr;
 use std::thread;
 use std::time::Duration;
 

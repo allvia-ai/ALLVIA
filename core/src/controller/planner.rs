@@ -3,6 +3,7 @@ use crate::controller::actions::ActionRunner;
 use crate::controller::heuristics;
 use crate::controller::loop_detector::LoopDetector;
 use crate::controller::supervisor::Supervisor;
+use crate::db;
 use crate::llm_gateway::LLMClient;
 use crate::schema::EventEnvelope;
 use crate::session_store::Session;
@@ -19,6 +20,16 @@ pub struct Planner {
     pub llm: Arc<dyn LLMClient>,
     pub max_steps: usize,
     pub tx: Option<mpsc::Sender<String>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RunGoalOutcome {
+    pub run_id: String,
+    pub planner_complete: bool,
+    pub execution_complete: bool,
+    pub business_complete: bool,
+    pub status: String,
+    pub summary: Option<String>,
 }
 
 impl Planner {
@@ -165,10 +176,8 @@ impl Planner {
                     return Some(serde_json::json!({ "action": "copy", "app": app_name }));
                 }
 
-                if Self::goal_contains_any(
-                    &goal_lower,
-                    &["paste", "붙여넣", "cmd+v", "command+v"],
-                ) && !Self::history_contains_case_insensitive(history, "Pasted")
+                if Self::goal_contains_any(&goal_lower, &["paste", "붙여넣", "cmd+v", "command+v"])
+                    && !Self::history_contains_case_insensitive(history, "Pasted")
                 {
                     return Some(serde_json::json!({ "action": "paste", "app": app_name }));
                 }
@@ -489,10 +498,11 @@ impl Planner {
             return;
         }
 
-        let in_mail_context = match Self::last_opened_app(history) {
-            Some(app) => app.eq_ignore_ascii_case("Mail"),
-            None => false,
-        } || Self::history_contains_case_insensitive(history, "Opened app: Mail");
+        let in_mail_context =
+            match Self::last_opened_app(history) {
+                Some(app) => app.eq_ignore_ascii_case("Mail"),
+                None => false,
+            } || Self::history_contains_case_insensitive(history, "Opened app: Mail");
         if !in_mail_context {
             return;
         }
@@ -738,10 +748,184 @@ impl Planner {
         }
     }
 
+    pub async fn run_goal_tracked(
+        &self,
+        goal: &str,
+        session_key: Option<&str>,
+    ) -> Result<RunGoalOutcome> {
+        let run_id = format!(
+            "surf_{}_{}",
+            Utc::now().format("%Y%m%d_%H%M%S"),
+            Uuid::new_v4().simple()
+        );
+        let normalized_goal = goal.trim();
+        let _ = db::create_task_run(&run_id, "surf_goal", normalized_goal, "running");
+        let _ = db::record_task_stage_run(
+            &run_id,
+            "planner",
+            1,
+            "running",
+            Some("planner.run_goal started"),
+        );
+
+        match self.run_goal(goal, session_key).await {
+            Ok(_) => {
+                let planner_complete = true;
+                let execution_complete = true;
+                let business_complete = false;
+                let summary = Some(
+                    "surf goal execution completed (business verification pending)".to_string(),
+                );
+                let details = serde_json::json!({
+                    "source": "planner.run_goal_tracked",
+                    "goal": normalized_goal,
+                    "status": "execution_completed",
+                    "business_complete": false,
+                    "business_note": "Requires semantic verification from app output evidence"
+                })
+                .to_string();
+
+                let _ = db::record_task_stage_run(
+                    &run_id,
+                    "planner",
+                    1,
+                    "completed",
+                    Some("planner produced done"),
+                );
+                let _ = db::record_task_stage_assertion(
+                    &run_id,
+                    "planner",
+                    "planner_complete",
+                    "true",
+                    "true",
+                    true,
+                    Some("Goal completed by planner"),
+                );
+                let _ = db::record_task_stage_run(
+                    &run_id,
+                    "execution",
+                    2,
+                    "completed",
+                    Some("action execution completed"),
+                );
+                let _ = db::record_task_stage_assertion(
+                    &run_id,
+                    "execution",
+                    "execution_complete",
+                    "true",
+                    "true",
+                    true,
+                    Some("No execution error returned"),
+                );
+                let _ = db::record_task_stage_run(
+                    &run_id,
+                    "business",
+                    3,
+                    "pending_verification",
+                    Some("business verification pending semantic evidence"),
+                );
+                let _ = db::record_task_stage_assertion(
+                    &run_id,
+                    "business",
+                    "business_complete",
+                    "true",
+                    "unknown",
+                    false,
+                    Some("run_goal returned Ok, but business evidence was not asserted here"),
+                );
+                let _ = db::update_task_run_outcome(
+                    &run_id,
+                    planner_complete,
+                    execution_complete,
+                    business_complete,
+                    "execution_completed",
+                    summary.as_deref(),
+                    Some(&details),
+                );
+
+                Ok(RunGoalOutcome {
+                    run_id,
+                    planner_complete,
+                    execution_complete,
+                    business_complete,
+                    status: "execution_completed".to_string(),
+                    summary,
+                })
+            }
+            Err(e) => {
+                let error_text = e.to_string();
+                let summary = Some(format!("surf goal failed: {}", error_text));
+                let details = serde_json::json!({
+                    "source": "planner.run_goal_tracked",
+                    "goal": normalized_goal,
+                    "status": "failed",
+                    "error": error_text
+                })
+                .to_string();
+
+                let _ = db::record_task_stage_run(&run_id, "planner", 1, "failed", Some(&details));
+                let _ = db::record_task_stage_assertion(
+                    &run_id,
+                    "planner",
+                    "planner_complete",
+                    "true",
+                    "false",
+                    false,
+                    Some("planner did not reach done"),
+                );
+                let _ = db::record_task_stage_run(
+                    &run_id,
+                    "execution",
+                    2,
+                    "failed",
+                    Some("execution/biz completion unavailable due planner failure"),
+                );
+                let _ = db::record_task_stage_assertion(
+                    &run_id,
+                    "execution",
+                    "execution_complete",
+                    "true",
+                    "false",
+                    false,
+                    Some("run_goal returned error"),
+                );
+                let _ = db::record_task_stage_run(
+                    &run_id,
+                    "business",
+                    3,
+                    "failed",
+                    Some("business completion failed"),
+                );
+                let _ = db::record_task_stage_assertion(
+                    &run_id,
+                    "business",
+                    "business_complete",
+                    "true",
+                    "false",
+                    false,
+                    Some("run_goal returned error"),
+                );
+                let _ = db::update_task_run_outcome(
+                    &run_id,
+                    false,
+                    false,
+                    false,
+                    "business_failed",
+                    summary.as_deref(),
+                    Some(&details),
+                );
+
+                Err(anyhow::anyhow!("{} (run_id={})", e, run_id))
+            }
+        }
+    }
+
     pub async fn run_goal(&self, goal: &str, session_key: Option<&str>) -> Result<()> {
         println!("🌊 Starting Planned Surf: '{}'", goal);
         let scenario_mode = Self::scenario_mode_enabled();
-        let require_primary_planner = Self::env_truthy_default("STEER_REQUIRE_PRIMARY_PLANNER", true);
+        let allow_deterministic_fallback = Self::env_truthy("STEER_ALLOW_DETERMINISTIC_FALLBACK");
+        let require_primary_planner =
+            Self::env_truthy_default("STEER_REQUIRE_PRIMARY_PLANNER", true);
         let allow_scenario_mode = Self::env_truthy("STEER_ALLOW_SCENARIO_MODE");
         if scenario_mode && require_primary_planner && !allow_scenario_mode {
             return Err(anyhow::anyhow!(
@@ -874,11 +1058,7 @@ impl Planner {
 
             if scenario_mode {
                 if let Some(fallback_plan) = Self::fallback_plan_from_goal(goal, &history) {
-                    Self::record_fallback_action(
-                        &mut history,
-                        "scenario_mode",
-                        &fallback_plan,
-                    );
+                    Self::record_fallback_action(&mut history, "scenario_mode", &fallback_plan);
                     plan = fallback_plan;
                 }
             } else {
@@ -935,6 +1115,7 @@ impl Planner {
                 if supervisor_action == "review"
                     && !Self::goal_has_multi_app(goal)
                     && !Self::goal_has_explicit_sequence(goal)
+                    && allow_deterministic_fallback
                     && Self::should_relax_review(
                         &supervisor_decision.reason,
                         &supervisor_decision.notes,
@@ -980,37 +1161,46 @@ impl Planner {
                                 || review_text.contains("불일치"));
 
                         if !has_hard_blocker && !has_notes_content_issue {
-                            if let Some(loop_break_plan) =
-                                Self::fallback_plan_from_goal(goal, &history)
-                            {
-                                Self::record_fallback_action(
-                                    &mut history,
-                                    &format!("review_loop_{}rejections", recent_rejections),
-                                    &loop_break_plan,
-                                );
-                                plan = loop_break_plan;
-                                supervisor_action = "accept".to_string();
-                            } else {
-                                let action_name = plan["action"].as_str().unwrap_or("unknown");
-                                if matches!(
-                                    action_name,
-                                    "open_app"
-                                        | "open_url"
-                                        | "shortcut"
-                                        | "type"
-                                        | "paste"
-                                        | "copy"
-                                        | "select_all"
-                                        | "read"
-                                        | "read_clipboard"
-                                        | "click_visual"
-                                ) {
-                                    println!(
-                                        "   🔁 Review-loop override: forcing '{}' after {} rejections.",
-                                        action_name, recent_rejections
+                            if allow_deterministic_fallback {
+                                if let Some(loop_break_plan) =
+                                    Self::fallback_plan_from_goal(goal, &history)
+                                {
+                                    Self::record_fallback_action(
+                                        &mut history,
+                                        &format!("review_loop_{}rejections", recent_rejections),
+                                        &loop_break_plan,
                                     );
+                                    plan = loop_break_plan;
                                     supervisor_action = "accept".to_string();
+                                } else {
+                                    let action_name = plan["action"].as_str().unwrap_or("unknown");
+                                    if matches!(
+                                        action_name,
+                                        "open_app"
+                                            | "open_url"
+                                            | "shortcut"
+                                            | "type"
+                                            | "paste"
+                                            | "copy"
+                                            | "select_all"
+                                            | "read"
+                                            | "read_clipboard"
+                                            | "click_visual"
+                                    ) {
+                                        println!(
+                                            "   🔁 Review-loop override: forcing '{}' after {} rejections.",
+                                            action_name, recent_rejections
+                                        );
+                                        supervisor_action = "accept".to_string();
+                                    }
                                 }
+                            } else {
+                                history.push(
+                                    "FALLBACK_BLOCKED: review-loop deterministic fallback disabled"
+                                        .to_string(),
+                                );
+                                let msg = "Supervisor review loop: deterministic fallback disabled by policy";
+                                return Err(anyhow::anyhow!(msg));
                             }
                         }
                     }

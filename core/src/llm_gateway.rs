@@ -955,6 +955,13 @@ Respond with ONE JSON object only.
                 }
             }
 
+            if !crate::env_flag("STEER_ALLOW_REFUSAL_FALLBACK") {
+                return Err(anyhow::anyhow!(
+                    "OpenAI refusal with fallback disabled by policy: {}",
+                    refusal
+                ));
+            }
+
             let fallback_action = self.fallback_vision_action(goal, history);
             log::warn!(
                 "Using deterministic fallback action after refusal: {}",

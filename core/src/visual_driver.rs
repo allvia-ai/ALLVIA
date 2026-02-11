@@ -340,11 +340,13 @@ impl VisualDriver {
                 }
                 UiAction::Type(text) => {
                     let text_clone = text.clone();
-                    let compact: String = text_clone.chars().filter(|c| !c.is_whitespace()).collect();
+                    let compact: String =
+                        text_clone.chars().filter(|c| !c.is_whitespace()).collect();
                     let calc_like = !compact.is_empty()
-                        && compact
-                            .chars()
-                            .all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | '*' | '/' | '=' | '.' | ',' | '(' | ')'));
+                        && compact.chars().all(|c| {
+                            c.is_ascii_digit()
+                                || matches!(c, '+' | '-' | '*' | '/' | '=' | '.' | ',' | '(' | ')')
+                        });
 
                     // For non-calculator text, prefer clipboard-paste typing for reliability (especially multiline).
                     let task = tokio::task::spawn_blocking(move || {
@@ -684,11 +686,14 @@ impl VisualDriver {
                                             let script = format!("tell application \"System Events\" to click at {{{}, {}}}", x, y);
                                             debug!("      🖱️ Executing AppleScript: {}", script);
                                             let click_script = script.clone();
-                                            let click_task = tokio::task::spawn_blocking(move || {
-                                                applescript::run(&click_script)
-                                            });
+                                            let click_task =
+                                                tokio::task::spawn_blocking(move || {
+                                                    applescript::run(&click_script)
+                                                });
                                             let click_result = tokio::time::timeout(
-                                                tokio::time::Duration::from_millis(click_timeout_ms),
+                                                tokio::time::Duration::from_millis(
+                                                    click_timeout_ms,
+                                                ),
                                                 click_task,
                                             )
                                             .await;
@@ -699,7 +704,10 @@ impl VisualDriver {
                                                     break; // Success!
                                                 }
                                                 Ok(Ok(Err(e))) => {
-                                                    error!("      ❌ Click visual script failed: {}", e);
+                                                    error!(
+                                                        "      ❌ Click visual script failed: {}",
+                                                        e
+                                                    );
                                                     if attempt == max_retries && step.critical {
                                                         return Err(anyhow::anyhow!(
                                                             "Visual Click execution failed"

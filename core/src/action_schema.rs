@@ -267,10 +267,8 @@ pub fn normalize_action(plan: &Value) -> ActionValidation {
             if key.is_none() {
                 error = Some("shortcut requires 'key'".to_string());
             } else {
-                let canonical_key = canonicalize_shortcut_alias(
-                    key.as_deref().unwrap_or_default(),
-                    &mut modifiers,
-                );
+                let canonical_key =
+                    canonicalize_shortcut_alias(key.as_deref().unwrap_or_default(), &mut modifiers);
                 obj.insert("key".to_string(), Value::String(canonical_key.clone()));
                 obj.insert(
                     "modifiers".to_string(),
@@ -461,7 +459,10 @@ mod tests {
         let result = normalize_action(&plan);
         assert!(result.error.is_none());
         assert_eq!(result.normalized["key"].as_str().unwrap(), "n");
-        assert_eq!(result.normalized["modifiers"][0].as_str().unwrap(), "command");
+        assert_eq!(
+            result.normalized["modifiers"][0].as_str().unwrap(),
+            "command"
+        );
     }
 
     #[test]
@@ -479,7 +480,10 @@ mod tests {
         assert!(result.error.is_none());
         assert_eq!(result.normalized["action"].as_str().unwrap(), "shortcut");
         assert_eq!(result.normalized["key"].as_str().unwrap(), "n");
-        assert_eq!(result.normalized["modifiers"][0].as_str().unwrap(), "command");
+        assert_eq!(
+            result.normalized["modifiers"][0].as_str().unwrap(),
+            "command"
+        );
     }
 
     #[test]

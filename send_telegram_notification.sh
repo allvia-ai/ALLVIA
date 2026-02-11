@@ -11,6 +11,8 @@ TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 TELEGRAM_CONNECT_TIMEOUT="${TELEGRAM_CONNECT_TIMEOUT:-5}"
 TELEGRAM_MAX_TIME="${TELEGRAM_MAX_TIME:-10}"
+TELEGRAM_RETRY_COUNT="${TELEGRAM_RETRY_COUNT:-3}"
+TELEGRAM_RETRY_DELAY_SEC="${TELEGRAM_RETRY_DELAY_SEC:-1}"
 
 MESSAGE="$1"
 IMAGE_PATH="$2"
@@ -53,10 +55,24 @@ fi
 # Send text message using JSON payload
 send_message() {
     local text="${1:-$MESSAGE}"
-    curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-        --connect-timeout "$TELEGRAM_CONNECT_TIMEOUT" --max-time "$TELEGRAM_MAX_TIME" \
-        -H "Content-Type: application/json" \
-        -d "$(jq -n --arg chat_id "$TELEGRAM_CHAT_ID" --arg text "$text" '{chat_id: $chat_id, text: $text}')" > /dev/null
+    local attempt=1
+    local backoff="$TELEGRAM_RETRY_DELAY_SEC"
+    local rc=1
+    while [ "$attempt" -le "$TELEGRAM_RETRY_COUNT" ]; do
+        if curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --connect-timeout "$TELEGRAM_CONNECT_TIMEOUT" --max-time "$TELEGRAM_MAX_TIME" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg chat_id "$TELEGRAM_CHAT_ID" --arg text "$text" '{chat_id: $chat_id, text: $text}')" > /dev/null; then
+            return 0
+        fi
+        rc=$?
+        if [ "$attempt" -lt "$TELEGRAM_RETRY_COUNT" ]; then
+            sleep "$backoff"
+            backoff=$((backoff * 2))
+        fi
+        attempt=$((attempt + 1))
+    done
+    return "$rc"
 }
 
 # Send one photo with caption.
@@ -72,11 +88,25 @@ send_photo_with_caption() {
         caption="${caption:0:900}..."
     fi
 
-    curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" \
-        --connect-timeout "$TELEGRAM_CONNECT_TIMEOUT" --max-time "$TELEGRAM_MAX_TIME" \
-        -F "chat_id=${TELEGRAM_CHAT_ID}" \
-        -F "photo=@${image_path}" \
-        -F "caption=${caption}" > /dev/null
+    local attempt=1
+    local backoff="$TELEGRAM_RETRY_DELAY_SEC"
+    local rc=1
+    while [ "$attempt" -le "$TELEGRAM_RETRY_COUNT" ]; do
+        if curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" \
+            --connect-timeout "$TELEGRAM_CONNECT_TIMEOUT" --max-time "$TELEGRAM_MAX_TIME" \
+            -F "chat_id=${TELEGRAM_CHAT_ID}" \
+            -F "photo=@${image_path}" \
+            -F "caption=${caption}" > /dev/null; then
+            return 0
+        fi
+        rc=$?
+        if [ "$attempt" -lt "$TELEGRAM_RETRY_COUNT" ]; then
+            sleep "$backoff"
+            backoff=$((backoff * 2))
+        fi
+        attempt=$((attempt + 1))
+    done
+    return "$rc"
 }
 
 send_extra_images() {

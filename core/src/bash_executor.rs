@@ -150,6 +150,13 @@ pub struct BashExecResult {
     pub process_id: Option<String>,
 }
 
+fn should_allow_test_auto_approval(
+    explicit_auto_approval: bool,
+    test_assume_approved: bool,
+) -> bool {
+    explicit_auto_approval && test_assume_approved
+}
+
 /// Execute a bash command with advanced options
 pub fn execute_bash(cmd: &str, config: &BashExecConfig) -> Result<BashExecResult> {
     use crate::approval_gate::{ApprovalGate, ApprovalLevel};
@@ -170,11 +177,22 @@ pub fn execute_bash(cmd: &str, config: &BashExecConfig) -> Result<BashExecResult
                 });
             }
             ApprovalLevel::RequireApproval => {
-                if crate::env_flag("STEER_BASH_ALLOW_AUTO_APPROVAL") {
+                let explicit_auto_approval = crate::env_flag("STEER_BASH_ALLOW_AUTO_APPROVAL");
+                let test_assume_approved = crate::env_flag("STEER_TEST_ASSUME_APPROVED");
+                if should_allow_test_auto_approval(explicit_auto_approval, test_assume_approved) {
                     println!(
-                        "⚠️ [Bash] Command requires approval but auto-approved by STEER_BASH_ALLOW_AUTO_APPROVAL=1: {}",
+                        "🧪 [Bash] Auto-approved in test mode (STEER_BASH_ALLOW_AUTO_APPROVAL=1, STEER_TEST_ASSUME_APPROVED=1): {}",
                         cmd
                     );
+                } else if explicit_auto_approval {
+                    return Ok(BashExecResult {
+                        success: false,
+                        stdout: String::new(),
+                        stderr: "Auto-approval disabled outside test mode (set STEER_TEST_ASSUME_APPROVED=1 for test-only bypass)".to_string(),
+                        exit_code: -2,
+                        duration_ms: 0,
+                        process_id: None,
+                    });
                 } else {
                     return Ok(BashExecResult {
                         success: false,
@@ -458,5 +476,13 @@ mod tests {
         let info = get_process("test1");
         assert!(info.is_some());
         assert_eq!(info.unwrap().pid, 12345);
+    }
+
+    #[test]
+    fn test_auto_approval_only_in_test_mode() {
+        assert!(should_allow_test_auto_approval(true, true));
+        assert!(!should_allow_test_auto_approval(true, false));
+        assert!(!should_allow_test_auto_approval(false, true));
+        assert!(!should_allow_test_auto_approval(false, false));
     }
 }

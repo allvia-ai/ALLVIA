@@ -175,6 +175,10 @@ export default function Launcher() {
             const summaryLines = [
                 `**Intent**: ${intentRes.intent} (${Math.round(intentRes.confidence * 100)}%)`,
                 `**Status**: ${execRes.status}`,
+                execRes.run_id ? `**Run ID**: ${execRes.run_id}` : "",
+                `**Planner Complete**: ${execRes.planner_complete ? "yes" : "no"}`,
+                `**Execution Complete**: ${execRes.execution_complete ? "yes" : "no"}`,
+                `**Business Complete**: ${execRes.business_complete ? "yes" : "no"}`,
                 `**Verify**: ${verifyRes.ok ? "ok" : "issues"}`,
                 execRes.resume_from != null ? `**Next Step**: ${execRes.resume_from + 1}` : "",
             ];
@@ -247,6 +251,10 @@ export default function Launcher() {
             const verifyRes = await agentVerify(lastPlanId);
             const summaryLines = [
                 `**Status**: ${execRes.status}`,
+                execRes.run_id ? `**Run ID**: ${execRes.run_id}` : "",
+                `**Planner Complete**: ${execRes.planner_complete ? "yes" : "no"}`,
+                `**Execution Complete**: ${execRes.execution_complete ? "yes" : "no"}`,
+                `**Business Complete**: ${execRes.business_complete ? "yes" : "no"}`,
                 `**Verify**: ${verifyRes.ok ? "ok" : "issues"}`,
                 execRes.resume_from != null ? `**Next Step**: ${execRes.resume_from + 1}` : "",
             ];
@@ -306,6 +314,10 @@ export default function Launcher() {
             const verifyRes = await agentVerify(pendingApproval.planId);
             const summaryLines = [
                 `**Status**: ${execRes.status}`,
+                execRes.run_id ? `**Run ID**: ${execRes.run_id}` : "",
+                `**Planner Complete**: ${execRes.planner_complete ? "yes" : "no"}`,
+                `**Execution Complete**: ${execRes.execution_complete ? "yes" : "no"}`,
+                `**Business Complete**: ${execRes.business_complete ? "yes" : "no"}`,
                 `**Verify**: ${verifyRes.ok ? "ok" : "issues"}`,
                 execRes.resume_from != null ? `**Next Step**: ${execRes.resume_from + 1}` : "",
             ];

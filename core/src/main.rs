@@ -244,8 +244,14 @@ async fn main() -> anyhow::Result<()> {
             let mut cli_policy = policy::PolicyEngine::new();
             cli_policy.unlock();
             let planner = local_os_agent::controller::planner::Planner::new(llm, None);
-            match planner.run_goal(&goal, None).await {
-                Ok(_) => println!("✅ Surf completed successfully!"),
+            match planner.run_goal_tracked(&goal, None).await {
+                Ok(outcome) => println!(
+                    "✅ Surf completed successfully! run_id={} planner={} execution={} business={}",
+                    outcome.run_id,
+                    outcome.planner_complete,
+                    outcome.execution_complete,
+                    outcome.business_complete
+                ),
                 Err(e) => println!("❌ Surf failed: {}", e),
             }
         } else {
@@ -362,9 +368,13 @@ async fn main() -> anyhow::Result<()> {
                 println!("  status                - Show system status");
                 println!("  recommendations [N]   - List pending workflow recommendations");
                 println!("  approve <id>          - Approve and create n8n workflow");
-                println!("  approve_test <id>     - Test-only assumed approval then create workflow");
+                println!(
+                    "  approve_test <id>     - Test-only assumed approval then create workflow"
+                );
                 println!("  reject <id>           - Reject recommendation");
-                println!("  ingest_mock_workflow  - Ingest mock workflow as pending recommendation");
+                println!(
+                    "  ingest_mock_workflow  - Ingest mock workflow as pending recommendation"
+                );
                 println!("  analyze_patterns      - Detect behavior patterns and generate recommendations");
                 println!("  quality               - Show workflow quality metrics");
                 println!("  telegram <msg>        - Send Telegram message");
@@ -723,7 +733,10 @@ async fn main() -> anyhow::Result<()> {
                 };
 
                 if rec.status.eq_ignore_ascii_case("rejected") {
-                    println!("❌ Recommendation {} is rejected and cannot be approved.", id);
+                    println!(
+                        "❌ Recommendation {} is rejected and cannot be approved.",
+                        id
+                    );
                     continue;
                 }
                 if !rec.status.eq_ignore_ascii_case("approved") {
@@ -734,8 +747,11 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 println!("🏗️  Building n8n workflow for '{}'...", rec.title);
-                match recommendation_executor::execute_approved_recommendation(id, llm_client.clone())
-                    .await
+                match recommendation_executor::execute_approved_recommendation(
+                    id,
+                    llm_client.clone(),
+                )
+                .await
                 {
                     Ok(workflow_id) => {
                         println!("✅ Workflow created! ID: {}", workflow_id);
@@ -762,8 +778,11 @@ async fn main() -> anyhow::Result<()> {
                     println!("❌ approve_test precheck failed: {}", e);
                     continue;
                 }
-                match recommendation_executor::execute_approved_recommendation(id, llm_client.clone())
-                    .await
+                match recommendation_executor::execute_approved_recommendation(
+                    id,
+                    llm_client.clone(),
+                )
+                .await
                 {
                     Ok(workflow_id) => {
                         println!("✅ [TEST] Workflow created! ID: {}", workflow_id);
@@ -1045,8 +1064,15 @@ async fn main() -> anyhow::Result<()> {
                     let planner =
                         local_os_agent::controller::planner::Planner::new(brain.clone(), None);
                     // Run concurrently to allow Ctrl+C? For now blocking is fine as it has internal timeout/loop
-                    if let Err(e) = planner.run_goal(&goal, None).await {
-                        error!("❌ Surf failed: {}", e);
+                    match planner.run_goal_tracked(&goal, None).await {
+                        Ok(outcome) => info!(
+                            "✅ Surf completed (run_id={}, planner={}, execution={}, business={})",
+                            outcome.run_id,
+                            outcome.planner_complete,
+                            outcome.execution_complete,
+                            outcome.business_complete
+                        ),
+                        Err(e) => error!("❌ Surf failed: {}", e),
                     }
                 } else {
                     warn!("⚠️  LLM Client not available.");

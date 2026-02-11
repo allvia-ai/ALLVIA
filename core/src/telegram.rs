@@ -115,10 +115,16 @@ impl TelegramBot {
                                         // or better, adding a "telegram_reply" action that uses this ID.
                                         // For MVP, if surf succeeds, we send "Done".
 
-                                        match planner.run_goal(&text_clone, None).await {
-                                            Ok(_) => {
+                                        match planner.run_goal_tracked(&text_clone, None).await {
+                                            Ok(outcome) => {
                                                 let _ = bot_clone
-                                                    .send_message(chat_id, "✅ Task Completed.")
+                                                    .send_message(
+                                                        chat_id,
+                                                        &format!(
+                                                            "✅ Task Completed. (run_id={})",
+                                                            outcome.run_id
+                                                        ),
+                                                    )
                                                     .await;
                                             }
                                             Err(e) => {

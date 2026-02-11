@@ -137,12 +137,56 @@ impl ActionRunner {
             "return \"ok\"",
         ];
         crate::applescript::run_with_args(&lines, &Vec::<String>::new())?;
-        let _ = Self::mail_set_recipient_if_missing();
+        let _ = Self::mail_set_recipient_if_missing(None);
         Ok(())
     }
 
+    fn normalize_email_candidate(raw: &str) -> Option<String> {
+        let trimmed = raw.trim_matches(|c: char| {
+            matches!(
+                c,
+                '"' | '\'' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':' | '.'
+            )
+        });
+        if trimmed.is_empty() || trimmed.contains(' ') || !trimmed.contains('@') {
+            return None;
+        }
+        let mut parts = trimmed.split('@');
+        let local = parts.next().unwrap_or_default();
+        let domain = parts.next().unwrap_or_default();
+        if local.is_empty() || domain.is_empty() || parts.next().is_some() {
+            return None;
+        }
+        if !domain.contains('.') {
+            return None;
+        }
+        Some(trimmed.to_string())
+    }
+
+    fn extract_mail_recipient_from_goal(goal: &str) -> Option<String> {
+        for token in goal.split_whitespace() {
+            if let Some(email) = Self::normalize_email_candidate(token) {
+                return Some(email);
+            }
+        }
+        None
+    }
+
+    fn preferred_mail_recipient(goal: Option<&str>) -> Option<String> {
+        if let Some(g) = goal {
+            if let Some(recipient) = Self::extract_mail_recipient_from_goal(g) {
+                return Some(recipient);
+            }
+        }
+        Self::default_mail_recipient()
+    }
+
     fn default_mail_recipient() -> Option<String> {
-        let candidates = ["STEER_DEFAULT_MAIL_TO", "STEER_USER_EMAIL", "APPLE_ID_EMAIL"];
+        let candidates = [
+            "STEER_DEFAULT_MAIL_TO",
+            "STEER_USER_EMAIL",
+            "APPLE_ID_EMAIL",
+        ];
         for key in candidates {
             if let Ok(value) = std::env::var(key) {
                 let trimmed = value.trim();
@@ -151,11 +195,35 @@ impl ActionRunner {
                 }
             }
         }
-        None
+        Self::mail_account_primary_email()
     }
 
-    fn mail_set_recipient_if_missing() -> Result<()> {
-        let Some(address) = Self::default_mail_recipient() else {
+    fn mail_account_primary_email() -> Option<String> {
+        let lines = [
+            "tell application \"Mail\"",
+            "repeat with ac in accounts",
+            "try",
+            "set addrList to email addresses of ac",
+            "if addrList is not missing value and (count of addrList) > 0 then",
+            "set candidate to item 1 of addrList as text",
+            "if candidate is not \"\" then return candidate",
+            "end if",
+            "end if",
+            "end try",
+            "try",
+            "set candidate to user name of ac as text",
+            "if candidate contains \"@\" then return candidate",
+            "end try",
+            "end repeat",
+            "end tell",
+            "return \"\"",
+        ];
+        let out = crate::applescript::run_with_args(&lines, &Vec::<String>::new()).ok()?;
+        Self::normalize_email_candidate(out.trim())
+    }
+
+    fn mail_set_recipient_if_missing(goal: Option<&str>) -> Result<()> {
+        let Some(address) = Self::preferred_mail_recipient(goal) else {
             return Ok(());
         };
         let lines = [
@@ -190,26 +258,68 @@ impl ActionRunner {
         Ok(out.trim().parse::<i64>().unwrap_or(0))
     }
 
-    fn mail_send_latest_message() -> Result<String> {
-        let fallback = Self::default_mail_recipient().unwrap_or_default();
+    fn parse_mail_send_result(raw: &str) -> (String, Option<i64>, Option<i64>) {
+        let mut parts = raw.trim().split('|');
+        let status = parts.next().unwrap_or("").trim().to_string();
+        let outgoing_before = parts.next().and_then(|v| v.trim().parse::<i64>().ok());
+        let outgoing_after = parts.next().and_then(|v| v.trim().parse::<i64>().ok());
+        (status, outgoing_before, outgoing_after)
+    }
+
+    fn mail_send_latest_message(goal: Option<&str>) -> Result<String> {
+        let fallback = Self::preferred_mail_recipient(goal).unwrap_or_default();
         let lines = [
             "on run argv",
             "set fallbackAddress to item 1 of argv",
             "tell application \"Mail\"",
             "activate",
-            "if (count of outgoing messages) = 0 then return \"no_draft\"",
+            "if (count of outgoing messages) = 0 then return \"no_draft|0|0\"",
+            "set beforeOutgoing to (count of outgoing messages)",
             "set _msg to last outgoing message",
             "set visible of _msg to true",
-            "if (count of to recipients of _msg) = 0 then",
+            "set _subject to \"\"",
+            "try",
+            "set _subject to (subject of _msg as text)",
+            "end try",
+            "set sendTargets to {}",
+            "if _subject is not \"\" then",
+            "repeat with m in outgoing messages",
+            "set mSubject to \"\"",
+            "try",
+            "set mSubject to (subject of m as text)",
+            "end try",
+            "if mSubject is _subject then set end of sendTargets to m",
+            "end repeat",
+            "end if",
+            "if (count of sendTargets) = 0 then set sendTargets to {_msg}",
+            "repeat with m in sendTargets",
+            "if (count of to recipients of m) = 0 then",
             "if fallbackAddress is not \"\" then",
-            "make new to recipient at end of to recipients of _msg with properties {address:fallbackAddress}",
+            "make new to recipient at end of to recipients of m with properties {address:fallbackAddress}",
             "else",
-            "return \"missing_recipient\"",
+            "return \"missing_recipient|\" & beforeOutgoing & \"|\" & beforeOutgoing",
             "end if",
             "end if",
-            "send _msg",
+            "send m",
+            "end repeat",
+            "delay 0.8",
+            "set afterOutgoing to (count of outgoing messages)",
+            "if afterOutgoing = 0 then return \"sent_confirmed|\" & beforeOutgoing & \"|\" & afterOutgoing",
+            "if afterOutgoing < beforeOutgoing then return \"sent_confirmed|\" & beforeOutgoing & \"|\" & afterOutgoing",
+            "if _subject is not \"\" then",
+            "repeat with ac in accounts",
+            "try",
+            "set sentMbx to sent mailbox of ac",
+            "if sentMbx is not missing value then",
+            "set sentHits to (count of (messages of sentMbx whose subject is _subject))",
+            "if sentHits > 0 then return \"sent_confirmed|\" & beforeOutgoing & \"|\" & afterOutgoing",
+            "end if",
+            "end if",
+            "end try",
+            "end repeat",
+            "end if",
             "end tell",
-            "return \"sent\"",
+            "return \"sent_pending|\" & beforeOutgoing & \"|\" & afterOutgoing",
             "end run",
         ];
         let out = crate::applescript::run_with_args(&lines, &[fallback])?;
@@ -359,7 +469,9 @@ impl ActionRunner {
 
     fn goal_mentions_downloads(goal: &str) -> bool {
         let lower = goal.to_lowercase();
-        lower.contains("downloads") || lower.contains("downloads folder") || lower.contains("다운로드")
+        lower.contains("downloads")
+            || lower.contains("downloads folder")
+            || lower.contains("다운로드")
     }
 
     fn finder_open_downloads() -> Result<()> {
@@ -380,10 +492,7 @@ impl ActionRunner {
         Ok(())
     }
 
-    fn normalize_shortcut_parts(
-        key_raw: &str,
-        modifiers_raw: &[String],
-    ) -> (String, Vec<String>) {
+    fn normalize_shortcut_parts(key_raw: &str, modifiers_raw: &[String]) -> (String, Vec<String>) {
         let mut key = key_raw.trim().to_lowercase();
         let mut modifiers: Vec<String> = Vec::new();
 
@@ -581,8 +690,7 @@ impl ActionRunner {
             let need_refocus = match front.as_deref() {
                 Some(front_app) => {
                     !front_app.eq_ignore_ascii_case(&target_app)
-                        && (Self::is_focus_noise_app(front_app)
-                            || strict_focus_actions)
+                        && (Self::is_focus_noise_app(front_app) || strict_focus_actions)
                 }
                 None => true,
             };
@@ -672,8 +780,8 @@ impl ActionRunner {
                     description = "click_ref failed: missing ref".to_string();
                     action_status_override = Some("failed");
                 } else {
-                    let front_app =
-                        crate::tool_chaining::CrossAppBridge::get_frontmost_app().unwrap_or_default();
+                    let front_app = crate::tool_chaining::CrossAppBridge::get_frontmost_app()
+                        .unwrap_or_default();
                     if front_app.eq_ignore_ascii_case("Finder")
                         && Self::goal_mentions_downloads(goal)
                     {
@@ -880,6 +988,7 @@ impl ActionRunner {
 
                     if app_name.eq_ignore_ascii_case("Mail") {
                         let _ = Self::mail_ensure_draft();
+                        let _ = Self::mail_set_recipient_if_missing(Some(goal));
                         let subject_already_set = history
                             .iter()
                             .any(|h| h.to_lowercase().contains("(mail subject)"));
@@ -1021,8 +1130,8 @@ impl ActionRunner {
                         .any(|m| m.eq_ignore_ascii_case("shift"));
                     let is_cmd_n = key == "n" && has_command;
                     let is_cmd_shift_d = key == "d" && has_command && has_shift;
-                    let front_app =
-                        crate::tool_chaining::CrossAppBridge::get_frontmost_app().unwrap_or_default();
+                    let front_app = crate::tool_chaining::CrossAppBridge::get_frontmost_app()
+                        .unwrap_or_default();
 
                     if is_cmd_n && front_app.eq_ignore_ascii_case("Mail") {
                         match Self::mail_ensure_draft() {
@@ -1043,29 +1152,31 @@ impl ActionRunner {
                             }
                         }
                     } else if is_cmd_shift_d && front_app.eq_ignore_ascii_case("Mail") {
-                        match Self::mail_send_latest_message() {
-                            Ok(result) if result == "sent" => {
-                                let outgoing_after = Self::mail_outgoing_count().unwrap_or(-1);
-                                description = format!(
-                                    "Shortcut '{}' + {:?} (Mail sent)",
-                                    key, shortcut_modifiers
-                                );
-                                action_status_override = Some("success");
+                        match Self::mail_send_latest_message(Some(goal)) {
+                            Ok(raw_result) => {
+                                let (result, outgoing_before, parsed_after) =
+                                    Self::parse_mail_send_result(&raw_result);
+                                let outgoing_after = parsed_after
+                                    .unwrap_or_else(|| Self::mail_outgoing_count().unwrap_or(-1));
+                                if result == "sent_confirmed" {
+                                    description = format!(
+                                        "Shortcut '{}' + {:?} (Mail sent)",
+                                        key, shortcut_modifiers
+                                    );
+                                    action_status_override = Some("success");
+                                } else {
+                                    description = format!(
+                                        "Shortcut '{}' + {:?} (mail send blocked: {})",
+                                        key, shortcut_modifiers, raw_result
+                                    );
+                                    action_status_override = Some("failed");
+                                }
                                 action_data = Some(json!({
                                     "proof": "mail_send",
-                                    "result": result,
+                                    "result": raw_result,
+                                    "send_status": result,
+                                    "outgoing_before": outgoing_before,
                                     "outgoing_after": outgoing_after
-                                }));
-                            }
-                            Ok(result) => {
-                                description = format!(
-                                    "Shortcut '{}' + {:?} (mail send blocked: {})",
-                                    key, shortcut_modifiers, result
-                                );
-                                action_status_override = Some("failed");
-                                action_data = Some(json!({
-                                    "proof": "mail_send",
-                                    "result": result
                                 }));
                             }
                             Err(e) => {
@@ -1119,24 +1230,20 @@ impl ActionRunner {
                         let _ = heuristics::ensure_app_focus(&target_app, 5).await;
                     }
 
-                    let is_cmd_n = key == "n"
-                        && modifiers
-                            .iter()
-                            .any(|m| m.eq_ignore_ascii_case("command"));
+                    let is_cmd_n =
+                        key == "n" && modifiers.iter().any(|m| m.eq_ignore_ascii_case("command"));
                     let is_cmd_shift_d = key == "d"
-                        && modifiers
-                            .iter()
-                            .any(|m| m.eq_ignore_ascii_case("command"))
-                        && modifiers
-                            .iter()
-                            .any(|m| m.eq_ignore_ascii_case("shift"));
+                        && modifiers.iter().any(|m| m.eq_ignore_ascii_case("command"))
+                        && modifiers.iter().any(|m| m.eq_ignore_ascii_case("shift"));
                     let front_app = crate::tool_chaining::CrossAppBridge::get_frontmost_app()
                         .unwrap_or_default();
                     if is_cmd_n && front_app.eq_ignore_ascii_case("Mail") {
                         match Self::mail_ensure_draft() {
                             Ok(_) => {
-                                description =
-                                    format!("Shortcut '{}' + {:?} (Created new item)", key, modifiers);
+                                description = format!(
+                                    "Shortcut '{}' + {:?} (Created new item)",
+                                    key, modifiers
+                                );
                                 action_status_override = Some("success");
                                 action_data = Some(json!({
                                     "proof": "mail_draft_ready",
@@ -1149,31 +1256,36 @@ impl ActionRunner {
                             }
                         }
                     } else if is_cmd_shift_d && front_app.eq_ignore_ascii_case("Mail") {
-                        match Self::mail_send_latest_message() {
-                            Ok(result) if result == "sent" => {
-                                let outgoing_after = Self::mail_outgoing_count().unwrap_or(-1);
-                                description = format!("Shortcut '{}' + {:?} (Mail sent)", key, modifiers);
-                                action_status_override = Some("success");
+                        match Self::mail_send_latest_message(Some(goal)) {
+                            Ok(raw_result) => {
+                                let (result, outgoing_before, parsed_after) =
+                                    Self::parse_mail_send_result(&raw_result);
+                                let outgoing_after = parsed_after
+                                    .unwrap_or_else(|| Self::mail_outgoing_count().unwrap_or(-1));
+                                if result == "sent_confirmed" {
+                                    description =
+                                        format!("Shortcut '{}' + {:?} (Mail sent)", key, modifiers);
+                                    action_status_override = Some("success");
+                                } else {
+                                    description = format!(
+                                        "Shortcut '{}' + {:?} (mail send blocked: {})",
+                                        key, modifiers, raw_result
+                                    );
+                                    action_status_override = Some("failed");
+                                }
                                 action_data = Some(json!({
                                     "proof": "mail_send",
-                                    "result": result,
+                                    "result": raw_result,
+                                    "send_status": result,
+                                    "outgoing_before": outgoing_before,
                                     "outgoing_after": outgoing_after
                                 }));
                             }
-                            Ok(result) => {
-                                description = format!(
-                                    "Shortcut '{}' + {:?} (mail send blocked: {})",
-                                    key, modifiers, result
-                                );
-                                action_status_override = Some("failed");
-                                action_data = Some(json!({
-                                    "proof": "mail_send",
-                                    "result": result
-                                }));
-                            }
                             Err(e) => {
-                                description =
-                                    format!("Shortcut '{}' + {:?} (mail send failed: {})", key, modifiers, e);
+                                description = format!(
+                                    "Shortcut '{}' + {:?} (mail send failed: {})",
+                                    key, modifiers, e
+                                );
                                 action_status_override = Some("failed");
                             }
                         }
@@ -1193,28 +1305,30 @@ impl ActionRunner {
                 }
             }
             "mail_send" => {
-                let front_app = crate::tool_chaining::CrossAppBridge::get_frontmost_app()
-                    .unwrap_or_default();
+                let front_app =
+                    crate::tool_chaining::CrossAppBridge::get_frontmost_app().unwrap_or_default();
                 if !front_app.eq_ignore_ascii_case("Mail") {
                     let _ = heuristics::ensure_app_focus("Mail", 3).await;
                 }
-                match Self::mail_send_latest_message() {
-                    Ok(result) if result == "sent" => {
-                        let outgoing_after = Self::mail_outgoing_count().unwrap_or(-1);
-                        description = "Mail send completed".to_string();
-                        action_status_override = Some("success");
+                match Self::mail_send_latest_message(Some(goal)) {
+                    Ok(raw_result) => {
+                        let (result, outgoing_before, parsed_after) =
+                            Self::parse_mail_send_result(&raw_result);
+                        let outgoing_after = parsed_after
+                            .unwrap_or_else(|| Self::mail_outgoing_count().unwrap_or(-1));
+                        if result == "sent_confirmed" {
+                            description = "Mail send completed".to_string();
+                            action_status_override = Some("success");
+                        } else {
+                            description = format!("Mail send blocked: {}", raw_result);
+                            action_status_override = Some("failed");
+                        }
                         action_data = Some(json!({
                             "proof": "mail_send",
-                            "result": result,
+                            "result": raw_result,
+                            "send_status": result,
+                            "outgoing_before": outgoing_before,
                             "outgoing_after": outgoing_after
-                        }));
-                    }
-                    Ok(result) => {
-                        description = format!("Mail send blocked: {}", result);
-                        action_status_override = Some("failed");
-                        action_data = Some(json!({
-                            "proof": "mail_send",
-                            "result": result
                         }));
                     }
                     Err(e) => {
@@ -1235,7 +1349,7 @@ impl ActionRunner {
                 let front_app =
                     crate::tool_chaining::CrossAppBridge::get_frontmost_app().unwrap_or_default();
                 if front_app.eq_ignore_ascii_case("Mail") {
-                    let _ = Self::mail_set_recipient_if_missing();
+                    let _ = Self::mail_set_recipient_if_missing(Some(goal));
                     let mut text = crate::tool_chaining::CrossAppBridge::get_clipboard()
                         .unwrap_or_else(|_| "".to_string());
                     let fallback = Self::mail_fallback_body_from_goal(goal);
@@ -1342,7 +1456,8 @@ impl ActionRunner {
                     match Self::notes_read_text() {
                         Ok(text) => {
                             if !text.trim().is_empty() {
-                                let _ = crate::tool_chaining::CrossAppBridge::copy_to_clipboard(&text);
+                                let _ =
+                                    crate::tool_chaining::CrossAppBridge::copy_to_clipboard(&text);
                             }
                             description = "Copied selection (notes scripted)".to_string();
                             action_status_override = Some("success");
@@ -1360,7 +1475,8 @@ impl ActionRunner {
                     match Self::textedit_read_text() {
                         Ok(text) => {
                             if !text.trim().is_empty() {
-                                let _ = crate::tool_chaining::CrossAppBridge::copy_to_clipboard(&text);
+                                let _ =
+                                    crate::tool_chaining::CrossAppBridge::copy_to_clipboard(&text);
                             }
                             description = "Copied selection (textedit scripted)".to_string();
                             action_status_override = Some("success");

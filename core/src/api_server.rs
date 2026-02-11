@@ -93,6 +93,13 @@ pub struct AgentExecuteResponse {
     #[serde(default)]
     pub manual_steps: Vec<String>,
     pub resume_from: Option<usize>,
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub planner_complete: bool,
+    #[serde(default)]
+    pub execution_complete: bool,
+    #[serde(default)]
+    pub business_complete: bool,
 }
 
 #[derive(Deserialize)]
@@ -187,6 +194,12 @@ pub struct VerificationRunsQuery {
 #[derive(Deserialize)]
 pub struct NLRunQuery {
     pub limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub struct TaskRunsQuery {
+    pub limit: Option<i64>,
+    pub status: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -433,6 +446,16 @@ pub async fn start_api_server(
         .route("/api/agent/approve", post(agent_approve_handler))
         .route("/api/agent/nl-runs", get(list_nl_runs_handler))
         .route("/api/agent/nl-metrics", get(nl_run_metrics_handler))
+        .route("/api/agent/task-runs", get(list_task_runs_handler))
+        .route("/api/agent/task-runs/:run_id", get(get_task_run_handler))
+        .route(
+            "/api/agent/task-runs/:run_id/stages",
+            get(list_task_stage_runs_handler),
+        )
+        .route(
+            "/api/agent/task-runs/:run_id/assertions",
+            get(list_task_stage_assertions_handler),
+        )
         .route(
             "/api/agent/approval-policies",
             get(list_nl_approval_policies).post(set_nl_approval_policy),
@@ -990,9 +1013,9 @@ async fn handle_chat(
                 }
             });
 
-            return Json(ChatResponse { 
-                response: "🚀 Vision 검증 데모(Smart Mode)를 시작합니다.\n(Google 접속 -> [검증] -> 키 입력 -> [검증])".to_string(), 
-                command: None 
+            return Json(ChatResponse {
+                response: "🚀 Vision 검증 데모(Smart Mode)를 시작합니다.\n(Google 접속 -> [검증] -> 키 입력 -> [검증])".to_string(),
+                command: None
             });
         }
     }
@@ -1090,7 +1113,7 @@ async fn handle_chat(
                             .unwrap_or(&message);
                         let prompt = prompt_str.to_string(); // Clone to owned String for async block
                         let response_msg = format!("🏗️ 자동화 워크플로우 생성을 시작합니다: '{}'\n(잠시만 기다려주세요...)", prompt);
-                        
+
                         // Spawn async task to handle creation (avoid blocking response)
                         let llm_clone = brain.clone();
                         tokio::spawn(async move {
@@ -1099,11 +1122,11 @@ async fn handle_chat(
                                     // 1. Get Credentials Context
                                     let creds = n8n.list_credentials().await.unwrap_or_default();
                                     let cred_context = creds.iter().map(|c| format!("{}:{}", c.name, c.id)).collect::<Vec<_>>().join(", ");
-                                    
+
                                     // Ensure server is running
                                     if let Err(e) = n8n.ensure_server_running().await {
                                         println!("⚠️ n8n Server Check Failed: {}", e);
-                                        // Try proceeding anyway? Or return? 
+                                        // Try proceeding anyway? Or return?
                                         // CLI fallback handles start, so we might be fine, but explicit check is good.
                                     }
 
@@ -1113,7 +1136,7 @@ async fn handle_chat(
                                     } else {
                                         format!("Available Credentials: {}", cred_context)
                                     };
-                                    
+
                                     let full_prompt = format!("Create a n8n workflow for: {}. {}", prompt, cred_str);
                                     match llm_clone.build_n8n_workflow(&full_prompt).await {
                                         Ok(json_str) => {
@@ -1135,7 +1158,7 @@ async fn handle_chat(
                                 Err(e) => println!("❌ n8n Client Error: {}", e),
                             }
                         });
-                        
+
                         response_msg
                     },
                     "create_routine" => {
@@ -1143,13 +1166,13 @@ async fn handle_chat(
                         if let Some(p) = params {
                             let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("New Routine");
                             let cron = p.get("cron").and_then(|v| v.as_str()).unwrap_or("* * * * *");
-                            
+
                             // Validate Cron
                             if std::str::FromStr::from_str(&cron as &str).map(|_: cron::Schedule| ()).is_err() {
                                 format!("❌ 잘못된 Cron 표현식입니다: {}", cron)
                             } else {
                                 let prompt = p.get("prompt").and_then(|v| v.as_str()).unwrap_or("Check status");
-                            
+
                             match crate::db::create_routine(name, cron, prompt) {
                                 Ok(_id) => format!("✅ 루틴이 등록되었습니다!\n• 이름: {}\n• 주기: {}\n• 명령: {}", name, cron, prompt),
                                 Err(e) => format!("❌ 루틴 등록 실패: {}", e),
@@ -1437,6 +1460,81 @@ async fn nl_run_metrics_handler(Query(query): Query<NLRunMetricsQuery>) -> Json<
     Json(metrics)
 }
 
+async fn list_task_runs_handler(
+    Query(query): Query<TaskRunsQuery>,
+) -> Json<Vec<db::TaskRunRecord>> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let status = query
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let runs = db::list_task_runs(limit, status).unwrap_or_default();
+    Json(runs)
+}
+
+async fn get_task_run_handler(Path(run_id): Path<String>) -> impl IntoResponse {
+    match db::get_task_run(&run_id) {
+        Ok(Some(run)) => (StatusCode::OK, Json(json!(run))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "task_run_not_found", "run_id": run_id })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "task_run_lookup_failed", "details": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn list_task_stage_runs_handler(Path(run_id): Path<String>) -> impl IntoResponse {
+    match db::get_task_run(&run_id) {
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "task_run_not_found", "run_id": run_id })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "task_run_lookup_failed", "details": e.to_string() })),
+        )
+            .into_response(),
+        Ok(Some(_)) => match db::list_task_stage_runs(&run_id) {
+            Ok(stages) => (StatusCode::OK, Json(json!(stages))).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "task_stage_runs_failed", "details": e.to_string() })),
+            )
+                .into_response(),
+        },
+    }
+}
+
+async fn list_task_stage_assertions_handler(Path(run_id): Path<String>) -> impl IntoResponse {
+    match db::get_task_run(&run_id) {
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "task_run_not_found", "run_id": run_id })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "task_run_lookup_failed", "details": e.to_string() })),
+        )
+            .into_response(),
+        Ok(Some(_)) => match db::list_task_stage_assertions(&run_id) {
+            Ok(assertions) => (StatusCode::OK, Json(json!(assertions))).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "task_stage_assertions_failed", "details": e.to_string() })),
+            )
+                .into_response(),
+        },
+    }
+}
+
 async fn list_nl_approval_policies(
     Query(query): Query<ApprovalPolicyQuery>,
 ) -> Json<Vec<ApprovalPolicyResponse>> {
@@ -1622,8 +1720,14 @@ async fn execute_goal_handler(
         // Spawn background task for OODA loop
         tokio::spawn(async move {
             let planner = crate::controller::planner::Planner::new(llm, None);
-            match planner.run_goal(&payload.goal, None).await {
-                Ok(_) => println!("✅ Goal Execution Success"),
+            match planner.run_goal_tracked(&payload.goal, None).await {
+                Ok(outcome) => println!(
+                    "✅ Goal Execution Success (run_id={}, planner={}, execution={}, business={})",
+                    outcome.run_id,
+                    outcome.planner_complete,
+                    outcome.execution_complete,
+                    outcome.business_complete
+                ),
                 Err(e) => println!("❌ Goal Execution Failed: {}", e),
             }
         });
@@ -1708,6 +1812,21 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
         )
             .into_response();
     };
+    let session = nl_store::find_session_by_plan(&payload.plan_id);
+    let run_intent = session
+        .as_ref()
+        .map(|s| s.intent.intent.as_str().to_string())
+        .unwrap_or_else(|| plan.intent.as_str().to_string());
+    let run_prompt = session
+        .as_ref()
+        .map(|s| s.prompt.clone())
+        .unwrap_or_else(|| format!("plan_id={}", payload.plan_id));
+    let run_id = format!(
+        "{}_{}",
+        payload.plan_id,
+        chrono::Utc::now().timestamp_millis()
+    );
+    let _ = db::create_task_run(&run_id, &run_intent, &run_prompt, "running");
 
     let mut resume_from = nl_store::get_plan_progress(&plan.plan_id).unwrap_or(0);
     if resume_from >= plan.steps.len() {
@@ -1774,23 +1893,163 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
     } else {
         nl_store::clear_plan_progress(&plan.plan_id);
     }
-    let session = nl_store::find_session_by_plan(&payload.plan_id);
+
+    let planner_complete = !plan.steps.is_empty();
+    let execution_complete = result.status == "completed";
+    let verification_ok = verify.ok;
+    let business_complete = planner_complete && execution_complete && verification_ok;
+
+    let planner_actual = planner_complete.to_string();
+    let execution_actual = execution_complete.to_string();
+    let verify_actual = verification_ok.to_string();
+    let business_actual = business_complete.to_string();
+
+    let _ = db::record_task_stage_run(
+        &run_id,
+        "planner",
+        1,
+        if planner_complete {
+            "completed"
+        } else {
+            "failed"
+        },
+        Some(&format!("plan_steps={}", plan.steps.len())),
+    );
+    let _ = db::record_task_stage_assertion(
+        &run_id,
+        "planner",
+        "plan_steps_non_empty",
+        "true",
+        &planner_actual,
+        planner_complete,
+        Some(&format!("plan_id={}", plan.plan_id)),
+    );
+    let _ = db::record_task_stage_run(
+        &run_id,
+        "execution",
+        2,
+        if execution_complete {
+            "completed"
+        } else {
+            result.status.as_str()
+        },
+        Some(&format!(
+            "manual_steps={} logs={}",
+            result.manual_steps.len(),
+            result.logs.len()
+        )),
+    );
+    let _ = db::record_task_stage_assertion(
+        &run_id,
+        "execution",
+        "status_completed",
+        "true",
+        &execution_actual,
+        execution_complete,
+        Some(result.status.as_str()),
+    );
+    let _ = db::record_task_stage_run(
+        &run_id,
+        "verification",
+        3,
+        if verification_ok {
+            "completed"
+        } else {
+            "failed"
+        },
+        Some(&format!("issues={}", verify.issues.join("; "))),
+    );
+    let _ = db::record_task_stage_assertion(
+        &run_id,
+        "verification",
+        "verify_ok",
+        "true",
+        &verify_actual,
+        verification_ok,
+        Some(&verify.issues.join("; ")),
+    );
+    let _ = db::record_task_stage_run(
+        &run_id,
+        "business",
+        4,
+        if business_complete {
+            "completed"
+        } else {
+            "failed"
+        },
+        Some("requires planner_complete && execution_complete && verify_ok"),
+    );
+    let _ = db::record_task_stage_assertion(
+        &run_id,
+        "business",
+        "business_complete",
+        "true",
+        &business_actual,
+        business_complete,
+        Some("planner_complete && execution_complete && verify_ok"),
+    );
+
+    if result.status == "completed" && !business_complete {
+        result.logs.push(
+            "Final status downgraded: planner/execution complete but business completion failed"
+                .to_string(),
+        );
+        result.status = "error".to_string();
+    }
+
+    let task_run_status = if business_complete {
+        "business_completed"
+    } else if matches!(
+        result.status.as_str(),
+        "manual_required" | "approval_required" | "blocked"
+    ) {
+        "business_incomplete"
+    } else {
+        "business_failed"
+    };
+
     let summary = extract_summary(&result.logs);
+    let details_json = serde_json::to_string(&result.logs).unwrap_or_default();
+    let _ = db::update_task_run_outcome(
+        &run_id,
+        planner_complete,
+        execution_complete,
+        business_complete,
+        task_run_status,
+        summary.as_deref(),
+        Some(&details_json),
+    );
+
+    let final_nl_status = if business_complete {
+        "completed".to_string()
+    } else if matches!(
+        result.status.as_str(),
+        "manual_required" | "approval_required" | "blocked"
+    ) {
+        result.status.clone()
+    } else {
+        "error".to_string()
+    };
+
     if let Some(state) = session {
         let _ = db::insert_nl_run(
             state.intent.intent.as_str(),
             &state.prompt,
-            &result.status,
+            &final_nl_status,
             summary.as_deref(),
-            Some(&serde_json::to_string(&result.logs).unwrap_or_default()),
+            Some(&details_json),
         );
     }
     let response = AgentExecuteResponse {
-        status: result.status,
+        status: final_nl_status,
         logs: result.logs,
         approval: result.approval,
         manual_steps: result.manual_steps,
         resume_from: result.resume_from,
+        run_id: Some(run_id),
+        planner_complete,
+        execution_complete,
+        business_complete,
     };
 
     (StatusCode::OK, Json(response)).into_response()
