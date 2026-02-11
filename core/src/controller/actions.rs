@@ -220,6 +220,27 @@ impl ActionRunner {
         quoted.first().cloned()
     }
 
+    fn preferred_run_scope_marker(goal: Option<&str>) -> Option<String> {
+        let goal_text = goal?.trim();
+        if goal_text.is_empty() {
+            return None;
+        }
+        for raw in goal_text.split_whitespace() {
+            let cleaned = raw.trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '"' | '\'' | ',' | '.' | ';' | ':' | ')' | '(' | ']' | '[' | '}' | '{'
+                )
+            });
+            if cleaned.starts_with("RUN_SCOPE_")
+                && cleaned.len() >= "RUN_SCOPE_00000000_000000".len()
+            {
+                return Some(cleaned.to_string());
+            }
+        }
+        None
+    }
+
     fn default_mail_recipient() -> Option<String> {
         let candidates = [
             "STEER_DEFAULT_MAIL_TO",
@@ -276,7 +297,13 @@ impl ActionRunner {
             "set _msg to last outgoing message",
             "set visible of _msg to true",
             "end if",
-            "if (count of to recipients of _msg) = 0 then",
+            "set hasTarget to false",
+            "repeat with r in to recipients of _msg",
+            "try",
+            "if (address of r as text) is toAddress then set hasTarget to true",
+            "end try",
+            "end repeat",
+            "if hasTarget is false then",
             "make new to recipient at end of to recipients of _msg with properties {address:toAddress}",
             "end if",
             "end tell",
@@ -308,12 +335,15 @@ impl ActionRunner {
     fn mail_send_latest_message(goal: Option<&str>) -> Result<String> {
         let fallback = Self::preferred_mail_recipient(goal).unwrap_or_default();
         let subject_hint = Self::preferred_mail_subject(goal).unwrap_or_default();
+        let marker_hint = Self::preferred_run_scope_marker(goal).unwrap_or_default();
         let lines = [
             "on run argv",
             "set fallbackAddress to \"\"",
             "set subjectHint to \"\"",
+            "set markerHint to \"\"",
             "if (count of argv) >= 1 then set fallbackAddress to item 1 of argv",
             "if (count of argv) >= 2 then set subjectHint to item 2 of argv",
+            "if (count of argv) >= 3 then set markerHint to item 3 of argv",
             "tell application \"Mail\"",
             "activate",
             "set beforeOutgoing to (count of outgoing messages)",
@@ -323,12 +353,22 @@ impl ActionRunner {
             "repeat with idx from beforeOutgoing to 1 by -1",
             "set candidate to item idx of outgoing messages",
             "set candidateSubject to \"\"",
+            "set candidateContent to \"\"",
             "try",
             "set candidateSubject to (subject of candidate as text)",
+            "end try",
+            "try",
+            "set candidateContent to (content of candidate as text)",
             "end try",
             "if candidateSubject is subjectHint then",
             "set _msg to candidate",
             "exit repeat",
+            "end if",
+            "if markerHint is not \"\" then",
+            "if candidateSubject contains markerHint or candidateContent contains markerHint then",
+            "set _msg to candidate",
+            "exit repeat",
+            "end if",
             "end if",
             "end repeat",
             "end if",
@@ -396,7 +436,8 @@ impl ActionRunner {
             "return \"sent_pending|\" & beforeOutgoing & \"|\" & afterOutgoing",
             "end run",
         ];
-        let out = crate::applescript::run_with_args(&lines, &[fallback, subject_hint])?;
+        let out =
+            crate::applescript::run_with_args(&lines, &[fallback, subject_hint, marker_hint])?;
         Ok(out.trim().to_string())
     }
 

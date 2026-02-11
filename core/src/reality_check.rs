@@ -1,16 +1,13 @@
 use anyhow::{anyhow, Result};
+use lazy_static::lazy_static;
 use log::{error, info};
 use std::collections::HashSet;
 use std::process::Command;
+use std::sync::Mutex;
 
-/// Global cache of installed applications (loaded once at startup)
-pub static mut INSTALLED_APPS: Option<HashSet<String>> = None;
-
-fn env_truthy(name: &str) -> bool {
-    matches!(
-        std::env::var(name).as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
-    )
+// Global cache of installed applications (loaded once at startup).
+lazy_static! {
+    static ref INSTALLED_APPS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 }
 
 /// 1. Environment Scanner: Scan installed apps via system_profiler
@@ -46,16 +43,16 @@ pub fn scan_app_inventory() -> Result<()> {
     apps.insert("safari".to_string());
     apps.insert("google chrome".to_string());
 
-    unsafe {
-        println!(
-            "✅ [Reality] Inventory Complete. Found {} apps.",
-            apps.len()
-        );
-        // Debug print a few apps
-        let sample: Vec<_> = apps.iter().take(5).collect();
-        println!("   Sample: {:?}", sample);
+    println!(
+        "✅ [Reality] Inventory Complete. Found {} apps.",
+        apps.len()
+    );
+    // Debug print a few apps
+    let sample: Vec<_> = apps.iter().take(5).collect();
+    println!("   Sample: {:?}", sample);
 
-        INSTALLED_APPS = Some(apps);
+    if let Ok(mut cache) = INSTALLED_APPS.lock() {
+        *cache = Some(apps);
     }
 
     Ok(())
@@ -63,30 +60,27 @@ pub fn scan_app_inventory() -> Result<()> {
 
 /// 2. Pre-Flight Check: App Existence
 pub fn verify_app_exists(app_name: &str) -> Result<String> {
-    unsafe {
-        if INSTALLED_APPS.is_none() {
-            println!("⚠️ [Reality] Inventory is NONE. Attempting lazy app scan...");
-            if let Err(e) = scan_app_inventory() {
-                println!("⚠️ [Reality] Lazy app scan failed: {}", e);
-            }
+    let has_cache = INSTALLED_APPS.lock().map(|c| c.is_some()).unwrap_or(false);
+    if !has_cache {
+        println!("⚠️ [Reality] Inventory is NONE. Attempting lazy app scan...");
+        if let Err(e) = scan_app_inventory() {
+            println!("⚠️ [Reality] Lazy app scan failed: {}", e);
         }
+    }
 
-        if let Some(ref apps) = INSTALLED_APPS {
+    if let Ok(cache) = INSTALLED_APPS.lock() {
+        if let Some(ref apps) = *cache {
             let target = app_name.to_lowercase();
-            // 1. Exact match
             if apps.contains(&target) {
                 return Ok(app_name.to_string());
             }
-            // 2. Partial match (e.g. "Microsoft Excel" vs "Excel")
-            // Iterate to find the *best* match (shortest string that contains target?)
-            // For now, first match.
             for installed in apps {
                 if installed.contains(&target) || target.contains(installed) {
                     println!(
                         "      ⚠️ [Reality] Fuzzy match: '{}' -> '{}'",
                         app_name, installed
                     );
-                    return Ok(installed.clone()); // Return the actual installed name
+                    return Ok(installed.clone());
                 }
             }
 
@@ -98,18 +92,14 @@ pub fn verify_app_exists(app_name: &str) -> Result<String> {
                 "HALLUCINATION DETECTED: Application '{}' is not installed on this machine.",
                 app_name
             ));
-        } else {
-            if env_truthy("STEER_REALITY_FAIL_OPEN") {
-                println!("⚠️ [Reality] Inventory is NONE. Failing Open due to STEER_REALITY_FAIL_OPEN=1.");
-                return Ok(app_name.to_string());
-            }
-            println!("❌ [Reality] Inventory unavailable. Failing closed by default.");
-            return Err(anyhow!(
-                "REALITY_CHECK_UNAVAILABLE: app inventory is unavailable; refusing to auto-open '{}'",
-                app_name
-            ));
         }
     }
+
+    println!("❌ [Reality] Inventory unavailable. Failing closed by default.");
+    Err(anyhow!(
+        "REALITY_CHECK_UNAVAILABLE: app inventory is unavailable; refusing to auto-open '{}'",
+        app_name
+    ))
 }
 
 /// 3. Pre-Flight Check: File Existence

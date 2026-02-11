@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 # Load environment variables
 if [ -f core/.env ]; then
@@ -39,6 +39,31 @@ MARKER_S4="RUN_SCOPE_S4_${TIMESTAMP}"
 MARKER_S5="RUN_SCOPE_S5_${TIMESTAMP}"
 CURRENT_SCENARIO_MARKER=""
 
+detect_cli_llm_provider() {
+    local preferred="${STEER_CLI_LLM_AUTO_ORDER:-codex,gemini,claude}"
+    local oldifs="$IFS"
+    IFS=','
+    read -r -a providers <<< "$preferred"
+    IFS="$oldifs"
+    for provider in "${providers[@]}"; do
+        local p
+        p="$(echo "$provider" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
+        [ -z "$p" ] && continue
+        if command -v "$p" >/dev/null 2>&1; then
+            printf '%s\n' "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if [ -z "$CLI_LLM_VALUE" ] && [ "${STEER_AUTO_DETECT_CLI_LLM:-1}" = "1" ]; then
+    if detected="$(detect_cli_llm_provider)"; then
+        CLI_LLM_VALUE="$detected"
+        echo "🤖 Auto-detected CLI LLM provider: ${CLI_LLM_VALUE}"
+    fi
+fi
+
 if [ "$REQUIRE_PRIMARY_PLANNER_VALUE" = "1" ] && [ "$SCENARIO_MODE_VALUE" = "1" ] && [ "${STEER_ALLOW_SCENARIO_MODE:-0}" != "1" ]; then
     echo "❌ 정책 위반: STEER_SCENARIO_MODE=1 이지만 STEER_ALLOW_SCENARIO_MODE=1 승인 없이 fallback 모드 실행은 금지됩니다."
     echo "   운영 검증은 STEER_SCENARIO_MODE=0으로 실행하거나, 테스트 목적일 때만 STEER_ALLOW_SCENARIO_MODE=1을 설정하세요."
@@ -51,7 +76,7 @@ echo "🧯 STEER_FAIL_ON_FALLBACK=${FAIL_ON_FALLBACK_VALUE} (1=mark failed on fa
 if [ -n "$CLI_LLM_VALUE" ]; then
     echo "🤖 STEER_CLI_LLM=${CLI_LLM_VALUE}"
 else
-echo "🤖 STEER_CLI_LLM=disabled (using default OpenAI path)"
+    echo "🤖 STEER_CLI_LLM=disabled (using default OpenAI path)"
 fi
 echo ""
 

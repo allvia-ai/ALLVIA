@@ -5,7 +5,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::{extract::State, http::StatusCode, routing::get, routing::post, Json, Router};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    routing::get,
+    routing::post,
+    Json, Router,
+};
 use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
 use local_os_agent::{db, privacy::PrivacyGuard, schema::EventEnvelope};
 use rusqlite::{params, Connection};
@@ -26,6 +32,7 @@ struct AppState {
     started_at: Instant,
     stats: Arc<Mutex<IngestStats>>,
     guard: Arc<PrivacyGuard>,
+    ingest_token: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +107,20 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(8080);
 
     let privacy_salt = std::env::var("PRIVACY_SALT").unwrap_or_else(|_| "default_salt".to_string());
+    let ingest_token = std::env::var("STEER_COLLECTOR_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("COLLECTOR_INGEST_TOKEN").ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let require_ingest_token = std::env::var("STEER_COLLECTOR_REQUIRE_TOKEN")
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(true);
+    if require_ingest_token && ingest_token.is_none() {
+        anyhow::bail!(
+            "collector_rs token is required. Set STEER_COLLECTOR_TOKEN (or COLLECTOR_INGEST_TOKEN) or set STEER_COLLECTOR_REQUIRE_TOKEN=0 for local-only dev."
+        );
+    }
 
     let db_path = resolve_db_path();
     let output_dir = PathBuf::from(
@@ -139,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
         started_at: Instant::now(),
         stats: Arc::new(Mutex::new(IngestStats::default())),
         guard: Arc::new(PrivacyGuard::new(privacy_salt)),
+        ingest_token,
     };
 
     let app = Router::new()
@@ -179,8 +201,19 @@ async fn stats_handler(State(state): State<AppState>) -> Json<StatsResponse> {
 
 async fn ingest_events_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    if !request_is_authorized(&state, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "status": "error",
+                "error": "unauthorized"
+            })),
+        );
+    }
+
     let events = match parse_events(payload) {
         Ok(events) => events,
         Err(msg) => {
@@ -251,6 +284,28 @@ async fn ingest_events_handler(
             "failed": failed
         })),
     )
+}
+
+fn request_is_authorized(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(expected) = state.ingest_token.as_ref() else {
+        return true;
+    };
+    if let Some(value) = headers
+        .get("x-collector-token")
+        .and_then(|v| v.to_str().ok())
+    {
+        if value == expected {
+            return true;
+        }
+    }
+    if let Some(value) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        if let Some(token) = value.strip_prefix("Bearer ") {
+            if token.trim() == expected {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn parse_events(payload: Value) -> Result<Vec<EventEnvelope>, String> {
@@ -776,6 +831,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
     use chrono::TimeZone;
 
     #[test]
@@ -791,5 +847,43 @@ mod tests {
         assert_eq!(infer_action_type("Button"), "click");
         assert_eq!(infer_action_type("Edit"), "type");
         assert_eq!(infer_action_type("Unknown"), "interact");
+    }
+
+    #[test]
+    fn request_auth_passes_without_configured_token() {
+        let state = AppState {
+            started_at: Instant::now(),
+            stats: Arc::new(Mutex::new(IngestStats::default())),
+            guard: Arc::new(PrivacyGuard::new("test-salt".to_string())),
+            ingest_token: None,
+        };
+        let headers = HeaderMap::new();
+        assert!(request_is_authorized(&state, &headers));
+    }
+
+    #[test]
+    fn request_auth_accepts_matching_header_token() {
+        let state = AppState {
+            started_at: Instant::now(),
+            stats: Arc::new(Mutex::new(IngestStats::default())),
+            guard: Arc::new(PrivacyGuard::new("test-salt".to_string())),
+            ingest_token: Some("secret".to_string()),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-collector-token", HeaderValue::from_static("secret"));
+        assert!(request_is_authorized(&state, &headers));
+    }
+
+    #[test]
+    fn request_auth_rejects_wrong_token() {
+        let state = AppState {
+            started_at: Instant::now(),
+            stats: Arc::new(Mutex::new(IngestStats::default())),
+            guard: Arc::new(PrivacyGuard::new("test-salt".to_string())),
+            ingest_token: Some("secret".to_string()),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-collector-token", HeaderValue::from_static("wrong"));
+        assert!(!request_is_authorized(&state, &headers));
     }
 }

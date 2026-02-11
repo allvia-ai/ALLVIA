@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 # Usage:
 #   ./run_nl_request_with_telegram.sh "자연어 요청" ["작업 이름"]
@@ -10,7 +10,12 @@ set -e
 # - Builds detailed Korean report
 # - Sends Telegram notification (with final sent text audit file)
 
-REQUEST_TEXT="$1"
+if [ "$#" -lt 1 ]; then
+    echo "Usage: $0 \"자연어 요청\" [\"작업 이름\"]"
+    exit 1
+fi
+
+REQUEST_TEXT="${1:-}"
 TASK_NAME="${2:-자연어 요청 실행}"
 REQUEST_TEXT_EXEC="$REQUEST_TEXT"
 REQUEST_TEXT_FOR_VERIFY="$REQUEST_TEXT"
@@ -233,6 +238,14 @@ extract_expected_tokens_from_request() {
             }
         '
     } | awk '!seen[$0]++'
+}
+
+extract_expected_tokens_override() {
+    local raw="${STEER_SEMANTIC_EXPECT:-}"
+    [ -z "$raw" ] && return 0
+    printf '%s\n' "$raw" | perl -pe 's/\|\|/\n/g' \
+        | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
+        | awk 'NF > 0 && !seen[$0]++'
 }
 
 is_noise_token() {
@@ -564,6 +577,31 @@ REQUIRE_PRIMARY_PLANNER_VALUE="${STEER_REQUIRE_PRIMARY_PLANNER:-1}"
 LOCK_DISABLED_VALUE="${STEER_LOCK_DISABLED:-0}"
 RUN_SCOPE_ENABLED="${STEER_SEMANTIC_RUN_SCOPE:-1}"
 
+detect_cli_llm_provider() {
+    local preferred="${STEER_CLI_LLM_AUTO_ORDER:-codex,gemini,claude}"
+    local oldifs="$IFS"
+    IFS=','
+    read -r -a providers <<< "$preferred"
+    IFS="$oldifs"
+    for provider in "${providers[@]}"; do
+        local p
+        p="$(echo "$provider" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
+        [ -z "$p" ] && continue
+        if command -v "$p" >/dev/null 2>&1; then
+            printf '%s\n' "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if [ -z "$CLI_LLM_VALUE" ] && [ "${STEER_AUTO_DETECT_CLI_LLM:-1}" = "1" ]; then
+    if detected="$(detect_cli_llm_provider)"; then
+        CLI_LLM_VALUE="$detected"
+        echo "🤖 Auto-detected CLI LLM provider: ${CLI_LLM_VALUE}"
+    fi
+fi
+
 if [ "$RUN_SCOPE_ENABLED" = "1" ]; then
     RUN_SCOPE_MARKER="RUN_SCOPE_${TS}"
     REQUEST_TEXT_EXEC="${REQUEST_TEXT} 마지막 줄에 \"${RUN_SCOPE_MARKER}\"를 정확히 입력하세요."
@@ -742,9 +780,22 @@ SEMANTIC_LINES=""
 FILTERED_TOKENS=()
 if [ "${STEER_SEMANTIC_VERIFY:-1}" = "1" ]; then
     RAW_TOKENS=()
+    RAW_TOKEN_STREAM=""
     while IFS= read -r token; do
-        RAW_TOKENS+=("$token")
+        [ -z "$token" ] && continue
+        RAW_TOKEN_STREAM="${RAW_TOKEN_STREAM}${token}"$'\n'
     done < <(extract_expected_tokens_from_request)
+    while IFS= read -r token; do
+        [ -z "$token" ] && continue
+        RAW_TOKEN_STREAM="${RAW_TOKEN_STREAM}${token}"$'\n'
+    done < <(extract_expected_tokens_override)
+    if [ -n "$RUN_SCOPE_MARKER" ]; then
+        RAW_TOKEN_STREAM="${RAW_TOKEN_STREAM}${RUN_SCOPE_MARKER}"$'\n'
+    fi
+    while IFS= read -r token; do
+        [ -z "$token" ] && continue
+        RAW_TOKENS+=("$token")
+    done < <(printf '%s' "$RAW_TOKEN_STREAM" | awk 'NF > 0 && !seen[$0]++')
     FILTERED_TOKENS=()
     for token in "${RAW_TOKENS[@]}"; do
         [ -z "$token" ] && continue

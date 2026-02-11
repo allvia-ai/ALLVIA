@@ -525,15 +525,20 @@ impl N8nApi {
             ));
         }
 
+        let import_marker = format!("steer-import-{}", uuid::Uuid::new_v4());
+
         // 5. Run CLI Import
         let ids_before_cli = self.list_workflow_ids_by_name(name).unwrap_or_default();
-        if let Err(e) = self.create_workflow_cli(name, &normalized, active).await {
+        if let Err(e) = self
+            .create_workflow_cli(name, &normalized, active, &import_marker)
+            .await
+        {
             return Err(anyhow::anyhow!("❌ CLI Fallback Failed: {}", e));
         }
 
         // 6. Retrieve ID from DB:
-        // Since CLI doesn't return workflow ID, diff IDs before/after import to avoid name collisions.
-        self.retrieve_workflow_id_by_name(name, &ids_before_cli)
+        // Since CLI doesn't return workflow ID, prefer steer import marker, then diff IDs.
+        self.retrieve_workflow_id(name, &ids_before_cli, &import_marker)
     }
 
     async fn create_workflow_api(
@@ -605,11 +610,21 @@ impl N8nApi {
         name: &str,
         workflow_json: &Value,
         active: bool,
+        import_marker: &str,
     ) -> Result<String> {
         // Prepare JSON file
         let mut final_json = workflow_json.clone();
         final_json["name"] = json!(name);
         final_json["active"] = json!(active);
+        let mut settings = final_json
+            .get("settings")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        if !settings.is_object() {
+            settings = json!({});
+        }
+        settings["steerImportId"] = json!(import_marker);
+        final_json["settings"] = settings;
 
         // Ensure nodes exist
         if final_json["nodes"].as_array().is_none_or(|n| n.is_empty()) {
@@ -669,8 +684,39 @@ impl N8nApi {
         Ok(ids)
     }
 
-    // Helper to find ID after CLI import
-    fn retrieve_workflow_id_by_name(&self, name: &str, before_ids: &[String]) -> Result<String> {
+    fn list_workflow_ids_by_import_marker(&self, import_marker: &str) -> Result<Vec<String>> {
+        use rusqlite::Connection;
+        let home = std::env::var("HOME").unwrap_or("/".to_string());
+        let db_path = format!("{}/.n8n/database.sqlite", home);
+
+        let conn = Connection::open(db_path)?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM workflow_entity WHERE settings LIKE ?1 ORDER BY updatedAt DESC LIMIT 20",
+        )?;
+        let like_pattern = format!("%{}%", import_marker);
+        let mut rows = stmt.query([like_pattern])?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next()? {
+            ids.push(row.get::<usize, String>(0)?);
+        }
+        Ok(ids)
+    }
+
+    // Helper to find ID after CLI import.
+    fn retrieve_workflow_id(
+        &self,
+        name: &str,
+        before_ids: &[String],
+        import_marker: &str,
+    ) -> Result<String> {
+        if !import_marker.trim().is_empty() {
+            if let Ok(marker_ids) = self.list_workflow_ids_by_import_marker(import_marker) {
+                if let Some(id) = marker_ids.first() {
+                    return Ok(id.clone());
+                }
+            }
+        }
+
         let ids = self.list_workflow_ids_by_name(name)?;
         if ids.is_empty() {
             return Err(anyhow::anyhow!("Could not find imported workflow ID in DB"));

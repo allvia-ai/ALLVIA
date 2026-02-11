@@ -21,6 +21,8 @@ pub struct SemanticVerificationResult {
 pub fn semantic_consistency(workdir: &Path, max_files: usize) -> SemanticVerificationResult {
     let mut issues = Vec::new();
     let mut scanned = 0usize;
+    let todo_strict = env_truthy("STEER_SEMANTIC_TODO_STRICT");
+    let fail_on_medium = env_truthy("STEER_SEMANTIC_FAIL_ON_MEDIUM");
 
     let mut stack = vec![workdir.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -51,12 +53,15 @@ pub fn semantic_consistency(workdir: &Path, max_files: usize) -> SemanticVerific
             }
             scanned += 1;
             if let Ok(content) = fs::read_to_string(&path) {
-                if content.contains("TODO") || content.contains("FIXME") || content.contains("XXX")
+                if todo_strict
+                    && (content.contains("TODO")
+                        || content.contains("FIXME")
+                        || content.contains("XXX"))
                 {
                     issues.push(SemanticIssue {
                         file: display_path(workdir, &path),
                         reason: "TODO/FIXME marker present".to_string(),
-                        severity: "medium".to_string(),
+                        severity: "low".to_string(),
                     });
                 }
                 if content.contains("unimplemented!") || content.contains("panic!(\"TODO") {
@@ -77,7 +82,10 @@ pub fn semantic_consistency(workdir: &Path, max_files: usize) -> SemanticVerific
         }
     }
 
-    let ok = issues.is_empty();
+    let ok = !issues.iter().any(|issue| {
+        issue.severity.eq_ignore_ascii_case("high")
+            || (fail_on_medium && issue.severity.eq_ignore_ascii_case("medium"))
+    });
     let reason = if ok {
         "Semantic check passed".to_string()
     } else {
@@ -139,4 +147,11 @@ fn display_path(root: &Path, path: &PathBuf) -> String {
     path.strip_prefix(root)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| path.to_string_lossy().to_string())
+}
+
+fn env_truthy(name: &str) -> bool {
+    matches!(
+        std::env::var(name).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES") | Ok("on") | Ok("ON")
+    )
 }

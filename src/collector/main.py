@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import signal
 import threading
 import time
@@ -122,7 +123,8 @@ class IngestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _set_cors_headers(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
+        cors_origin = os.environ.get("COLLECTOR_CORS_ORIGIN", "http://localhost")
+        self.send_header("Access-Control-Allow-Origin", cors_origin)
         self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Collector-Token")
 
@@ -169,6 +171,16 @@ def parse_args() -> argparse.Namespace:
 def run() -> None:
     args = parse_args()
     config = load_config(args.config)
+    require_token = os.environ.get("COLLECTOR_REQUIRE_TOKEN", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if config.ingest.enabled and require_token and not config.ingest.token:
+        raise RuntimeError(
+            "ingest token is required. Set ingest.token in config or export COLLECTOR_REQUIRE_TOKEN=0 for local-only development."
+        )
     setup_logging(
         config.log_level,
         log_dir=config.logging.dir,

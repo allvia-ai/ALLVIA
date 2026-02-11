@@ -54,28 +54,6 @@ lazy_static! {
         "> /dev/sda",
     ];
 
-    /// Commands that require approval
-    static ref APPROVAL_PATTERNS: Vec<&'static str> = vec![
-        "sudo",
-        "rm -rf",
-        "rm -r",
-        "chmod",
-        "chown",
-        "kill -9",
-        "killall",
-        "shutdown",
-        "reboot",
-        "passwd",
-        "curl | sh",
-        "curl | bash",
-        "wget | sh",
-        "pip install",
-        "npm install -g",
-        "brew install",
-        "apt install",
-        "apt-get install",
-    ];
-
     /// Safe commands (always auto-approve)
     static ref SAFE_BINS: HashSet<&'static str> = {
         let mut set = HashSet::new();
@@ -99,6 +77,17 @@ lazy_static! {
         set.insert("diff");
         set.insert("env");
         set.insert("printenv");
+        set
+    };
+    /// JSON actions that are read-only/low-risk and can auto-pass by default.
+    static ref SAFE_NON_SHELL_ACTIONS: HashSet<&'static str> = {
+        let mut set = HashSet::new();
+        set.insert("snapshot");
+        set.insert("read");
+        set.insert("read_clipboard");
+        set.insert("extract");
+        set.insert("wait");
+        set.insert("done");
         set
     };
 
@@ -137,6 +126,63 @@ impl ApprovalGate {
             || compact.contains('`')
     }
 
+    fn command_words(cmd: &str) -> Vec<String> {
+        cmd.split_whitespace()
+            .map(|part| {
+                part.trim_matches(|c: char| {
+                    matches!(c, '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',')
+                })
+                .to_lowercase()
+            })
+            .filter(|part| !part.is_empty())
+            .collect()
+    }
+
+    fn command_binary(words: &[String]) -> String {
+        let Some(first) = words.first() else {
+            return String::new();
+        };
+        std::path::Path::new(first)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(first)
+            .to_string()
+    }
+
+    fn requires_approval_by_tokens(binary: &str, words: &[String]) -> bool {
+        if binary.is_empty() {
+            return true;
+        }
+        if matches!(
+            binary,
+            "sudo"
+                | "rm"
+                | "chmod"
+                | "chown"
+                | "kill"
+                | "killall"
+                | "shutdown"
+                | "reboot"
+                | "passwd"
+                | "curl"
+                | "wget"
+        ) {
+            return true;
+        }
+        if matches!(
+            binary,
+            "apt" | "apt-get" | "brew" | "pip" | "pip3" | "npm" | "cargo"
+        ) && words.iter().skip(1).any(|w| {
+            matches!(
+                w.as_str(),
+                "install" | "i" | "upgrade" | "remove" | "uninstall" | "global" | "-g"
+            )
+        }) {
+            return true;
+        }
+        false
+    }
+
     /// Check if a command requires approval, is blocked, or can auto-run
     pub fn check_command(cmd: &str) -> ApprovalLevel {
         let cmd_lower = cmd.to_lowercase();
@@ -154,20 +200,15 @@ impl ApprovalGate {
             return ApprovalLevel::RequireApproval;
         }
 
-        // 3. Check approval patterns
-        for pattern in APPROVAL_PATTERNS.iter() {
-            if cmd_lower.contains(pattern) {
-                return ApprovalLevel::RequireApproval;
-            }
+        // 3. Token-aware command classification.
+        let words = Self::command_words(cmd_trimmed);
+        let binary_name = Self::command_binary(&words);
+        if Self::requires_approval_by_tokens(&binary_name, &words) {
+            return ApprovalLevel::RequireApproval;
         }
 
-        // 4. Check if it's a safe binary (simple single command only).
-        let first_word = cmd_trimmed.split_whitespace().next().unwrap_or("");
-        let binary_name = std::path::Path::new(first_word)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(first_word);
-        if SAFE_BINS.contains(binary_name) {
+        // 4. Safe read-only binaries.
+        if SAFE_BINS.contains(binary_name.as_str()) {
             return ApprovalLevel::AutoApprove;
         }
 
@@ -282,6 +323,36 @@ mod tests {
     }
 
     #[test]
+    fn test_token_aware_classification_avoids_false_positive_contains() {
+        assert_eq!(
+            ApprovalGate::check_command("echo sudo is blocked"),
+            ApprovalLevel::AutoApprove
+        );
+    }
+
+    #[test]
+    fn test_package_install_requires_approval() {
+        assert_eq!(
+            ApprovalGate::check_command("npm install -g pnpm"),
+            ApprovalLevel::RequireApproval
+        );
+        assert_eq!(
+            ApprovalGate::check_command("cargo install ripgrep"),
+            ApprovalLevel::RequireApproval
+        );
+    }
+
+    #[test]
+    fn test_unknown_json_action_requires_approval() {
+        reset_decisions();
+        let plan = test_plan("plan-unknown-action");
+        let action = r#"{"action":"open_app","name":"Safari"}"#;
+        let decision = preview_approval(action, &plan);
+        assert_eq!(decision.status, "pending");
+        assert!(decision.requires_approval);
+    }
+
+    #[test]
     fn test_safe_bin_with_shell_features_requires_approval() {
         assert_eq!(
             ApprovalGate::check_command("echo hello > /tmp/a.txt"),
@@ -381,7 +452,7 @@ pub fn register_decision(decision: &str, action: &str, plan: &crate::nl_automati
         );
         return;
     };
-    let ttl = decision_ttl();
+    let ttl = decision_ttl_for(decision);
     let key = decision_key(&plan.plan_id, action);
     let entry = DecisionEntry {
         status,
@@ -453,6 +524,7 @@ pub fn preview_approval(action: &str, plan: &crate::nl_automation::Plan) -> Appr
             .get("action")
             .and_then(|a| a.as_str())
             .unwrap_or("unknown");
+        let action_type_lc = action_type.trim().to_lowercase();
 
         if action_type == "shell" || action_type == "run_shell" {
             if let Some(cmd) = parsed.get("command").and_then(|c| c.as_str()) {
@@ -476,12 +548,22 @@ pub fn preview_approval(action: &str, plan: &crate::nl_automation::Plan) -> Appr
             }
         }
 
+        if SAFE_NON_SHELL_ACTIONS.contains(action_type_lc.as_str()) {
+            return ApprovalDecision {
+                status: "approved".to_string(),
+                risk_level: "low".to_string(),
+                policy: "default".to_string(),
+                message: format!("Action: {}", action_type),
+                requires_approval: false,
+            };
+        }
+
         return ApprovalDecision {
-            status: "approved".to_string(),
-            risk_level: "low".to_string(),
+            status: "pending".to_string(),
+            risk_level: "high".to_string(),
             policy: "default".to_string(),
-            message: format!("Action: {}", action_type),
-            requires_approval: false,
+            message: format!("Action requires explicit approval: {}", action_type),
+            requires_approval: true,
         };
     }
 
@@ -492,12 +574,22 @@ pub fn preview_approval(action: &str, plan: &crate::nl_automation::Plan) -> Appr
         || trimmed.contains(';')
         || trimmed.starts_with("sudo");
     if !looks_like_shell {
+        let action_lc = trimmed.to_lowercase();
+        if matches!(action_lc.as_str(), "done" | "continue" | "next" | "skip") {
+            return ApprovalDecision {
+                status: "approved".to_string(),
+                risk_level: "low".to_string(),
+                policy: "default".to_string(),
+                message: format!("Action: {}", action),
+                requires_approval: false,
+            };
+        }
         return ApprovalDecision {
-            status: "approved".to_string(),
-            risk_level: "low".to_string(),
+            status: "pending".to_string(),
+            risk_level: "high".to_string(),
             policy: "default".to_string(),
-            message: format!("Action: {}", action),
-            requires_approval: false,
+            message: format!("Action requires explicit approval: {}", action),
+            requires_approval: true,
         };
     }
 
@@ -566,6 +658,18 @@ fn decision_ttl() -> std::time::Duration {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(600);
     Duration::from_secs(ttl_seconds)
+}
+
+fn decision_ttl_for(decision: &str) -> std::time::Duration {
+    let normalized = decision.trim().to_lowercase();
+    if matches!(normalized.as_str(), "allow-always" | "allow_always") {
+        let ttl_seconds = std::env::var("STEER_APPROVAL_ALLOW_ALWAYS_TTL_SECONDS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60 * 60 * 24 * 30);
+        return Duration::from_secs(ttl_seconds);
+    }
+    decision_ttl()
 }
 
 fn cleanup_expired_decisions_locked(registry: &mut HashMap<String, DecisionEntry>) {

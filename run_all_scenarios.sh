@@ -1,8 +1,13 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 # Load environment variables
-export $(cat core/.env | xargs)
+if [ -f core/.env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source core/.env
+    set +a
+fi
 
 echo "🚀 Starting Advanced Scenarios 1-5 Execution..."
 echo "⚠️  PLEASE DO NOT TOUCH THE MOUSE/KEYBOARD DURING EXECUTION"
@@ -87,7 +92,21 @@ if ! preflight_checks; then
 fi
 
 # Send initial notification
-./send_telegram_notification.sh "🚀 시나리오 실행 시작"
+send_telegram_safe() {
+    if [ ! -x ./send_telegram_notification.sh ] && [ ! -f ./send_telegram_notification.sh ]; then
+        echo "ℹ️ Telegram notifier not found, skipping send."
+        return 0
+    fi
+    if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+        echo "ℹ️ Telegram env missing, skipping send."
+        return 0
+    fi
+    if ! bash ./send_telegram_notification.sh "$@"; then
+        echo "⚠️ Telegram send failed (continuing)."
+    fi
+}
+
+send_telegram_safe "🚀 시나리오 실행 시작"
 
 # Create output directory for results
 mkdir -p scenario_results
@@ -104,34 +123,40 @@ capture_and_notify() {
     local screenshot="scenario_results/scenario_${scenario_num}_${TIMESTAMP}.png"
     screencapture -x "$screenshot"
     
-    # Extract meaningful info from log
     local result_info=""
-    if grep -q "✅" "$log_file" 2>/dev/null; then
-        result_info="작업 완료"
-    elif grep -q "❌" "$log_file" 2>/dev/null; then
-        result_info="실행 중 오류 발생"
-    else
-        result_info="실행됨"
-    fi
-    
+    local key_line=""
+    key_line="$(grep -En "Goal completed by planner|Surf failed|Supervisor escalated|Execution Error|PLAN_REJECTED|LLM Refused|fallback action|FALLBACK_ACTION:" "$log_file" 2>/dev/null | tail -n 1 | sed -E 's/^[0-9]+://')"
+
     # Send clean notification
     if [ "$status" = "success" ]; then
+        result_info="작업 완료"
+        if [ -n "$key_line" ]; then
+            result_info="${result_info} (${key_line})"
+        fi
         local message="✅ *시나리오 ${scenario_num}: ${scenario_name}*
 
 상태: 성공
 결과: ${result_info}
 시간: $(date '+%H:%M:%S')"
     else
+        result_info="실행 중 오류 발생"
+        if [ -n "$key_line" ]; then
+            result_info="${result_info} (${key_line})"
+        fi
         local message="❌ *시나리오 ${scenario_num}: ${scenario_name}*
 
 상태: 실패
+결과: ${result_info}
 시간: $(date '+%H:%M:%S')
 
 로그 확인: scenario_results/scenario_${scenario_num}_${TIMESTAMP}.log"
     fi
     
-    ./send_telegram_notification.sh "$message" "$screenshot"
+    send_telegram_safe "$message" "$screenshot"
 }
+
+SUCCESS_COUNT=0
+TOTAL_COUNT=0
 
 # Scenario 1: Calendar
 echo "---------------------------------------------------"
@@ -140,11 +165,13 @@ LOG_FILE="scenario_results/scenario_1_${TIMESTAMP}.log"
 echo "Goal: 'Check my calendar for today and tell me the first event.'"
 if cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "Check my calendar for today and tell me the first event." &> "$LOG_FILE"; then
     echo "✅ Scenario 1 Complete."
+    SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
     capture_and_notify 1 "캘린더 확인" "success" "$LOG_FILE"
 else
     echo "❌ Scenario 1 Failed."
     capture_and_notify 1 "캘린더 확인" "failed" "$LOG_FILE"
 fi
+TOTAL_COUNT=$((TOTAL_COUNT + 1))
 sleep 5
 
 # Scenario 2: Meeting Summary
@@ -154,11 +181,13 @@ LOG_FILE="scenario_results/scenario_2_${TIMESTAMP}.log"
 echo "Goal: 'Open Notes app, create a new note titled 'Daily Standup', and write 'All systems go'.'"
 if cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "Open Notes app, create a new note titled 'Daily Standup', and write 'All systems go'." &> "$LOG_FILE"; then
     echo "✅ Scenario 2 Complete."
+    SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
     capture_and_notify 2 "회의 요약 작성" "success" "$LOG_FILE"
 else
     echo "❌ Scenario 2 Failed."
     capture_and_notify 2 "회의 요약 작성" "failed" "$LOG_FILE"
 fi
+TOTAL_COUNT=$((TOTAL_COUNT + 1))
 sleep 5
 
 # Scenario 3: Research
@@ -168,11 +197,13 @@ LOG_FILE="scenario_results/scenario_3_${TIMESTAMP}.log"
 echo "Goal: 'Open Safari, search for 'DeepSeek R1', and tell me what it is.'"
 if cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "Open Safari, search for 'DeepSeek R1', and tell me what it is." &> "$LOG_FILE"; then
     echo "✅ Scenario 3 Complete."
+    SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
     capture_and_notify 3 "웹 검색" "success" "$LOG_FILE"
 else
     echo "❌ Scenario 3 Failed."
     capture_and_notify 3 "웹 검색" "failed" "$LOG_FILE"
 fi
+TOTAL_COUNT=$((TOTAL_COUNT + 1))
 sleep 5
 
 # Scenario 4: Finder Navigation
@@ -182,11 +213,13 @@ LOG_FILE="scenario_results/scenario_4_${TIMESTAMP}.log"
 echo "Goal: 'Open Finder, list the files in the Downloads folder, and read the first filename.'"
 if cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "Open Finder, list the files in the Downloads folder, and read the first filename." &> "$LOG_FILE"; then
     echo "✅ Scenario 4 Complete."
+    SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
     capture_and_notify 4 "Finder 탐색" "success" "$LOG_FILE"
 else
     echo "❌ Scenario 4 Failed."
     capture_and_notify 4 "Finder 탐색" "failed" "$LOG_FILE"
 fi
+TOTAL_COUNT=$((TOTAL_COUNT + 1))
 sleep 5
 
 # Scenario 5: Complex Workflow
@@ -196,20 +229,22 @@ LOG_FILE="scenario_results/scenario_5_${TIMESTAMP}.log"
 echo "Goal: 'Open Safari, check the current stock price of Apple (AAPL), then open Notes and record it.'"
 if cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "Open Safari, check the current stock price of Apple (AAPL), then open Notes and record it." &> "$LOG_FILE"; then
     echo "✅ Scenario 5 Complete."
+    SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
     capture_and_notify 5 "복합 워크플로우" "success" "$LOG_FILE"
 else
     echo "❌ Scenario 5 Failed."
     capture_and_notify 5 "복합 워크플로우" "failed" "$LOG_FILE"
 fi
+TOTAL_COUNT=$((TOTAL_COUNT + 1))
 
 echo ""
 echo "🎉 All 5 Scenarios Executed."
 
-# Send final summary with counts
-SUCCESS_COUNT=$(ls scenario_results/*${TIMESTAMP}.log 2>/dev/null | wc -l | tr -d ' ')
+# Send final summary with judged counts
 SUMMARY="🎉 *전체 시나리오 실행 완료*
 
-총 ${SUCCESS_COUNT}개 시나리오 실행됨
+총 ${TOTAL_COUNT}개 실행
+성공 ${SUCCESS_COUNT}개 / 실패 $((TOTAL_COUNT - SUCCESS_COUNT))개
 결과: scenario_results/ 폴더 확인"
 
-./send_telegram_notification.sh "$SUMMARY"
+send_telegram_safe "$SUMMARY"
