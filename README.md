@@ -92,6 +92,83 @@ core/src/
 cargo test
 ```
 
+## 📡 데이터 수집/패턴 모니터링 (steer/jy 병합)
+
+`steer/jy`의 데이터 수집 파이프라인을 현재 저장소에 통합했습니다.
+
+- Collector core: `src/collector/`
+- OS sensors: `src/sensors/`
+- Runtime config: `configs/config.yaml`, `configs/config_run2.yaml`
+- DB migrations: `migrations/*.sql`
+- Rust batch bins: `build_sessions_rs`, `build_routines_rs`, `build_handoff_rs`
+- Python batch entrypoints(호환 유지, 내부 Rust 라우팅): `scripts/build_sessions.py`, `scripts/build_routines.py`, `scripts/build_handoff.py`
+- Legacy Python originals: `scripts/legacy/*.py`
+
+빠른 시작:
+
+```bash
+python -m pip install -r requirements-collector.txt
+PYTHONPATH=src python scripts/init_db.py --config configs/config.yaml
+PYTHONPATH=src python -m collector.main --config configs/config.yaml
+```
+
+패턴 분석/모니터링 배치(Rust 권장):
+
+```bash
+cargo build --manifest-path core/Cargo.toml \
+  --bin build_sessions_rs --bin build_routines_rs --bin build_handoff_rs
+STEER_DB_PATH=./steer.db ./core/target/debug/build_sessions_rs --since-hours 6 --use-state
+STEER_DB_PATH=./steer.db ./core/target/debug/build_routines_rs --days 3 --min-support 2 --use-state
+STEER_DB_PATH=./steer.db ./core/target/debug/build_handoff_rs --skip-unchanged --keep-latest-pending
+# 또는 3단계 일괄 실행
+bash scripts/run_pipeline_rs.sh configs/config.yaml
+```
+
+Python 호환 경로(동일 인자, 내부적으로 Rust 바이너리 호출):
+
+```bash
+python scripts/build_sessions.py --since-hours 6 --use-state
+python scripts/build_routines.py --days 3 --min-support 2 --use-state
+python scripts/build_handoff.py --skip-unchanged --keep-latest-pending
+PYTHONPATH=src python scripts/print_stats.py --config configs/config.yaml
+```
+
+## 🦀 Rust Collector (권장 기본 경로)
+
+Python collector 대신 Rust 단일 바이너리로 수집/보안필터/집약을 실행할 수 있습니다.
+
+- Binary: `/Users/david/Desktop/python/github/Allrounder/Steer/local-os-agent/core/src/bin/collector_rs.rs`
+- Endpoints: `POST /events`, `GET /health`, `GET /stats`
+- Built-in jobs:
+  - 시작 시 패턴 워크플로우 생성 (`workflows/workflow_YYYY-MM-DD.json`)
+  - 5분 단위 집약 (`minute_aggregates`)
+  - 일일 요약 갱신 (`daily_summaries`)
+  - retention cleanup (`events_v2`, `minute_aggregates`)
+
+실행:
+
+```bash
+cargo build --manifest-path core/Cargo.toml --bin collector_rs
+STEER_DB_PATH=./steer.db STEER_COLLECTOR_PORT=8080 ./core/target/debug/collector_rs
+# 또는 (기본 Rust 경로)
+bash scripts/run_local.sh
+```
+
+주요 환경변수:
+
+- `STEER_COLLECTOR_HOST` (default: `127.0.0.1`)
+- `STEER_COLLECTOR_PORT` (default: `8080`)
+- `STEER_COLLECTOR_AGG_INTERVAL_SEC` (default: `300`)
+- `STEER_COLLECTOR_RAW_RETENTION_DAYS` (default: `7`)
+- `STEER_COLLECTOR_SUMMARY_RETENTION_DAYS` (default: `30`)
+- `STEER_STARTUP_MIN_EVENTS` (default: `100`)
+- `STEER_STARTUP_PATTERN_THRESHOLD` (default: `3`)
+- `STEER_WORKFLOW_OUTPUT_DIR` (default: `workflows`)
+- `STEER_DB_PATH` (collector/pipeline 공통 DB 경로)
+- `STEER_PRIVACY_RULES_PATH` (handoff privacy rules 경로 override)
+
+Windows 서비스 실행(`scripts/run_core.ps1`)은 기본값이 `-CollectorImpl rust`입니다.
+
 ## 📜 라이선스
 
 MIT License

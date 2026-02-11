@@ -42,6 +42,7 @@ pub mod shell_analysis;
 pub mod visual_driver;
 pub mod workflow_schema;
 
+pub mod collector_pipeline;
 pub mod command_queue;
 pub mod context_pruning;
 pub mod project_scanner;

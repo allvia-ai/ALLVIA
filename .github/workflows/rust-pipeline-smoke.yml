@@ -1,0 +1,44 @@
+name: Rust Pipeline Smoke
+
+on:
+  push:
+    branches:
+      - main
+      - steer/develop
+      - steer/dy
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      - name: Build Rust pipeline binaries
+        run: |
+          cargo build --manifest-path core/Cargo.toml \
+            --bin collector_rs \
+            --bin build_sessions_rs \
+            --bin build_routines_rs \
+            --bin build_handoff_rs
+
+      - name: Unit tests (collector pipeline)
+        run: cargo test --manifest-path core/Cargo.toml collector_pipeline -- --nocapture
+
+      - name: Smoke run (empty db)
+        env:
+          STEER_DB_PATH: /tmp/steer_ci.db
+        run: |
+          ./core/target/debug/build_sessions_rs --since-hours 1 --use-state --dry-run
+          ./core/target/debug/build_routines_rs --days 1 --min-support 1 --use-state --dry-run
+          ./core/target/debug/build_handoff_rs --dry-run
+          bash scripts/run_pipeline_rs.sh configs/config.yaml
