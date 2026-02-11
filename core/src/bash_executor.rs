@@ -170,9 +170,21 @@ pub fn execute_bash(cmd: &str, config: &BashExecConfig) -> Result<BashExecResult
                 });
             }
             ApprovalLevel::RequireApproval => {
-                // TODO: Implement actual user approval UI
-                println!("⚠️ [Bash] Command requires approval: {}", cmd);
-                // For now, auto-approve (in production this would block)
+                if crate::env_flag("STEER_BASH_ALLOW_AUTO_APPROVAL") {
+                    println!(
+                        "⚠️ [Bash] Command requires approval but auto-approved by STEER_BASH_ALLOW_AUTO_APPROVAL=1: {}",
+                        cmd
+                    );
+                } else {
+                    return Ok(BashExecResult {
+                        success: false,
+                        stdout: String::new(),
+                        stderr: "Command requires explicit approval".to_string(),
+                        exit_code: -2,
+                        duration_ms: 0,
+                        process_id: None,
+                    });
+                }
             }
             ApprovalLevel::AutoApprove => {}
         }

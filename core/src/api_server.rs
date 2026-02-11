@@ -13,8 +13,9 @@ use crate::{
     approval_gate, chat_sanitize, consistency_check, context_pruning, db, execution_controller,
     feedback_collector, integrations, intent_router, judgment, llm_gateway, monitor, n8n_api,
     nl_store, pattern_detector, performance_verification, plan_builder, project_scanner,
-    quality_scorer, release_gate, runtime_verification, semantic_verification, slot_filler,
-    tool_result_guard, verification_engine, visual_verification,
+    quality_scorer, recommendation_executor, release_gate, runtime_verification,
+    semantic_verification, slot_filler, tool_result_guard, verification_engine,
+    visual_verification,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -286,9 +287,12 @@ async fn auth_middleware(
 ) -> Result<axum::response::Response, StatusCode> {
     let api_key = std::env::var("STEER_API_KEY").unwrap_or_default();
 
-    // If no key configured, allow all (Localhost Dev Mode)
+    // Require explicit opt-in for no-key local development mode.
     if api_key.is_empty() {
-        return Ok(next.run(req).await);
+        if crate::env_flag("STEER_API_ALLOW_NO_KEY") {
+            return Ok(next.run(req).await);
+        }
+        return Err(StatusCode::UNAUTHORIZED);
     }
 
     // Check Header
@@ -1268,11 +1272,9 @@ async fn approve_recommendation(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     println!("🔔 Received approval request for Recommendation ID: {}", id);
 
-    // 1. Get recommendation from DB
     let rec = match db::get_recommendation(id) {
         Ok(Some(r)) => r,
         _ => {
-            eprintln!("❌ Recommendation #{} not found in DB", id);
             return Err((
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": "Recommendation not found"})),
@@ -1280,188 +1282,62 @@ async fn approve_recommendation(
         }
     };
 
-    let n8n_client = match n8n_api::N8nApi::from_env() {
-        Ok(c) => c,
-        Err(e) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    serde_json::json!({ "error": "n8n Client Init Failed", "details": e.to_string() }),
-                ),
-            ));
-        }
-    };
-
-    // Ensure n8n is running first
-    if let Err(e) = n8n_client.ensure_server_running().await {
-        eprintln!("❌ Failed to start n8n: {}", e);
+    if rec.status.eq_ignore_ascii_case("rejected") {
         return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(
-                serde_json::json!({ "error": "n8n Server Unavailable", "details": e.to_string() }),
-            ),
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "Rejected recommendation cannot be approved"
+            })),
         ));
     }
 
-    // [NEW] Fetch Credentials to inform LLM
-    let credentials = n8n_client.list_credentials().await.unwrap_or_default();
-    let cred_context = if credentials.is_empty() {
-        "NOTE: No credentials found in n8n. Do NOT use nodes requiring authentication (like Gmail, Slack) unless you are sure.".to_string()
-    } else {
-        let list = credentials
-            .iter()
-            .map(|c| {
-                format!(
-                    "- Name: '{}', ID: '{}', Type: '{}'",
-                    c.name, c.id, c.type_name
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!("IMPORTANT: You MUST use these exact Credential IDs for authentication:\n{}\nIf a required credential is missing, do not hallucinate an ID. Use a placeholder and add a comment.", list)
-    };
-
-    let mut current_json = if let Some(json) = &rec.workflow_json {
-        json.clone()
-    } else {
-        // Initial Generation with Credential Context
-        if let Some(llm) = &state.llm_client {
-            let full_prompt = format!("{}\n\n{}", rec.n8n_prompt, cred_context);
-            println!(
-                "🧠 Generating workflow with context: {} credentials",
-                credentials.len()
-            );
-
-            match llm.build_n8n_workflow(&full_prompt).await {
-                Ok(json) => json,
-                Err(e) => {
-                    return Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(
-                            serde_json::json!({ "error": "LLM Generation Failed", "details": e.to_string() }),
-                        ),
-                    ))
-                }
-            }
-        } else {
+    if !rec.status.eq_ignore_ascii_case("approved") {
+        if let Err(e) = db::update_recommendation_review_status(id, "approved") {
             return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "error": "LLM Client Unavailable" })),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "Failed to set approved status",
+                    "details": e.to_string()
+                })),
             ));
         }
-    };
-
-    let mut attempts = 0;
-    let max_attempts = 3;
-    let mut last_error = String::new();
-
-    while attempts < max_attempts {
-        attempts += 1;
-
-        // Repair JSON if this is a retry
-        if attempts > 1 {
-            if let Some(llm) = &state.llm_client {
-                println!(
-                    "🔧 Attempting to fix workflow JSON (Try {}/{})",
-                    attempts, max_attempts
-                );
-                // Also pass credential context during fix
-                let fix_prompt = format!("{}\n\n{}", rec.n8n_prompt, cred_context);
-                match llm
-                    .fix_n8n_workflow(&fix_prompt, &current_json, &last_error)
-                    .await
-                {
-                    Ok(fixed) => current_json = fixed,
-                    Err(e) => println!("Failed to fix JSON: {}", e),
-                }
-            }
-        }
-
-        // Parse JSON to Value
-        let workflow_data: serde_json::Value =
-            match serde_json::from_str(&current_json).or_else(|_| {
-                let cleaned = extract_json_object(&current_json);
-                serde_json::from_str(&cleaned)
-            }) {
-                Ok(v) => v,
-                Err(e) => {
-                    last_error = format!("Invalid JSON Syntax: {}", e);
-                    continue;
-                }
-            };
-
-        // Extract name
-        let name = workflow_data["name"]
-            .as_str()
-            .unwrap_or(&rec.title)
-            .to_string();
-
-        // Try create
-        // SAFETY: Created as inactive (false) to prevent broken loops. User must enable manually.
-        match n8n_client
-            .create_workflow(&name, &workflow_data, false)
-            .await
-        {
-            Ok(workflow_id) => {
-                // Success!
-                println!("✅ Workflow created successfully on attempt {}", attempts);
-                if let Err(e) = db::mark_recommendation_approved(id, &workflow_id, &current_json) {
-                    eprintln!("Failed to update DB: {}", e);
-                }
-                return Ok(Json(serde_json::json!({
-                    "status": "success",
-                    "id": workflow_id,
-                    "message": "Workflow created successfully"
-                })));
-            }
-            Err(e) => {
-                last_error = e.to_string();
-                println!("❌ Creation failed: {}", last_error);
-            }
-        }
     }
 
-    // If we get here, all attempts failed
-    let error_msg = format!(
-        "❌ All {} attempts to create workflow failed. Last Error: {}",
-        max_attempts, last_error
-    );
-    eprintln!("{}", error_msg);
-    if let Err(db_err) = db::mark_recommendation_failed(id, &last_error) {
-        eprintln!("Failed to mark recommendation as failed: {}", db_err);
-    }
-
-    Err((
-        StatusCode::BAD_GATEWAY,
-        Json(serde_json::json!({ "error": error_msg, "details": last_error })),
-    ))
-}
-
-fn extract_json_object(input: &str) -> String {
-    let start = input.find('{');
-    let end = input.rfind('}');
-    match (start, end) {
-        (Some(s), Some(e)) if e > s => input[s..=e].to_string(),
-        _ => input.to_string(),
+    match recommendation_executor::execute_approved_recommendation(id, state.llm_client.clone())
+        .await
+    {
+        Ok(workflow_id) => Ok(Json(serde_json::json!({
+            "status": "success",
+            "id": workflow_id,
+            "message": "Workflow created successfully"
+        }))),
+        Err(e) => Err((
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "Approval pipeline failed",
+                "details": e.to_string()
+            })),
+        )),
     }
 }
 
 async fn reject_recommendation(axum::extract::Path(id): axum::extract::Path<i64>) -> StatusCode {
-    match db::update_recommendation_status(id, "rejected") {
+    match db::update_recommendation_review_status(id, "rejected") {
         Ok(_) => StatusCode::OK,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
 async fn later_recommendation(axum::extract::Path(id): axum::extract::Path<i64>) -> StatusCode {
-    match db::update_recommendation_status(id, "later") {
+    // "Later" keeps the recommendation in pending review state.
+    match db::update_recommendation_review_status(id, "pending") {
         Ok(_) => StatusCode::OK,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
 async fn restore_recommendation(axum::extract::Path(id): axum::extract::Path<i64>) -> StatusCode {
-    match db::update_recommendation_status(id, "pending") {
+    match db::update_recommendation_review_status(id, "pending") {
         Ok(_) => StatusCode::OK,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -1627,6 +1503,7 @@ struct RecommendationMetricsResponse {
     failed: i64,
     pending: i64,
     later: i64,
+    legacy_other: i64,
     approval_rate: f64,
     last_created_at: Option<String>,
 }
@@ -1639,6 +1516,7 @@ async fn get_recommendation_metrics() -> Json<RecommendationMetricsResponse> {
         failed: 0,
         pending: 0,
         later: 0,
+        legacy_other: 0,
         last_created_at: None,
     });
 
@@ -1655,6 +1533,7 @@ async fn get_recommendation_metrics() -> Json<RecommendationMetricsResponse> {
         failed: metrics.failed,
         pending: metrics.pending,
         later: metrics.later,
+        legacy_other: metrics.legacy_other,
         approval_rate,
         last_created_at: metrics.last_created_at,
     })

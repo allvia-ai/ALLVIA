@@ -136,7 +136,10 @@ impl FeedbackCollector {
 
         if fail_count >= 3 {
             // Mark recommendation as failed in DB
-            let _ = db::update_recommendation_status(recommendation_id, "failed");
+            let _ = db::mark_recommendation_failed(
+                recommendation_id,
+                "suppressed due to repeated execution feedback failures",
+            );
             println!(
                 "⚠️  Recommendation {} suppressed due to repeated failures",
                 recommendation_id

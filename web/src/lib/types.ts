@@ -41,6 +41,7 @@ export const RecommendationMetricsSchema = z.object({
     failed: z.number(),
     pending: z.number(),
     later: z.number(),
+    legacy_other: z.number().optional(),
     approval_rate: z.number(),
     last_created_at: z.string().nullable().optional(),
 });

@@ -8,8 +8,6 @@ pub enum RecommendationStatus {
     Pending,
     Approved,
     Rejected,
-    Executed,
-    Failed,
 }
 
 impl RecommendationStatus {
@@ -18,8 +16,6 @@ impl RecommendationStatus {
             Self::Pending => "pending",
             Self::Approved => "approved",
             Self::Rejected => "rejected",
-            Self::Executed => "executed",
-            Self::Failed => "failed",
         }
     }
 
@@ -27,8 +23,6 @@ impl RecommendationStatus {
         match s {
             "approved" => Self::Approved,
             "rejected" => Self::Rejected,
-            "executed" => Self::Executed,
-            "failed" => Self::Failed,
             _ => Self::Pending,
         }
     }
@@ -111,12 +105,12 @@ impl WorkflowRecommendation {
     }
 
     pub fn mark_executed(&mut self, workflow_id: String) {
-        self.status = RecommendationStatus::Executed;
+        // Execution success does not change review state.
         self.n8n_workflow_id = Some(workflow_id);
     }
 
     pub fn mark_failed(&mut self, error: String) {
-        self.status = RecommendationStatus::Failed;
+        // Execution failure is captured in feedback, not as a review-state transition.
         self.feedback = Some(FeedbackData {
             success: false,
             error_message: Some(error),
@@ -179,11 +173,11 @@ mod tests {
         assert!(rec.approved_at.is_some());
 
         rec.mark_executed("workflow-123".to_string());
-        assert_eq!(rec.status, RecommendationStatus::Executed);
+        assert_eq!(rec.status, RecommendationStatus::Approved);
         assert_eq!(rec.n8n_workflow_id, Some("workflow-123".to_string()));
 
         rec.mark_failed("API Error".to_string());
-        assert_eq!(rec.status, RecommendationStatus::Failed);
+        assert_eq!(rec.status, RecommendationStatus::Approved);
         assert!(rec.feedback.is_some());
         assert_eq!(
             rec.feedback.unwrap().error_message,

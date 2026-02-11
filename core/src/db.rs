@@ -72,8 +72,15 @@ pub fn init() -> anyhow::Result<()> {
         }
     }
 
-    // [Paranoid Audit] Use Stable ID Path
-    let db_path = if let Some(mut path) = dirs::data_local_dir() {
+    // [Paranoid Audit] Use stable path, with explicit override for pipeline integration.
+    let db_path = if let Ok(override_path) = std::env::var("STEER_DB_PATH") {
+        let trimmed = override_path.trim();
+        if trimmed.is_empty() {
+            std::path::PathBuf::from("steer.db")
+        } else {
+            std::path::PathBuf::from(trimmed)
+        }
+    } else if let Some(mut path) = dirs::data_local_dir() {
         path.push("steer");
         std::fs::create_dir_all(&path)?; // Ensure ~/.local/share/steer exists
         path.push("steer.db");
@@ -81,6 +88,12 @@ pub fn init() -> anyhow::Result<()> {
     } else {
         std::path::PathBuf::from("steer.db") // Fallback
     };
+
+    if let Some(parent) = db_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
 
     // Open (or create) steer.db
     let conn = Connection::open(&db_path)?;
@@ -327,6 +340,18 @@ pub fn init() -> anyhow::Result<()> {
         ensure_column(conn, "recommendations", "pattern_id", "TEXT");
         ensure_column(conn, "recommendations", "last_error", "TEXT");
         ensure_column(conn, "exec_approvals", "decision", "TEXT");
+        // Keep recommendation status model strict: pending/approved/rejected only.
+        let _ = conn.execute(
+            "UPDATE recommendations
+             SET status = CASE
+                 WHEN LOWER(status) IN ('pending', 'approved', 'rejected') THEN LOWER(status)
+                 ELSE 'pending'
+             END
+             WHERE status IS NULL
+                OR LOWER(status) NOT IN ('pending', 'approved', 'rejected')
+                OR status != LOWER(status)",
+            [],
+        );
 
         // 1-2. Routine Candidates Table
         if let Err(e) = conn.execute(
@@ -525,7 +550,10 @@ pub struct RecommendationMetrics {
     pub rejected: i64,
     pub failed: i64,
     pub pending: i64,
+    /// Backward-compatible counter kept for older dashboard cards.
     pub later: i64,
+    /// Count of records outside pending/approved/rejected (legacy data).
+    pub legacy_other: i64,
     pub last_created_at: Option<String>,
 }
 
@@ -691,9 +719,10 @@ pub fn get_recommendation_metrics() -> Result<RecommendationMetrics> {
                 COUNT(*) as total,
                 COALESCE(SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END), 0) as approved,
                 COALESCE(SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END), 0) as rejected,
-                COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) as failed,
+                COALESCE(SUM(CASE WHEN last_error IS NOT NULL AND TRIM(last_error) != '' THEN 1 ELSE 0 END), 0) as failed,
                 COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) as pending,
-                COALESCE(SUM(CASE WHEN status = 'later' THEN 1 ELSE 0 END), 0) as later,
+                0 as later,
+                COALESCE(SUM(CASE WHEN status NOT IN ('pending','approved','rejected') THEN 1 ELSE 0 END), 0) as legacy_other,
                 MAX(created_at) as last_created_at
              FROM recommendations",
         )?;
@@ -706,7 +735,8 @@ pub fn get_recommendation_metrics() -> Result<RecommendationMetrics> {
                 failed: row.get(3)?,
                 pending: row.get(4)?,
                 later: row.get(5)?,
-                last_created_at: row.get(6).ok(),
+                legacy_other: row.get(6)?,
+                last_created_at: row.get(7).ok(),
             })
         })?;
 
@@ -719,6 +749,7 @@ pub fn get_recommendation_metrics() -> Result<RecommendationMetrics> {
         failed: 0,
         pending: 0,
         later: 0,
+        legacy_other: 0,
         last_created_at: None,
     })
 }
@@ -1797,11 +1828,54 @@ pub fn update_recommendation_status(id: i64, status: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn update_recommendation_review_status(id: i64, status: &str) -> Result<()> {
+    let normalized = status.trim().to_lowercase();
+    if normalized != "pending" && normalized != "approved" && normalized != "rejected" {
+        return Err(rusqlite::Error::InvalidParameterName(format!(
+            "invalid recommendation status '{}': only pending/approved/rejected are allowed",
+            status
+        )));
+    }
+
+    let rec = get_recommendation(id)?.ok_or_else(|| {
+        rusqlite::Error::InvalidParameterName(format!("recommendation {} not found", id))
+    })?;
+    let current = rec.status.trim().to_lowercase();
+
+    let allowed = match (current.as_str(), normalized.as_str()) {
+        ("pending", "pending") => true,
+        ("pending", "approved") => true,
+        ("pending", "rejected") => true,
+        ("approved", "approved") => true,
+        ("approved", "rejected") => true,
+        ("rejected", "rejected") => true,
+        ("rejected", "pending") => true,
+        _ => false,
+    };
+
+    if !allowed {
+        return Err(rusqlite::Error::InvalidParameterName(format!(
+            "invalid recommendation transition: {} -> {}",
+            current,
+            normalized
+        )));
+    }
+
+    update_recommendation_status(id, &normalized)
+}
+
 pub fn mark_recommendation_failed(id: i64, error: &str) -> Result<()> {
     let mut lock = get_db_lock();
     if let Some(conn) = lock.as_mut() {
+        // Keep review state in pending/approved/rejected model; store execution failure in last_error.
         conn.execute(
-            "UPDATE recommendations SET status = 'failed', last_error = ?1 WHERE id = ?2",
+            "UPDATE recommendations
+             SET status = CASE
+                 WHEN status IN ('approved', 'rejected') THEN status
+                 ELSE 'pending'
+             END,
+             last_error = ?1
+             WHERE id = ?2",
             params![error, id],
         )?;
     }
@@ -2316,7 +2390,7 @@ pub fn get_recent_recommendations(limit: i64) -> Result<Vec<Recommendation>> {
         let mut stmt = conn.prepare(
             "SELECT id, status, title, summary, trigger, actions, n8n_prompt, confidence, workflow_id, workflow_json, evidence, pattern_id, last_error 
              FROM recommendations 
-             WHERE status NOT IN ('dismissed', 'completed')
+             WHERE status IN ('pending', 'approved', 'rejected')
              ORDER BY created_at DESC 
              LIMIT ?1"
         )?;
@@ -2375,6 +2449,7 @@ pub fn get_active_policy_config() -> PolicyConfigReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::recommendation::AutomationProposal;
 
     #[test]
     fn test_init_creates_table() {
@@ -2389,5 +2464,34 @@ mod tests {
         let test_event = r#"{"type":"test","source":"unit_test"}"#;
         let insert_result = insert_event(test_event);
         assert!(insert_result.is_ok());
+    }
+
+    #[test]
+    fn test_recommendation_review_status_transitions() {
+        init().ok();
+
+        let unique = format!("status-transition-test-{}", uuid::Uuid::new_v4());
+        let proposal = AutomationProposal {
+            title: unique.clone(),
+            summary: "status transition test".to_string(),
+            trigger: "unit-test".to_string(),
+            actions: vec!["noop".to_string()],
+            confidence: 0.1,
+            n8n_prompt: "noop".to_string(),
+            evidence: vec![],
+            pattern_id: None,
+        };
+        let _ = insert_recommendation(&proposal);
+
+        let rows = get_recommendations_with_filter(Some("all")).unwrap_or_default();
+        let Some(rec) = rows.into_iter().find(|r| r.title == unique) else {
+            eprintln!("skip: could not resolve inserted recommendation for transition test");
+            return;
+        };
+
+        assert!(update_recommendation_review_status(rec.id, "approved").is_ok());
+        assert!(update_recommendation_review_status(rec.id, "pending").is_err());
+        assert!(update_recommendation_review_status(rec.id, "rejected").is_ok());
+        assert!(update_recommendation_review_status(rec.id, "later").is_err());
     }
 }

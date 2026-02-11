@@ -57,6 +57,11 @@ impl N8nApi {
 
     /// Check if n8n is running, and start it if not
     pub async fn ensure_server_running(&self) -> Result<()> {
+        if crate::env_flag("STEER_N8N_MOCK") {
+            println!("🧪 STEER_N8N_MOCK=1: skipping n8n health/start checks");
+            return Ok(());
+        }
+
         // Use 127.0.0.1 to avoid macOS localhost DNS lag
         let health_url = self
             .base_url
@@ -79,17 +84,26 @@ impl N8nApi {
             return Ok(());
         }
 
+        if !crate::env_flag("STEER_N8N_AUTO_START") {
+            return Err(anyhow::anyhow!(
+                "n8n server is not reachable at {}. Set STEER_N8N_AUTO_START=1 to auto-start.",
+                health_url
+            ));
+        }
+
         println!("⚠️  n8n server NOT found. Starting automatically...");
 
         // 2. Start n8n
-        // Use npx -y n8n start --tunnel
+        // Use npx -y n8n start (tunnel is opt-in for security/reproducibility).
         use std::process::{Command, Stdio};
 
-        // We use spawn to run in background.
-        // Note: This child process will be detached or killed when core exits depending on impl.
-        // For MVP, we just spawn it.
+        let mut args = vec!["-y", "n8n", "start"];
+        if crate::env_flag("STEER_N8N_USE_TUNNEL") {
+            args.push("--tunnel");
+        }
+
         let _child = Command::new("npx")
-            .args(["-y", "n8n", "start", "--tunnel"])
+            .args(args)
             .stdout(Stdio::null()) // Mute output or redirect to file
             .stderr(Stdio::null())
             .spawn()
@@ -146,6 +160,10 @@ impl N8nApi {
 
     /// List available credentials
     pub async fn list_credentials(&self) -> Result<Vec<Credential>> {
+        if crate::env_flag("STEER_N8N_MOCK") {
+            return Ok(Vec::new());
+        }
+
         let url = format!("{}/credentials", self.base_url);
         let resp = self
             .client

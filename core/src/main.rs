@@ -1,7 +1,7 @@
 use local_os_agent::{
     analyzer, api_server, applescript, bash_executor, db, dependency_check, feedback_collector,
     integrations, llm_gateway, mcp_client, monitor, n8n_api, orchestrator, pattern_detector,
-    policy, recommendation, scheduler, security, visual_driver,
+    policy, recommendation, recommendation_executor, scheduler, security, visual_driver,
 };
 
 use local_os_agent::env_flag;
@@ -16,25 +16,6 @@ use serde_json::json;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt};
 use tracing::{error, info, warn};
 use uuid::Uuid;
-
-fn mock_workflow_json(name: &str) -> serde_json::Value {
-    json!({
-        "name": name,
-        "nodes": [{
-            "id": "manual-trigger-1",
-            "name": "Manual Trigger",
-            "type": "n8n-nodes-base.manualTrigger",
-            "typeVersion": 1,
-            "position": [240, 300],
-            "parameters": {}
-        }],
-        "connections": {},
-        "settings": {},
-        "meta": {
-            "source": "steer-approve-assumed-test"
-        }
-    })
-}
 
 fn recommendation_fingerprint(title: &str, trigger: &str) -> String {
     format!(
@@ -69,76 +50,6 @@ fn load_mock_workflow_proposal() -> anyhow::Result<recommendation::AutomationPro
     Ok(proposal)
 }
 
-fn maybe_assume_approved_for_test(id: i64) -> anyhow::Result<()> {
-    if !env_flag("STEER_TEST_ASSUME_APPROVED") {
-        return Err(anyhow::anyhow!(
-            "STEER_TEST_ASSUME_APPROVED=1 is required for approve_test path"
-        ));
-    }
-
-    let rec = db::get_recommendation(id)?
-        .ok_or_else(|| anyhow::anyhow!("recommendation {} not found", id))?;
-    if rec.status.eq_ignore_ascii_case("rejected") {
-        return Err(anyhow::anyhow!(
-            "recommendation {} is rejected and cannot be assumed approved",
-            id
-        ));
-    }
-    if !rec.status.eq_ignore_ascii_case("approved") {
-        db::update_recommendation_status(id, "approved")?;
-        println!("🧪 [TEST] Assumed approval for recommendation {}.", id);
-    }
-    Ok(())
-}
-
-async fn execute_approved_recommendation(
-    id: i64,
-    llm_client: Option<std::sync::Arc<dyn llm_gateway::LLMClient>>,
-) -> anyhow::Result<String> {
-    let rec = db::get_recommendation(id)?
-        .ok_or_else(|| anyhow::anyhow!("recommendation {} not found", id))?;
-    if !rec.status.eq_ignore_ascii_case("approved") {
-        return Err(anyhow::anyhow!(
-            "recommendation {} is '{}' (approval required before creation)",
-            id,
-            rec.status
-        ));
-    }
-
-    let use_mock_workflow_json = env_flag("STEER_TEST_ASSUME_APPROVED") && env_flag("STEER_N8N_MOCK");
-    let workflow_json_str = if use_mock_workflow_json {
-        serde_json::to_string(&mock_workflow_json(&rec.title))?
-    } else {
-        let brain = llm_client.ok_or_else(|| anyhow::anyhow!("LLM Client not available"))?;
-        brain
-            .build_n8n_workflow(&rec.n8n_prompt)
-            .await
-            .map_err(|e| anyhow::anyhow!("workflow generation failed: {}", e))?
-    };
-
-    let workflow_val = serde_json::from_str::<serde_json::Value>(&workflow_json_str).map_err(|e| {
-        anyhow::anyhow!(
-            "generated workflow JSON is invalid for recommendation {}: {}",
-            id,
-            e
-        )
-    })?;
-
-    let n8n_url = std::env::var("N8N_API_URL").unwrap_or_else(|_| "http://localhost:5678".to_string());
-    let n8n_key = std::env::var("N8N_API_KEY").unwrap_or_default();
-    let n8n = n8n_api::N8nApi::new(&format!("{}/api/v1", n8n_url), &n8n_key);
-    match n8n.create_workflow(&rec.title, &workflow_val, true).await {
-        Ok(workflow_id) => {
-            db::mark_recommendation_approved(id, &workflow_id, &workflow_json_str)?;
-            Ok(workflow_id)
-        }
-        Err(e) => {
-            let _ = db::mark_recommendation_failed(id, &e.to_string());
-            Err(anyhow::anyhow!("workflow creation failed: {}", e))
-        }
-    }
-}
-
 async fn ingest_mock_workflow_recommendation(
     llm_client: Option<std::sync::Arc<dyn llm_gateway::LLMClient>>,
 ) -> anyhow::Result<()> {
@@ -161,8 +72,8 @@ async fn ingest_mock_workflow_recommendation(
     }
 
     if env_flag("STEER_TEST_ASSUME_APPROVED") {
-        maybe_assume_approved_for_test(rec_id)?;
-        match execute_approved_recommendation(rec_id, llm_client).await {
+        recommendation_executor::maybe_assume_approved_for_test(rec_id)?;
+        match recommendation_executor::execute_approved_recommendation(rec_id, llm_client).await {
             Ok(workflow_id) => println!(
                 "✅ [TEST] approve-assumed pipeline completed. Workflow ID: {}",
                 workflow_id
@@ -816,14 +727,16 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
                 if !rec.status.eq_ignore_ascii_case("approved") {
-                    if let Err(e) = db::update_recommendation_status(id, "approved") {
+                    if let Err(e) = db::update_recommendation_review_status(id, "approved") {
                         println!("❌ Failed to update recommendation status: {}", e);
                         continue;
                     }
                 }
 
                 println!("🏗️  Building n8n workflow for '{}'...", rec.title);
-                match execute_approved_recommendation(id, llm_client.clone()).await {
+                match recommendation_executor::execute_approved_recommendation(id, llm_client.clone())
+                    .await
+                {
                     Ok(workflow_id) => {
                         println!("✅ Workflow created! ID: {}", workflow_id);
                     }
@@ -845,11 +758,13 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
 
-                if let Err(e) = maybe_assume_approved_for_test(id) {
+                if let Err(e) = recommendation_executor::maybe_assume_approved_for_test(id) {
                     println!("❌ approve_test precheck failed: {}", e);
                     continue;
                 }
-                match execute_approved_recommendation(id, llm_client.clone()).await {
+                match recommendation_executor::execute_approved_recommendation(id, llm_client.clone())
+                    .await
+                {
                     Ok(workflow_id) => {
                         println!("✅ [TEST] Workflow created! ID: {}", workflow_id);
                     }
@@ -875,7 +790,7 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
                 };
-                match db::update_recommendation_status(id, "rejected") {
+                match db::update_recommendation_review_status(id, "rejected") {
                     Ok(()) => println!("🗑️  Recommendation {} rejected.", id),
                     Err(e) => println!("❌ Failed to reject recommendation: {}", e),
                 }

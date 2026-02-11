@@ -142,8 +142,8 @@ impl ApprovalGate {
             }
         }
 
-        // 4. Default: auto-approve (trust the agent)
-        ApprovalLevel::AutoApprove
+        // 4. Default: require approval for unknown commands.
+        ApprovalLevel::RequireApproval
     }
 
     /// Create an approval request for a command
@@ -314,24 +314,39 @@ pub fn preview_approval(action: &str, _plan: &impl std::fmt::Debug) -> ApprovalD
         };
     }
 
-    // Plain string action
+    let trimmed = action.trim();
+    let looks_like_shell = trimmed.contains(' ')
+        || trimmed.contains('/')
+        || trimmed.contains('|')
+        || trimmed.contains(';')
+        || trimmed.starts_with("sudo");
+    if !looks_like_shell {
+        return ApprovalDecision {
+            status: "approved".to_string(),
+            risk_level: "low".to_string(),
+            policy: "default".to_string(),
+            message: format!("Action: {}", action),
+            requires_approval: false,
+        };
+    }
+
+    // Shell-like plain text action: gate by command policy.
+    let level = ApprovalGate::check_command(trimmed);
+    let (status, risk, requires_approval) = match level {
+        ApprovalLevel::Blocked => ("denied".to_string(), "critical".to_string(), true),
+        ApprovalLevel::RequireApproval => ("pending".to_string(), "high".to_string(), true),
+        ApprovalLevel::AutoApprove => ("approved".to_string(), "low".to_string(), false),
+    };
     ApprovalDecision {
-        status: "approved".to_string(),
-        risk_level: "low".to_string(),
+        status,
+        risk_level: risk,
         policy: "default".to_string(),
         message: format!("Action: {}", action),
-        requires_approval: false,
+        requires_approval,
     }
 }
 
 /// Evaluate approval - legacy API (used by execution_controller)
-pub fn evaluate_approval(_action: &str, _plan: &impl std::fmt::Debug) -> ApprovalDecision {
-    // Default: approve
-    ApprovalDecision {
-        status: "approved".to_string(),
-        risk_level: "low".to_string(),
-        policy: "default".to_string(),
-        message: "Action approved".to_string(),
-        requires_approval: false,
-    }
+pub fn evaluate_approval(action: &str, plan: &impl std::fmt::Debug) -> ApprovalDecision {
+    preview_approval(action, plan)
 }

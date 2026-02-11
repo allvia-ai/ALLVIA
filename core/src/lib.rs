@@ -34,6 +34,7 @@ pub mod orchestrator;
 pub mod pattern_detector;
 pub mod privacy;
 pub mod recommendation;
+pub mod recommendation_executor;
 pub mod security;
 pub mod send_policy;
 pub mod shell_actions;

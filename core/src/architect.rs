@@ -1,8 +1,7 @@
 use crate::db::Recommendation;
 use crate::llm_gateway::LLMClient;
-use std::sync::Arc;
 use serde_json::json;
-use crate::db;
+use std::sync::Arc;
 
 pub struct ArchitectSession {
     llm: Arc<dyn LLMClient>,
@@ -66,9 +65,9 @@ If the user says 'Build' or 'Yes', output the token '[BUILD_COMPLETED]' and a su
         
         // Check for [BUILD_COMPLETED]
         if response.contains("[BUILD_COMPLETED]") {
-             // Update Rec status in DB
-             let _ = db::update_recommendation_status(self.recommendation.id, "approved");
-             return Ok(response.replace("[BUILD_COMPLETED]", "✅ **Automation Built & Deployed!** (Simulation)"));
+             // Do not auto-approve on marker text alone.
+             // Explicit user approval endpoint must perform the state transition.
+             return Ok(response.replace("[BUILD_COMPLETED]", "✅ **Automation Plan Ready** (승인 대기)"));
         }
 
         Ok(response)
