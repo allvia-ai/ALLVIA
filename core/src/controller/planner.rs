@@ -1522,3 +1522,83 @@ impl Planner {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Planner;
+    use crate::session_store::Session;
+
+    fn base_session(goal: &str) -> Session {
+        Session::new(goal, Some("planner_test"))
+    }
+
+    #[test]
+    fn summarize_execution_success_for_non_mail_goal() {
+        let goal = "Notes를 열고 간단한 메모를 작성하고 done 하세요.";
+        let mut session = base_session(goal);
+        session.add_step("open_app", "Opened app: Notes", "success", None);
+        session.add_step("type", "Typed '회의 준비'", "success", None);
+        let history = vec![
+            "Opened app: Notes".to_string(),
+            "Typed '회의 준비'".to_string(),
+        ];
+
+        let summary = Planner::summarize_execution(goal, &session, &history, true);
+        assert!(summary.planner_complete);
+        assert!(summary.execution_complete);
+        assert!(summary.business_complete);
+    }
+
+    #[test]
+    fn summarize_execution_fails_if_any_step_failed() {
+        let goal = "TextEdit를 열고 문서를 작성하세요.";
+        let mut session = base_session(goal);
+        session.add_step("open_app", "Opened app: TextEdit", "success", None);
+        session.add_step("type", "Type failed: blocked by dialog", "failed", None);
+        let history = vec!["Opened app: TextEdit".to_string()];
+
+        let summary = Planner::summarize_execution(goal, &session, &history, true);
+        assert!(summary.planner_complete);
+        assert!(!summary.execution_complete);
+        assert!(!summary.business_complete);
+    }
+
+    #[test]
+    fn summarize_execution_requires_mail_send_confirmation() {
+        let goal = "Mail을 열고 이메일을 보내세요.";
+        let mut session = base_session(goal);
+        session.add_step("open_app", "Opened app: Mail", "success", None);
+        session.add_step("type", "Typed 'subject'", "success", None);
+        let history = vec![
+            "Opened app: Mail".to_string(),
+            "Typed 'subject'".to_string(),
+        ];
+
+        let summary = Planner::summarize_execution(goal, &session, &history, true);
+        assert!(summary.mail_send_required);
+        assert!(!summary.mail_send_confirmed);
+        assert!(!summary.business_complete);
+    }
+
+    #[test]
+    fn summarize_execution_passes_when_mail_send_confirmed() {
+        let goal = "Mail로 보고서를 보내세요.";
+        let mut session = base_session(goal);
+        session.add_step("open_app", "Opened app: Mail", "success", None);
+        session.add_step(
+            "mail_send",
+            "Mail send completed",
+            "success",
+            Some(serde_json::json!({"send_status": "sent_confirmed"})),
+        );
+        let history = vec![
+            "Opened app: Mail".to_string(),
+            "Mail send completed".to_string(),
+        ];
+
+        let summary = Planner::summarize_execution(goal, &session, &history, true);
+        assert!(summary.mail_send_required);
+        assert!(summary.mail_send_confirmed);
+        assert!(summary.business_complete);
+    }
+}
