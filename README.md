@@ -63,6 +63,23 @@ This restarts the core process automatically if a crash occurs.
 - **Rust 1.70+**
 - **OpenAI API Key** (LLM 분석용)
 
+## 🐳 n8n 실행 모드 (macOS 권장)
+
+기본 런타임은 Docker입니다.
+
+- 기본값: `STEER_N8N_RUNTIME=docker`
+- 대체값: `STEER_N8N_RUNTIME=npx` 또는 `STEER_N8N_RUNTIME=manual`
+- Docker 자동기동: `STEER_N8N_AUTO_START=1` (docker 모드 기본값)
+- Docker compose 파일 경로 override: `STEER_N8N_COMPOSE_FILE=/abs/path/docker-compose.yml`
+- Docker 모드에서는 CLI fallback 기본 비활성 (`STEER_N8N_ALLOW_CLI_FALLBACK=0`)
+
+빠른 시작:
+
+```bash
+docker compose up -d n8n
+# n8n API URL 기본값: http://localhost:5678/api/v1
+```
+
 ## 🛡️ 보안
 
 - `exec` 명령어는 위험한 키워드(`rm`, `sudo` 등)가 포함되면 차단됩니다.

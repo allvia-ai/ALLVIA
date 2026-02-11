@@ -977,26 +977,27 @@ async fn handle_chat(
 
     // Issue #4 Fix: n8n restart command
     if message == "n8n restart" || message.contains("n8n 재시작") {
-        match std::process::Command::new("pkill")
-            .arg("-f")
-            .arg("n8n")
-            .output()
-        {
+        let api = match crate::n8n_api::N8nApi::from_env() {
+            Ok(v) => v,
+            Err(e) => {
+                return Json(ChatResponse {
+                    response: format!("❌ n8n 초기화 실패: {}", e),
+                    command: None,
+                })
+            }
+        };
+        match api.restart_server().await {
             Ok(_) => {
-                // Try to start n8n again
-                let _ = std::process::Command::new("npx")
-                    .args(["n8n", "start"])
-                    .spawn();
                 return Json(ChatResponse {
                     response: "🔄 n8n 서버를 재시작했습니다.".to_string(),
                     command: Some("n8n_restart".to_string()),
-                });
+                })
             }
             Err(e) => {
                 return Json(ChatResponse {
                     response: format!("❌ n8n 재시작 실패: {}", e),
                     command: None,
-                });
+                })
             }
         }
     }
@@ -1330,6 +1331,7 @@ async fn approve_recommendation(
         Ok(outcome) => Ok(Json(serde_json::json!({
             "status": "success",
             "id": outcome.workflow_id,
+            "workflow_id": outcome.workflow_id,
             "approved_now": outcome.approved_now,
             "reused_existing": outcome.reused_existing,
             "message": if outcome.reused_existing {

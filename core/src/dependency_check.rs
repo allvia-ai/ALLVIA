@@ -44,12 +44,40 @@ pub struct SystemHealth {
 }
 
 impl SystemHealth {
+    fn n8n_runtime() -> String {
+        std::env::var("STEER_N8N_RUNTIME")
+            .unwrap_or_else(|_| "docker".to_string())
+            .trim()
+            .to_lowercase()
+    }
+
     pub fn check_all() -> Self {
-        let deps = vec![
+        let mut deps = vec![
             Dependency::new("Homebrew", "which brew", "/bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"", true),
             Dependency::new("cliclick", "which cliclick", "brew install cliclick", false),
-            Dependency::new("n8n", "which n8n", "npm install -g n8n", true),
         ];
+        let runtime = Self::n8n_runtime();
+        if runtime == "docker" {
+            deps.push(Dependency::new(
+                "Docker",
+                "docker --version",
+                "brew install --cask docker",
+                true,
+            ));
+            deps.push(Dependency::new(
+                "Docker Compose",
+                "docker compose version",
+                "Install/enable Docker Compose plugin",
+                true,
+            ));
+        } else {
+            deps.push(Dependency::new(
+                "n8n",
+                "which n8n",
+                "npm install -g n8n",
+                true,
+            ));
+        }
 
         let mut missing = Vec::new();
         for mut dep in deps {

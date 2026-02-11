@@ -44,3 +44,9 @@ This document summarizes the optional environment variables introduced across ph
 
 ## Notifications
 - `NOTIFY_POLICY_RULES`: JSON rules for notification gating (send_policy).
+
+## n8n Runtime
+- `STEER_N8N_RUNTIME`: n8n runtime mode (`docker` | `npx` | `manual`). Default `docker`.
+- `STEER_N8N_AUTO_START`: Auto-start n8n when unreachable. Docker mode default `true`.
+- `STEER_N8N_COMPOSE_FILE`: Absolute path to docker-compose file used in docker mode.
+- `STEER_N8N_ALLOW_CLI_FALLBACK`: Allow CLI import fallback when API fails. Default `false` in docker mode, `true` in npx mode.
