@@ -1,0 +1,83 @@
+mask_keys:
+  - window_title
+  - url
+  - path
+  - file_name
+
+hash:
+  algorithm: sha256
+  salt_env: DATA_COLLECTOR_SALT
+
+hash_keys:
+  - path
+  - file_path
+  - filepath
+  - file_name
+
+length_limits:
+  window_title: 64
+  url: 128
+  path: 128
+  file_path: 128
+  filepath: 128
+  file_name: 64
+
+url_policy:
+  allow_full_url: false
+  keep_domain_only: true
+
+redaction_patterns:
+  - name: email
+    regex: '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+  - name: phone
+    regex: '\b(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{2,4}\)?[-.\s]?)?\d{3,4}[-.\s]?\d{4}\b'
+  - name: long_digits
+    regex: '\b\d{12,}\b'
+
+drop_payload_keys:
+  - content
+  - body
+  - text
+  - html
+  - cell_value
+  - clipboard
+
+allowlist_apps:
+  - os
+  - applicationframehost.exe
+  - 3dsmax.exe
+  - 7zfm.exe
+  - chrome.exe
+  - code.exe
+  - devenv.exe
+  - discord.exe
+  - excel
+  - excel.exe
+  - kakaotalk.exe
+  - microsoft.notes.exe
+  - msedge.exe
+  - notion.exe
+  - notion calendar.exe
+  - outlook
+  - outlook.exe
+  - pycharm64.exe
+  - revit.exe
+  - sketchup.exe
+  - unity hub.exe
+  - unity.exe
+  - systemsettings.exe
+  - textinputhost.exe
+  - windowsterminal.exe
+  - whale.exe
+  - zoom.exe
+
+# Example denylist: password managers, finance apps, personal messengers.
+denylist_apps:
+  - keepass
+  - 1password
+  - lastpass
+  - bitwarden
+  - bankapp
+  - personal_messenger
+
+denylist_action: drop

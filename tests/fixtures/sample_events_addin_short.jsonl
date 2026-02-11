@@ -1,0 +1,3 @@
+{"schema_version":"1.0","ts":"2026-01-21T00:05:00Z","source":"excel_addin","app":"EXCEL","event_type":"excel.export_pdf","resource":{"type":"file","id":"file-001"},"payload":{"format":"pdf","sheet_count":2,"file_path":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}}
+{"schema_version":"1.0","ts":"2026-01-21T00:05:10Z","source":"outlook_addin","app":"OUTLOOK","event_type":"outlook.send_clicked","resource":{"type":"email","id":"draft-001"},"payload":{"attachments_count":1,"recipients_count":2}}
+{"schema_version":"1.0","ts":"2026-01-21T00:05:20Z","source":"outlook_addin","app":"OUTLOOK","event_type":"outlook.compose_started","resource":{"type":"email","id":"draft-002"},"payload":{"mode":"new"}}

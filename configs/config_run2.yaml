@@ -1,0 +1,59 @@
+db_path: collector_run2.db
+migrations_path: migrations
+validation_level: lenient
+wal_mode: true
+log_level: INFO
+privacy_rules_path: configs/privacy_rules.yaml
+
+queue:
+  max_size: 1000
+  shutdown_drain_seconds: 3
+
+ingest:
+  enabled: true
+  host: 127.0.0.1
+  port: 8080
+  token: ""
+
+privacy:
+  hash_salt: dev-salt
+
+store:
+  busy_timeout_ms: 5000
+  insert_batch_size: 100
+  insert_flush_ms: 1000
+  insert_retry_attempts: 3
+  insert_retry_backoff_ms: 50
+
+priority:
+  debounce_seconds: 2.0
+  focus_event_types:
+    - os.foreground_changed
+  focus_block_event_type: os.app_focus_block
+  drop_p2_when_queue_over: 0.8
+
+retention:
+  enabled: true
+  interval_minutes: 60
+  raw_events_days: 7
+  sessions_days: 30
+  routine_candidates_days: 90
+  handoff_queue_days: 7
+  max_db_mb: 500
+  batch_size: 5000
+  vacuum_hours: 24
+
+observability:
+  log_interval_sec: 60
+  activity_log: true
+  activity_top_n: 3
+  activity_min_duration_sec: 5
+  activity_include_title: false
+
+logging:
+  dir: logs/run2
+  file_name: collector.log
+  max_mb: 20
+  backup_count: 10
+  json: true
+  to_console: true
