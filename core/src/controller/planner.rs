@@ -895,6 +895,87 @@ impl Planner {
         );
     }
 
+    fn extract_known_app_from_text(text: &str) -> Option<&'static str> {
+        let lower = text.to_lowercase();
+        let aliases: [(&str, &'static str); 13] = [
+            ("calendar", "Calendar"),
+            ("캘린더", "Calendar"),
+            ("notes", "Notes"),
+            ("메모", "Notes"),
+            ("textedit", "TextEdit"),
+            ("mail", "Mail"),
+            ("메일", "Mail"),
+            ("finder", "Finder"),
+            ("safari", "Safari"),
+            ("calculator", "Calculator"),
+            ("계산기", "Calculator"),
+            ("notion", "Notion"),
+            ("노션", "Notion"),
+        ];
+
+        for (needle, app) in aliases {
+            if lower.contains(needle) {
+                return Some(app);
+            }
+        }
+        None
+    }
+
+    fn next_unopened_app_in_goal(goal: &str, history: &[String]) -> Option<&'static str> {
+        for app in Self::ordered_apps_in_goal(goal) {
+            let marker = format!("Opened app: {}", app);
+            if !Self::history_contains_case_insensitive(history, &marker) {
+                return Some(app);
+            }
+        }
+        None
+    }
+
+    fn maybe_rewrite_click_visual_to_app_action(
+        goal: &str,
+        history: &[String],
+        plan: &mut serde_json::Value,
+    ) {
+        if plan["action"].as_str() != Some("click_visual") {
+            return;
+        }
+
+        let description = plan["description"].as_str().unwrap_or("").trim();
+        if description.is_empty() {
+            return;
+        }
+
+        let desc_lower = description.to_lowercase();
+        let looks_like_app_switch = desc_lower.contains("dock")
+            || desc_lower.contains("icon")
+            || desc_lower.contains("앱")
+            || desc_lower.contains("application");
+        if !looks_like_app_switch {
+            return;
+        }
+
+        let target_app = Self::extract_known_app_from_text(description)
+            .or_else(|| Self::next_unopened_app_in_goal(goal, history));
+        let Some(target_app) = target_app else {
+            return;
+        };
+
+        let opened_marker = format!("Opened app: {}", target_app);
+        if Self::history_contains_case_insensitive(history, &opened_marker) {
+            *plan = serde_json::json!({ "action": "switch_app", "app": target_app });
+            println!(
+                "   🔁 Rewrote click_visual dock/app action to switch_app: {}",
+                target_app
+            );
+        } else {
+            *plan = serde_json::json!({ "action": "open_app", "name": target_app });
+            println!(
+                "   🔁 Rewrote click_visual dock/app action to open_app: {}",
+                target_app
+            );
+        }
+    }
+
     fn can_force_done_for_simple_goal(
         goal: &str,
         plan: &serde_json::Value,
@@ -1422,6 +1503,7 @@ impl Planner {
                 continue;
             }
             plan = validation.normalized;
+            Self::maybe_rewrite_click_visual_to_app_action(goal, &history, &mut plan);
             Self::maybe_rewrite_shortcut_to_next_app(goal, &history, &mut plan);
             Self::maybe_rewrite_mail_subject_before_paste(goal, &history, &mut plan);
 
