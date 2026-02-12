@@ -42,6 +42,20 @@ struct RunGoalExecutionSummary {
     failed_steps: usize,
     mail_send_required: bool,
     mail_send_confirmed: bool,
+    notes_write_required: bool,
+    notes_write_confirmed: bool,
+    textedit_write_required: bool,
+    textedit_write_confirmed: bool,
+    textedit_save_required: bool,
+    textedit_save_confirmed: bool,
+}
+
+#[derive(Debug, Default, Clone)]
+struct RunGoalBusinessEvidence {
+    mail_send_confirmed: bool,
+    notes_write_confirmed: bool,
+    textedit_write_confirmed: bool,
+    textedit_save_confirmed: bool,
 }
 
 impl Planner {
@@ -84,6 +98,182 @@ impl Planner {
         mentions_mail && mentions_send
     }
 
+    fn goal_has_payload_tokens(goal: &str) -> bool {
+        !Self::extract_quoted_fragments(goal).is_empty()
+    }
+
+    fn goal_has_write_signal(lower: &str) -> bool {
+        Self::goal_contains_any(
+            lower,
+            &[
+                "write",
+                "작성",
+                "입력",
+                "붙여넣",
+                "paste",
+                "type",
+                "append",
+                "기록",
+            ],
+        )
+    }
+
+    fn goal_has_new_item_signal(lower: &str) -> bool {
+        Self::goal_contains_any(
+            lower,
+            &[
+                "new note",
+                "new document",
+                "새 메모",
+                "새 문서",
+                "cmd+n",
+                "command+n",
+            ],
+        )
+    }
+
+    fn goal_requires_notes_write(goal: &str) -> bool {
+        let lower = goal.to_lowercase();
+        let mentions_notes = lower.contains("notes") || lower.contains("메모");
+        mentions_notes
+            && (Self::goal_has_write_signal(&lower)
+                || Self::goal_has_new_item_signal(&lower)
+                || Self::goal_has_payload_tokens(goal))
+    }
+
+    fn goal_requires_textedit_write(goal: &str) -> bool {
+        let lower = goal.to_lowercase();
+        let mentions_textedit = lower.contains("textedit") || lower.contains("텍스트에디트");
+        mentions_textedit
+            && (Self::goal_has_write_signal(&lower)
+                || Self::goal_has_new_item_signal(&lower)
+                || Self::goal_has_payload_tokens(goal))
+    }
+
+    fn goal_requires_textedit_save(goal: &str) -> bool {
+        let lower = goal.to_lowercase();
+        let mentions_textedit = lower.contains("textedit") || lower.contains("텍스트에디트");
+        let mentions_save = Self::goal_contains_any(
+            &lower,
+            &[
+                "save",
+                "저장",
+                "cmd+s",
+                "command+s",
+                "파일로 저장",
+                "저장해",
+            ],
+        );
+        mentions_textedit && mentions_save
+    }
+
+    fn step_data_has_proof(step: &crate::session_store::SessionStep, proof: &str) -> bool {
+        step.data
+            .as_ref()
+            .and_then(|d| d.get("proof"))
+            .and_then(|v| v.as_str())
+            .map(|v| v == proof)
+            .unwrap_or(false)
+    }
+
+    fn parse_app_context_from_step(step: &crate::session_store::SessionStep) -> Option<String> {
+        let description = step.description.trim();
+        if let Some(rest) = description.strip_prefix("Opened app: ") {
+            let app = rest.trim();
+            if !app.is_empty() {
+                return Some(app.to_lowercase());
+            }
+        }
+        if let Some(rest) = description.strip_prefix("Switched to app: ") {
+            let app = rest.trim();
+            if !app.is_empty() {
+                return Some(app.to_lowercase());
+            }
+        }
+        None
+    }
+
+    fn collect_business_evidence(session: &Session, history: &[String]) -> RunGoalBusinessEvidence {
+        let mut evidence = RunGoalBusinessEvidence::default();
+        let mut current_app = Self::last_opened_app_from_history(history).map(|a| a.to_lowercase());
+        let mut textedit_context_seen = current_app.as_deref() == Some("textedit");
+
+        for step in &session.steps {
+            if step.status == "success" {
+                if let Some(app) = Self::parse_app_context_from_step(step) {
+                    if app == "textedit" {
+                        textedit_context_seen = true;
+                    }
+                    current_app = Some(app);
+                }
+            }
+
+            if step.status != "success" {
+                continue;
+            }
+
+            let desc = step.description.to_lowercase();
+            if Self::step_has_mail_send_confirmed(step) {
+                evidence.mail_send_confirmed = true;
+            }
+            if Self::step_data_has_proof(step, "notes_write_text") || desc.contains("(notes body)")
+            {
+                evidence.notes_write_confirmed = true;
+            }
+            if Self::step_data_has_proof(step, "textedit_append_text")
+                || desc.contains("(textedit body)")
+            {
+                evidence.textedit_write_confirmed = true;
+                textedit_context_seen = true;
+            }
+
+            if matches!(step.action_type.as_str(), "type" | "paste") {
+                match current_app.as_deref() {
+                    Some("notes") => evidence.notes_write_confirmed = true,
+                    Some("textedit") => {
+                        evidence.textedit_write_confirmed = true;
+                        textedit_context_seen = true;
+                    }
+                    _ => {}
+                }
+            }
+
+            let is_save_shortcut = matches!(step.action_type.as_str(), "shortcut" | "key" | "save")
+                && desc.contains("shortcut 's'")
+                && desc.contains("command");
+            if is_save_shortcut
+                && (current_app.as_deref() == Some("textedit") || textedit_context_seen)
+            {
+                evidence.textedit_save_confirmed = true;
+            }
+        }
+
+        if !evidence.mail_send_confirmed {
+            evidence.mail_send_confirmed =
+                Self::history_contains_case_insensitive(history, "mail send completed")
+                    || Self::history_contains_case_insensitive(history, "(mail sent)");
+        }
+        if !evidence.notes_write_confirmed {
+            evidence.notes_write_confirmed =
+                Self::history_contains_case_insensitive(history, "(notes body)")
+                    || (Self::history_contains_case_insensitive(history, "opened app: notes")
+                        && Self::history_contains_case_insensitive(history, "typed '"));
+        }
+        if !evidence.textedit_write_confirmed {
+            evidence.textedit_write_confirmed =
+                Self::history_contains_case_insensitive(history, "(textedit body)")
+                    || (Self::history_contains_case_insensitive(history, "opened app: textedit")
+                        && Self::history_contains_case_insensitive(history, "typed '"));
+        }
+        if !evidence.textedit_save_confirmed {
+            evidence.textedit_save_confirmed =
+                Self::history_contains_case_insensitive(history, "opened app: textedit")
+                    && Self::history_contains_shortcut(history, "s");
+        }
+
+        evidence
+    }
+
     fn step_has_mail_send_confirmed(step: &crate::session_store::SessionStep) -> bool {
         if let Some(data) = &step.data {
             if data
@@ -113,9 +303,14 @@ impl Planner {
             .count();
         let execution_complete = planner_complete && failed_steps == 0;
         let mail_send_required = Self::goal_requires_mail_send(goal);
-        let mail_send_confirmed = session.steps.iter().any(Self::step_has_mail_send_confirmed)
-            || Self::history_contains_case_insensitive(history, "mail send completed")
-            || Self::history_contains_case_insensitive(history, "(mail sent)");
+        let notes_write_required = Self::goal_requires_notes_write(goal);
+        let textedit_write_required = Self::goal_requires_textedit_write(goal);
+        let textedit_save_required = Self::goal_requires_textedit_save(goal);
+        let evidence = Self::collect_business_evidence(session, history);
+        let mail_send_confirmed = evidence.mail_send_confirmed;
+        let notes_write_confirmed = evidence.notes_write_confirmed;
+        let textedit_write_confirmed = evidence.textedit_write_confirmed;
+        let textedit_save_confirmed = evidence.textedit_save_confirmed;
 
         let (business_complete, business_note) = if !execution_complete {
             (
@@ -125,16 +320,32 @@ impl Planner {
                     failed_steps, step_count
                 ),
             )
-        } else if mail_send_required && !mail_send_confirmed {
-            (
-                false,
-                "mail send required by goal but sent confirmation was not detected".to_string(),
-            )
         } else {
-            (
-                true,
-                "planner/execution/business checks passed from run evidence".to_string(),
-            )
+            let mut missing_checks: Vec<&str> = Vec::new();
+            if mail_send_required && !mail_send_confirmed {
+                missing_checks.push("mail_send_confirmation");
+            }
+            if notes_write_required && !notes_write_confirmed {
+                missing_checks.push("notes_write_evidence");
+            }
+            if textedit_write_required && !textedit_write_confirmed {
+                missing_checks.push("textedit_write_evidence");
+            }
+            if textedit_save_required && !textedit_save_confirmed {
+                missing_checks.push("textedit_save_confirmation");
+            }
+
+            if missing_checks.is_empty() {
+                (
+                    true,
+                    "planner/execution/business checks passed from run evidence".to_string(),
+                )
+            } else {
+                (
+                    false,
+                    format!("business evidence missing: {}", missing_checks.join(", ")),
+                )
+            }
         };
 
         RunGoalExecutionSummary {
@@ -146,6 +357,12 @@ impl Planner {
             failed_steps,
             mail_send_required,
             mail_send_confirmed,
+            notes_write_required,
+            notes_write_confirmed,
+            textedit_write_required,
+            textedit_write_confirmed,
+            textedit_save_required,
+            textedit_save_confirmed,
         }
     }
 
@@ -881,7 +1098,13 @@ impl Planner {
                     "step_count": exec_summary.step_count,
                     "failed_steps": exec_summary.failed_steps,
                     "mail_send_required": exec_summary.mail_send_required,
-                    "mail_send_confirmed": exec_summary.mail_send_confirmed
+                    "mail_send_confirmed": exec_summary.mail_send_confirmed,
+                    "notes_write_required": exec_summary.notes_write_required,
+                    "notes_write_confirmed": exec_summary.notes_write_confirmed,
+                    "textedit_write_required": exec_summary.textedit_write_required,
+                    "textedit_write_confirmed": exec_summary.textedit_write_confirmed,
+                    "textedit_save_required": exec_summary.textedit_save_required,
+                    "textedit_save_confirmed": exec_summary.textedit_save_confirmed
                 })
                 .to_string();
 
@@ -943,8 +1166,15 @@ impl Planner {
                     if business_complete { "true" } else { "false" },
                     business_complete,
                     Some(&format!(
-                        "mail_send_required={} mail_send_confirmed={}",
-                        exec_summary.mail_send_required, exec_summary.mail_send_confirmed
+                        "mail_send_required={} mail_send_confirmed={} notes_write_required={} notes_write_confirmed={} textedit_write_required={} textedit_write_confirmed={} textedit_save_required={} textedit_save_confirmed={}",
+                        exec_summary.mail_send_required,
+                        exec_summary.mail_send_confirmed,
+                        exec_summary.notes_write_required,
+                        exec_summary.notes_write_confirmed,
+                        exec_summary.textedit_write_required,
+                        exec_summary.textedit_write_confirmed,
+                        exec_summary.textedit_save_required,
+                        exec_summary.textedit_save_confirmed
                     )),
                 );
                 let _ = db::update_task_run_outcome(
@@ -1046,8 +1276,23 @@ impl Planner {
     ) -> Result<RunGoalExecutionSummary> {
         println!("🌊 Starting Planned Surf: '{}'", goal);
         let scenario_mode = Self::scenario_mode_enabled();
-        let allow_deterministic_fallback = Self::env_truthy("STEER_ALLOW_DETERMINISTIC_FALLBACK");
-        let allow_review_loop_override = Self::env_truthy("STEER_ALLOW_REVIEW_LOOP_OVERRIDE");
+        let test_context = Self::env_truthy("STEER_TEST_MODE") || Self::env_truthy("CI");
+        let deterministic_fallback_requested =
+            Self::env_truthy("STEER_ALLOW_DETERMINISTIC_FALLBACK");
+        let review_loop_override_requested = Self::env_truthy("STEER_ALLOW_REVIEW_LOOP_OVERRIDE");
+        if deterministic_fallback_requested && !test_context {
+            return Err(anyhow::anyhow!(
+                "STEER_ALLOW_DETERMINISTIC_FALLBACK is test-only (requires STEER_TEST_MODE=1 or CI=1)."
+            ));
+        }
+        if review_loop_override_requested && !test_context {
+            return Err(anyhow::anyhow!(
+                "STEER_ALLOW_REVIEW_LOOP_OVERRIDE is test-only (requires STEER_TEST_MODE=1 or CI=1)."
+            ));
+        }
+        let allow_deterministic_fallback = deterministic_fallback_requested && test_context;
+        let allow_review_loop_override =
+            review_loop_override_requested && allow_deterministic_fallback;
         let require_primary_planner =
             Self::env_truthy_default("STEER_REQUIRE_PRIMARY_PLANNER", true);
         let allow_scenario_mode = Self::env_truthy("STEER_ALLOW_SCENARIO_MODE");
@@ -1599,6 +1844,51 @@ mod tests {
         let summary = Planner::summarize_execution(goal, &session, &history, true);
         assert!(summary.mail_send_required);
         assert!(summary.mail_send_confirmed);
+        assert!(summary.business_complete);
+    }
+
+    #[test]
+    fn summarize_execution_requires_textedit_save_when_goal_mentions_save() {
+        let goal = "TextEdit에서 문서를 작성하고 저장하세요.";
+        let mut session = base_session(goal);
+        session.add_step("open_app", "Opened app: TextEdit", "success", None);
+        session.add_step("type", "Typed 'status: in-progress'", "success", None);
+        let history = vec![
+            "Opened app: TextEdit".to_string(),
+            "Typed 'status: in-progress'".to_string(),
+        ];
+
+        let summary = Planner::summarize_execution(goal, &session, &history, true);
+        assert!(summary.textedit_write_required);
+        assert!(summary.textedit_write_confirmed);
+        assert!(summary.textedit_save_required);
+        assert!(!summary.textedit_save_confirmed);
+        assert!(!summary.business_complete);
+    }
+
+    #[test]
+    fn summarize_execution_passes_when_textedit_save_confirmed() {
+        let goal = "TextEdit에서 문서를 작성하고 저장하세요.";
+        let mut session = base_session(goal);
+        session.add_step("open_app", "Opened app: TextEdit", "success", None);
+        session.add_step(
+            "type",
+            "Typed 'status: in-progress' (textedit body)",
+            "success",
+            Some(serde_json::json!({"proof": "textedit_append_text"})),
+        );
+        session.add_step("shortcut", "Shortcut 's' + [\"command\"]", "success", None);
+        let history = vec![
+            "Opened app: TextEdit".to_string(),
+            "Typed 'status: in-progress' (textedit body)".to_string(),
+            "Shortcut 's' + [\"command\"]".to_string(),
+        ];
+
+        let summary = Planner::summarize_execution(goal, &session, &history, true);
+        assert!(summary.textedit_write_required);
+        assert!(summary.textedit_write_confirmed);
+        assert!(summary.textedit_save_required);
+        assert!(summary.textedit_save_confirmed);
         assert!(summary.business_complete);
     }
 }

@@ -23,22 +23,26 @@ impl Drop for LockGuard {
 pub fn acquire_lock() -> Result<Option<LockGuard>, String> {
     let allow_multi = env_flag("STEER_ALLOW_MULTI");
     let lock_disabled = env_flag("STEER_LOCK_DISABLED");
-    let allow_lock_disable =
-        env_flag("STEER_ALLOW_LOCK_DISABLE") || env_flag("STEER_TEST_MODE") || env_flag("CI");
-
-    if allow_multi && !allow_lock_disable {
+    let explicit_disable_flag = env_flag("STEER_ALLOW_LOCK_DISABLE");
+    let test_context = env_flag("STEER_TEST_MODE") || env_flag("CI");
+    if explicit_disable_flag && !test_context {
         return Err(
-            "STEER_ALLOW_MULTI requires STEER_ALLOW_LOCK_DISABLE=1 or STEER_TEST_MODE=1"
+            "STEER_ALLOW_LOCK_DISABLE is test-only (requires STEER_TEST_MODE=1 or CI=1)"
                 .to_string(),
         );
     }
-    if allow_multi || (lock_disabled && allow_lock_disable) {
+
+    if allow_multi && !test_context {
+        return Err(
+            "STEER_ALLOW_MULTI is test-only (requires STEER_TEST_MODE=1 or CI=1)".to_string(),
+        );
+    }
+    if allow_multi || (lock_disabled && test_context) {
         return Ok(None);
     }
-    if lock_disabled && !allow_lock_disable {
+    if lock_disabled && !test_context {
         return Err(
-            "STEER_LOCK_DISABLED requires STEER_ALLOW_LOCK_DISABLE=1 or STEER_TEST_MODE=1"
-                .to_string(),
+            "STEER_LOCK_DISABLED is test-only (requires STEER_TEST_MODE=1 or CI=1)".to_string(),
         );
     }
 

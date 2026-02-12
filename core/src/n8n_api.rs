@@ -3,7 +3,6 @@ use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[allow(dead_code)]
@@ -384,16 +383,18 @@ impl N8nApi {
         if resp.status().is_success() {
             println!("✅ API Key is valid.");
             Ok(())
-        } else if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        } else if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            || resp.status() == reqwest::StatusCode::FORBIDDEN
+        {
             Err(anyhow::anyhow!(
-                "❌ n8n API Key is INVALID (401). Check core/.env or secrets."
+                "❌ n8n API Key is INVALID ({}). Check core/.env or secrets.",
+                resp.status()
             ))
         } else {
-            // Other error, maybe server error, but key might be fine.
-            // Be conservative: warn but don't block if it's just empty or 404?
-            // 403/401 is the main concern.
-            println!("⚠️ Auth check returned status: {}", resp.status());
-            Ok(()) // Let it slide if it's not strictly 401, to avoid blocking valid but weird states
+            Err(anyhow::anyhow!(
+                "❌ n8n auth verification failed with status {}",
+                resp.status()
+            ))
         }
     }
 
@@ -528,7 +529,6 @@ impl N8nApi {
         let import_marker = format!("steer-import-{}", uuid::Uuid::new_v4());
 
         // 5. Run CLI Import
-        let ids_before_cli = self.list_workflow_ids_by_name(name).unwrap_or_default();
         if let Err(e) = self
             .create_workflow_cli(name, &normalized, active, &import_marker)
             .await
@@ -536,9 +536,9 @@ impl N8nApi {
             return Err(anyhow::anyhow!("❌ CLI Fallback Failed: {}", e));
         }
 
-        // 6. Retrieve ID from DB:
-        // Since CLI doesn't return workflow ID, prefer steer import marker, then diff IDs.
-        self.retrieve_workflow_id(name, &ids_before_cli, &import_marker)
+        // 6. Retrieve ID via CLI export (no direct SQLite coupling).
+        self.retrieve_workflow_id_via_cli_export(name, &import_marker)
+            .await
     }
 
     async fn create_workflow_api(
@@ -667,71 +667,110 @@ impl N8nApi {
         Ok("cli-imported".to_string())
     }
 
-    fn list_workflow_ids_by_name(&self, name: &str) -> Result<Vec<String>> {
-        use rusqlite::Connection;
-        let home = std::env::var("HOME").unwrap_or("/".to_string());
-        let db_path = format!("{}/.n8n/database.sqlite", home);
-
-        let conn = Connection::open(db_path)?;
-        let mut stmt = conn.prepare(
-            "SELECT id FROM workflow_entity WHERE name = ?1 ORDER BY updatedAt DESC LIMIT 20",
-        )?;
-        let mut rows = stmt.query([name])?;
-        let mut ids = Vec::new();
-        while let Some(row) = rows.next()? {
-            ids.push(row.get::<usize, String>(0)?);
+    fn workflow_id_from_value(value: Option<&Value>) -> Option<String> {
+        match value {
+            Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
+            Some(Value::Number(n)) => Some(n.to_string()),
+            _ => None,
         }
-        Ok(ids)
     }
 
-    fn list_workflow_ids_by_import_marker(&self, import_marker: &str) -> Result<Vec<String>> {
-        use rusqlite::Connection;
-        let home = std::env::var("HOME").unwrap_or("/".to_string());
-        let db_path = format!("{}/.n8n/database.sqlite", home);
-
-        let conn = Connection::open(db_path)?;
-        let mut stmt = conn.prepare(
-            "SELECT id FROM workflow_entity WHERE settings LIKE ?1 ORDER BY updatedAt DESC LIMIT 20",
-        )?;
-        let like_pattern = format!("%{}%", import_marker);
-        let mut rows = stmt.query([like_pattern])?;
-        let mut ids = Vec::new();
-        while let Some(row) = rows.next()? {
-            ids.push(row.get::<usize, String>(0)?);
-        }
-        Ok(ids)
-    }
-
-    // Helper to find ID after CLI import.
-    fn retrieve_workflow_id(
-        &self,
-        name: &str,
-        before_ids: &[String],
-        import_marker: &str,
-    ) -> Result<String> {
-        if !import_marker.trim().is_empty() {
-            if let Ok(marker_ids) = self.list_workflow_ids_by_import_marker(import_marker) {
-                if let Some(id) = marker_ids.first() {
-                    return Ok(id.clone());
+    fn export_items_from_value(value: &Value) -> Vec<Value> {
+        match value {
+            Value::Array(items) => items.clone(),
+            Value::Object(map) => {
+                if let Some(Value::Array(items)) = map.get("data") {
+                    items.clone()
+                } else if map.contains_key("nodes") || map.contains_key("connections") {
+                    vec![value.clone()]
+                } else {
+                    Vec::new()
                 }
             }
+            _ => Vec::new(),
+        }
+    }
+
+    async fn retrieve_workflow_id_via_cli_export(
+        &self,
+        name: &str,
+        import_marker: &str,
+    ) -> Result<String> {
+        let path = format!("/tmp/n8n_export_{}.json", uuid::Uuid::new_v4());
+        let output = tokio::process::Command::new("npx")
+            .args(["-y", "n8n", "export:workflow", "--all", "--output", &path])
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let detail = if !stderr.is_empty() { stderr } else { stdout };
+            return Err(anyhow::anyhow!(
+                "CLI workflow id lookup failed after import: {}",
+                detail
+            ));
         }
 
-        let ids = self.list_workflow_ids_by_name(name)?;
-        if ids.is_empty() {
-            return Err(anyhow::anyhow!("Could not find imported workflow ID in DB"));
+        let raw = tokio::fs::read_to_string(&path).await?;
+        if let Err(e) = tokio::fs::remove_file(&path).await {
+            eprintln!("⚠️ Failed to clean up export file {}: {}", path, e);
         }
 
-        let before_set: HashSet<&str> = before_ids.iter().map(|s| s.as_str()).collect();
-        for id in &ids {
-            if !before_set.contains(id.as_str()) {
-                return Ok(id.clone());
+        let parsed: Value = serde_json::from_str(&raw).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse exported workflows while resolving imported workflow id: {}",
+                e
+            )
+        })?;
+        let items = Self::export_items_from_value(&parsed);
+        if items.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No workflows found in n8n CLI export while resolving imported workflow id"
+            ));
+        }
+
+        let mut marker_match: Option<String> = None;
+        let mut name_matches: Vec<String> = Vec::new();
+        for item in items {
+            let Some(id) = Self::workflow_id_from_value(item.get("id")) else {
+                continue;
+            };
+            let settings_text = item
+                .get("settings")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            if !import_marker.trim().is_empty() && settings_text.contains(import_marker) {
+                marker_match = Some(id);
+                break;
+            }
+
+            if item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|wf_name| wf_name == name)
+                .unwrap_or(false)
+            {
+                name_matches.push(id);
             }
         }
 
-        ids.into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("Could not find imported workflow ID in DB"))
+        if let Some(id) = marker_match {
+            return Ok(id);
+        }
+        if let Some(id) = name_matches.first() {
+            if name_matches.len() > 1 {
+                eprintln!(
+                    "⚠️ Multiple workflows matched by name '{}' after CLI import; using first exported id={}",
+                    name, id
+                );
+            }
+            return Ok(id.clone());
+        }
+
+        Err(anyhow::anyhow!(
+            "Could not resolve imported workflow id via n8n CLI export"
+        ))
     }
 
     fn build_minimal_workflow(name: &str) -> Value {

@@ -13,6 +13,7 @@ TELEGRAM_CONNECT_TIMEOUT="${TELEGRAM_CONNECT_TIMEOUT:-5}"
 TELEGRAM_MAX_TIME="${TELEGRAM_MAX_TIME:-10}"
 TELEGRAM_RETRY_COUNT="${TELEGRAM_RETRY_COUNT:-3}"
 TELEGRAM_RETRY_DELAY_SEC="${TELEGRAM_RETRY_DELAY_SEC:-1}"
+TELEGRAM_VALIDATE_REPORT="${TELEGRAM_VALIDATE_REPORT:-0}"
 
 MESSAGE="$1"
 IMAGE_PATH="$2"
@@ -50,6 +51,36 @@ fi
 if [ -n "${TELEGRAM_DUMP_FINAL_PATH:-}" ]; then
     mkdir -p "$(dirname "$TELEGRAM_DUMP_FINAL_PATH")"
     printf '%s\n' "$MESSAGE" > "$TELEGRAM_DUMP_FINAL_PATH"
+fi
+
+validate_report_message() {
+    local text="$1"
+    local evidence_count
+    local has_status
+    local has_evidence_header
+
+    has_status=0
+    has_evidence_header=0
+    if printf '%s\n' "$text" | grep -Eq "^상태:[[:space:]]*(✅|❌)"; then
+        has_status=1
+    fi
+    if printf '%s\n' "$text" | grep -Eq "^근거:"; then
+        has_evidence_header=1
+    fi
+    evidence_count="$(printf '%s\n' "$text" | grep -Ec "^- ")"
+    evidence_count="${evidence_count:-0}"
+
+    if [ "$has_status" -eq 0 ] || [ "$has_evidence_header" -eq 0 ] || [ "$evidence_count" -lt 3 ]; then
+        echo "❌ Telegram report validation failed (status=$has_status evidence_header=$has_evidence_header bullets=$evidence_count)"
+        return 1
+    fi
+    return 0
+}
+
+if [ "$TELEGRAM_VALIDATE_REPORT" = "1" ]; then
+    if ! validate_report_message "$MESSAGE"; then
+        exit 1
+    fi
 fi
 
 # Send text message using JSON payload

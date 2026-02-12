@@ -280,6 +280,7 @@ extract_expected_recipient_from_request() {
 token_presence_location() {
     local token="$1"
     local marker="${2:-}"
+    local run_start_epoch="${3:-0}"
     local require_marker="${STEER_SEMANTIC_REQUIRE_MARKER:-1}"
     local scan_limit="${STEER_MAIL_SENT_SCAN_LIMIT:-120}"
     local result=""
@@ -296,7 +297,7 @@ token_presence_location() {
     tmp_err="$(mktemp -t steer_osa_err.XXXXXX)"
 
     (
-        osascript - "$token" "$marker" "$scan_limit" <<'APPLESCRIPT'
+        osascript - "$token" "$marker" "$scan_limit" "$run_start_epoch" <<'APPLESCRIPT'
 on run argv
     set tokenText to item 1 of argv
     set markerText to ""
@@ -307,6 +308,22 @@ on run argv
             set scanLimit to (item 3 of argv) as integer
         on error
             set scanLimit to 120
+        end try
+    end if
+    set runStartEpoch to 0
+    if (count of argv) > 3 then
+        try
+            set runStartEpoch to (item 4 of argv) as integer
+        on error
+            set runStartEpoch to 0
+        end try
+    end if
+    set nowEpoch to 0
+    if runStartEpoch > 0 then
+        try
+            set nowEpoch to (do shell script "date +%s") as integer
+        on error
+            set nowEpoch to 0
         end try
     end if
     if scanLimit < 10 then set scanLimit to 10
@@ -376,13 +393,31 @@ on run argv
                                 set sm to message idx of sentMbx
                                 set ss to ""
                                 set sc to ""
+                                set timeOk to true
                                 try
                                     set ss to subject of sm as text
                                 end try
                                 try
                                     set sc to content of sm as text
                                 end try
-                                set sentScopeOk to (markerText is "" or sc contains markerText or ss contains markerText)
+                                if runStartEpoch > 0 then
+                                    set timeOk to false
+                                    set sentAt to missing value
+                                    try
+                                        set sentAt to date sent of sm
+                                    on error
+                                        try
+                                            set sentAt to date received of sm
+                                        end try
+                                    end try
+                                    if sentAt is not missing value and nowEpoch > 0 then
+                                        set sentAgeSeconds to ((current date) - sentAt)
+                                        if sentAgeSeconds < 0 then set sentAgeSeconds to 0
+                                        set sentEpoch to nowEpoch - (round sentAgeSeconds rounding down)
+                                        if sentEpoch ≥ runStartEpoch then set timeOk to true
+                                    end if
+                                end if
+                                set sentScopeOk to (timeOk and (markerText is "" or sc contains markerText or ss contains markerText))
                                 if sentScopeOk and ss contains tokenText then return "MAIL_SENT_SUBJECT"
                                 if sentScopeOk and sc contains tokenText then return "MAIL_SENT_BODY"
                             end repeat
@@ -451,6 +486,7 @@ APPLESCRIPT
 mail_sent_recipient_location() {
     local recipient="$1"
     local marker="${2:-}"
+    local run_start_epoch="${3:-0}"
     local require_marker="${STEER_SEMANTIC_REQUIRE_MARKER:-1}"
     local scan_limit="${STEER_MAIL_SENT_SCAN_LIMIT:-120}"
     local result=""
@@ -472,7 +508,7 @@ mail_sent_recipient_location() {
     tmp_err="$(mktemp -t steer_mail_recipient_err.XXXXXX)"
 
     (
-        osascript - "$recipient" "$marker" "$scan_limit" <<'APPLESCRIPT'
+        osascript - "$recipient" "$marker" "$scan_limit" "$run_start_epoch" <<'APPLESCRIPT'
 on run argv
     set recipientText to item 1 of argv
     set markerText to ""
@@ -483,6 +519,22 @@ on run argv
             set scanLimit to (item 3 of argv) as integer
         on error
             set scanLimit to 120
+        end try
+    end if
+    set runStartEpoch to 0
+    if (count of argv) > 3 then
+        try
+            set runStartEpoch to (item 4 of argv) as integer
+        on error
+            set runStartEpoch to 0
+        end try
+    end if
+    set nowEpoch to 0
+    if runStartEpoch > 0 then
+        try
+            set nowEpoch to (do shell script "date +%s") as integer
+        on error
+            set nowEpoch to 0
         end try
     end if
     if scanLimit < 10 then set scanLimit to 10
@@ -502,6 +554,7 @@ on run argv
                                 set ss to ""
                                 set sc to ""
                                 set recipientsText to ""
+                                set timeOk to true
                                 try
                                     set ss to subject of sm as text
                                 end try
@@ -515,7 +568,24 @@ on run argv
                                         end try
                                     end repeat
                                 end try
-                                set scopeOk to (markerText is "" or sc contains markerText or ss contains markerText)
+                                if runStartEpoch > 0 then
+                                    set timeOk to false
+                                    set sentAt to missing value
+                                    try
+                                        set sentAt to date sent of sm
+                                    on error
+                                        try
+                                            set sentAt to date received of sm
+                                        end try
+                                    end try
+                                    if sentAt is not missing value and nowEpoch > 0 then
+                                        set sentAgeSeconds to ((current date) - sentAt)
+                                        if sentAgeSeconds < 0 then set sentAgeSeconds to 0
+                                        set sentEpoch to nowEpoch - (round sentAgeSeconds rounding down)
+                                        if sentEpoch ≥ runStartEpoch then set timeOk to true
+                                    end if
+                                end if
+                                set scopeOk to (timeOk and (markerText is "" or sc contains markerText or ss contains markerText))
                                 if scopeOk and recipientsText contains recipientText then return "MAIL_SENT_RECIPIENT"
                             end repeat
                         end if
@@ -576,6 +646,9 @@ NOTIFIER_TIMEOUT_SEC="${STEER_NOTIFIER_TIMEOUT_SEC:-25}"
 REQUIRE_PRIMARY_PLANNER_VALUE="${STEER_REQUIRE_PRIMARY_PLANNER:-1}"
 LOCK_DISABLED_VALUE="${STEER_LOCK_DISABLED:-0}"
 RUN_SCOPE_ENABLED="${STEER_SEMANTIC_RUN_SCOPE:-1}"
+TEST_MODE_VALUE="${STEER_TEST_MODE:-0}"
+REQUIRE_NODE_CAPTURE_VALUE="${STEER_REQUIRE_NODE_CAPTURE:-1}"
+RUN_STARTED_EPOCH=0
 
 detect_cli_llm_provider() {
     local preferred="${STEER_CLI_LLM_AUTO_ORDER:-codex,gemini,claude}"
@@ -590,6 +663,28 @@ detect_cli_llm_provider() {
         if command -v "$p" >/dev/null 2>&1; then
             printf '%s\n' "$p"
             return 0
+        fi
+    done
+    return 1
+}
+
+has_openai_key_configured() {
+    if [ -n "${OPENAI_API_KEY:-}" ]; then
+        return 0
+    fi
+
+    local env_files=(".env" "core/.env")
+    local env_file=""
+    for env_file in "${env_files[@]}"; do
+        [ -f "$env_file" ] || continue
+        if grep -Eq '^[[:space:]]*OPENAI_API_KEY[[:space:]]*=' "$env_file"; then
+            local key_line
+            key_line="$(grep -E '^[[:space:]]*OPENAI_API_KEY[[:space:]]*=' "$env_file" | tail -n 1 || true)"
+            local key_value="${key_line#*=}"
+            key_value="$(printf '%s' "$key_value" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/^["'"'"']|["'"'"']$//g')"
+            if [ -n "$key_value" ]; then
+                return 0
+            fi
         fi
     done
     return 1
@@ -614,12 +709,20 @@ if [ "$REQUIRE_PRIMARY_PLANNER_VALUE" = "1" ] && [ "$SCENARIO_MODE_VALUE" = "1" 
     exit 1
 fi
 
+if [ "$SCENARIO_MODE_VALUE" = "0" ] && [ -z "$CLI_LLM_VALUE" ] && ! has_openai_key_configured; then
+    echo "❌ Preflight failed: OPENAI_API_KEY is not set."
+    echo "   Fix: 기본 OpenAI 경로를 쓰려면 .env/core/.env 또는 현재 셸에 OPENAI_API_KEY를 설정하세요."
+    echo "   대안: STEER_CLI_LLM 설정 또는 STEER_SCENARIO_MODE=1(테스트 전용) 사용."
+    exit 1
+fi
+
 FATAL_PATTERN='Failed to acquire lock|thread .* panicked|FATAL ERROR|⛔️|LLM not available for surf mode|Preflight failed|Surf failed|Supervisor escalated|Execution Error|SCHEMA_ERROR|PLAN_REJECTED|LLM Refused'
 
 echo "🚀 Running NL request..."
 echo "Task: ${TASK_NAME}"
 echo "Mode: STEER_SCENARIO_MODE=${SCENARIO_MODE_VALUE}"
 echo "Node Capture: STEER_NODE_CAPTURE=1, STEER_NODE_CAPTURE_ALL=${NODE_CAPTURE_ALL_VALUE}"
+echo "Test Mode: STEER_TEST_MODE=${TEST_MODE_VALUE}"
 echo "Fallback Policy: STEER_FAIL_ON_FALLBACK=${FAIL_ON_FALLBACK_VALUE}"
 if [ -n "$RUN_SCOPE_MARKER" ]; then
     echo "Semantic Scope Marker: ${RUN_SCOPE_MARKER}"
@@ -674,6 +777,27 @@ is_user_active_front_app() {
     return 1
 }
 
+should_pause_for_user_input() {
+    local front_app="$1"
+    local guard_mode="${STEER_USER_INPUT_GUARD_MODE:-all}"
+    case "$guard_mode" in
+        all)
+            return 0
+            ;;
+        app_list|allowlist)
+            is_user_active_front_app "$front_app"
+            return $?
+            ;;
+        none)
+            return 1
+            ;;
+        *)
+            is_user_active_front_app "$front_app"
+            return $?
+            ;;
+    esac
+}
+
 run_surf_with_input_guard() {
     local use_guard="${STEER_PAUSE_ON_USER_INPUT:-1}"
     if [ "$use_guard" != "1" ]; then
@@ -684,7 +808,7 @@ run_surf_with_input_guard() {
                 STEER_NODE_CAPTURE_ALL="$NODE_CAPTURE_ALL_VALUE" \
                 STEER_NODE_CAPTURE_DIR="$NODE_DIR" \
                 STEER_LOCK_DISABLED="$LOCK_DISABLED_VALUE" \
-                STEER_TEST_MODE=1 \
+                STEER_TEST_MODE="$TEST_MODE_VALUE" \
                 cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$REQUEST_TEXT_EXEC" &> "$LOG_FILE"
         else
             STEER_SCENARIO_MODE="$SCENARIO_MODE_VALUE" \
@@ -692,7 +816,7 @@ run_surf_with_input_guard() {
                 STEER_NODE_CAPTURE_ALL="$NODE_CAPTURE_ALL_VALUE" \
                 STEER_NODE_CAPTURE_DIR="$NODE_DIR" \
                 STEER_LOCK_DISABLED="$LOCK_DISABLED_VALUE" \
-                STEER_TEST_MODE=1 \
+                STEER_TEST_MODE="$TEST_MODE_VALUE" \
                 cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$REQUEST_TEXT_EXEC" &> "$LOG_FILE"
         fi
         return $?
@@ -705,7 +829,7 @@ run_surf_with_input_guard() {
     local pause_count=0
     local run_pid
 
-    echo "🛡️ User-input guard enabled (apps=${STEER_USER_ACTIVE_APPS:-Terminal,Codex,iTerm2}, active<=${active_threshold}s, resume>=${resume_idle}s)"
+    echo "🛡️ User-input guard enabled (mode=${STEER_USER_INPUT_GUARD_MODE:-all}, apps=${STEER_USER_ACTIVE_APPS:-Terminal,Codex,iTerm2}, active<=${active_threshold}s, resume>=${resume_idle}s)"
 
     if [ -n "$CLI_LLM_VALUE" ]; then
         STEER_SCENARIO_MODE="$SCENARIO_MODE_VALUE" \
@@ -714,7 +838,7 @@ run_surf_with_input_guard() {
             STEER_NODE_CAPTURE_ALL="$NODE_CAPTURE_ALL_VALUE" \
             STEER_NODE_CAPTURE_DIR="$NODE_DIR" \
             STEER_LOCK_DISABLED="$LOCK_DISABLED_VALUE" \
-            STEER_TEST_MODE=1 \
+            STEER_TEST_MODE="$TEST_MODE_VALUE" \
             cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$REQUEST_TEXT_EXEC" &> "$LOG_FILE" &
     else
         STEER_SCENARIO_MODE="$SCENARIO_MODE_VALUE" \
@@ -722,7 +846,7 @@ run_surf_with_input_guard() {
             STEER_NODE_CAPTURE_ALL="$NODE_CAPTURE_ALL_VALUE" \
             STEER_NODE_CAPTURE_DIR="$NODE_DIR" \
             STEER_LOCK_DISABLED="$LOCK_DISABLED_VALUE" \
-            STEER_TEST_MODE=1 \
+            STEER_TEST_MODE="$TEST_MODE_VALUE" \
             cargo run --manifest-path core/Cargo.toml --bin local_os_agent -- surf "$REQUEST_TEXT_EXEC" &> "$LOG_FILE" &
     fi
     run_pid=$!
@@ -733,7 +857,7 @@ run_surf_with_input_guard() {
         if [ -n "$idle_sec" ]; then
             local front_app
             front_app="$(get_frontmost_app)"
-            if [ "$paused" -eq 0 ] && [ "$idle_sec" -le "$active_threshold" ] && is_user_active_front_app "$front_app"; then
+            if [ "$paused" -eq 0 ] && [ "$idle_sec" -le "$active_threshold" ] && should_pause_for_user_input "$front_app"; then
                 # Pause root process and immediate children to avoid race with cargo/local_os_agent.
                 kill -STOP "$run_pid" >/dev/null 2>&1 || true
                 pkill -STOP -P "$run_pid" >/dev/null 2>&1 || true
@@ -760,6 +884,7 @@ run_surf_with_input_guard() {
 }
 
 STATUS="success"
+RUN_STARTED_EPOCH="$(date +%s)"
 if ! run_surf_with_input_guard; then
     STATUS="failed"
 fi
@@ -817,9 +942,9 @@ if [ "${STEER_SEMANTIC_VERIFY:-1}" = "1" ]; then
         for token in "${FILTERED_TOKENS[@]}"; do
             checked_count=$((checked_count + 1))
             normalized_token="$(normalize_semantic_token "$token")"
-            location="$(token_presence_location "$token" "$RUN_SCOPE_MARKER")"
+            location="$(token_presence_location "$token" "$RUN_SCOPE_MARKER" "$RUN_STARTED_EPOCH")"
             if semantic_location_missing "$location" && [ -n "$normalized_token" ] && [ "$normalized_token" != "$token" ]; then
-                location="$(token_presence_location "$normalized_token" "$RUN_SCOPE_MARKER")"
+                location="$(token_presence_location "$normalized_token" "$RUN_SCOPE_MARKER" "$RUN_STARTED_EPOCH")"
             fi
             if semantic_location_missing "$location"; then
                 missing_count=$((missing_count + 1))
@@ -858,7 +983,7 @@ if printf '%s' "$REQUEST_TEXT_FOR_VERIFY" | grep -Eiq '보내|발송|send'; then
 
     mail_sent_location="NOT_CHECKED"
     if [ -n "$mail_verify_token" ]; then
-        mail_sent_location="$(token_presence_location "$mail_verify_token" "$RUN_SCOPE_MARKER")"
+        mail_sent_location="$(token_presence_location "$mail_verify_token" "$RUN_SCOPE_MARKER" "$RUN_STARTED_EPOCH")"
     fi
     mail_sent_ok=0
     case "$mail_sent_location" in
@@ -878,7 +1003,7 @@ if printf '%s' "$REQUEST_TEXT_FOR_VERIFY" | grep -Eiq '보내|발송|send'; then
     mail_recipient_location="RECIPIENT_UNSET"
     mail_recipient_ok=0
     if printf '%s' "$expected_recipient" | grep -Eq '.+@.+\..+'; then
-        mail_recipient_location="$(mail_sent_recipient_location "$expected_recipient" "$RUN_SCOPE_MARKER")"
+        mail_recipient_location="$(mail_sent_recipient_location "$expected_recipient" "$RUN_SCOPE_MARKER" "$RUN_STARTED_EPOCH")"
         if [ "$mail_recipient_location" = "MAIL_SENT_RECIPIENT" ]; then
             mail_recipient_ok=1
         fi
@@ -909,6 +1034,7 @@ fi
 EVIDENCE_LINES="${EVIDENCE_LINES}- 판정 기준: 종료코드 + 치명 로그 패턴 검사"$'\n'
 EVIDENCE_LINES="${EVIDENCE_LINES}- STEER_SCENARIO_MODE=${SCENARIO_MODE_VALUE}"$'\n'
 EVIDENCE_LINES="${EVIDENCE_LINES}- STEER_NODE_CAPTURE_ALL=${NODE_CAPTURE_ALL_VALUE}"$'\n'
+EVIDENCE_LINES="${EVIDENCE_LINES}- STEER_TEST_MODE=${TEST_MODE_VALUE}"$'\n'
 if [ "$FALLBACK_HIT" -eq 1 ]; then
     EVIDENCE_LINES="${EVIDENCE_LINES}- fallback 액션 감지됨(fallback action/FALLBACK_ACTION)"$'\n'
     if [ "$FAIL_ON_FALLBACK_VALUE" = "1" ]; then
@@ -920,6 +1046,10 @@ EVIDENCE_LINES="${EVIDENCE_LINES}${SEMANTIC_LINES}"
 NODE_COUNT=0
 if [ -d "$NODE_DIR" ]; then
     NODE_COUNT=$(find "$NODE_DIR" -maxdepth 1 -type f -name '*.png' | wc -l | tr -d ' ')
+fi
+if [ "$REQUIRE_NODE_CAPTURE_VALUE" = "1" ] && [ "$NODE_COUNT" -eq 0 ]; then
+    STATUS="failed"
+    EVIDENCE_LINES="${EVIDENCE_LINES}- 계약 위반: node_capture required인데 노드 캡처가 없습니다"$'\n'
 fi
 EVIDENCE_LINES="${EVIDENCE_LINES}- 노드 캡처 수: ${NODE_COUNT}"$'\n'
 EVIDENCE_LINES="${EVIDENCE_LINES}- 노드 캡처 폴더: $(basename "$NODE_DIR")"$'\n'
@@ -1037,13 +1167,13 @@ if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ] && [ -f ".
 
     if [ -n "$TELEGRAM_MAIN_IMAGE" ] && [ -f "$TELEGRAM_MAIN_IMAGE" ]; then
         if ! send_telegram_with_timeout "$NOTIFIER_TIMEOUT_SEC" \
-            env TELEGRAM_DUMP_FINAL_PATH="$FINAL_MSG_FILE" TELEGRAM_SKIP_REWRITE=1 "${EXTRA_NODE_ENV[@]}" \
+            env TELEGRAM_DUMP_FINAL_PATH="$FINAL_MSG_FILE" TELEGRAM_SKIP_REWRITE=1 TELEGRAM_VALIDATE_REPORT=1 "${EXTRA_NODE_ENV[@]}" \
             bash ./send_telegram_notification.sh "$TELEGRAM_MESSAGE" "$TELEGRAM_MAIN_IMAGE" >/dev/null 2>&1; then
             TELEGRAM_SEND_OK=0
         fi
     else
         if ! send_telegram_with_timeout "$NOTIFIER_TIMEOUT_SEC" \
-            env TELEGRAM_DUMP_FINAL_PATH="$FINAL_MSG_FILE" TELEGRAM_SKIP_REWRITE=1 "${EXTRA_NODE_ENV[@]}" \
+            env TELEGRAM_DUMP_FINAL_PATH="$FINAL_MSG_FILE" TELEGRAM_SKIP_REWRITE=1 TELEGRAM_VALIDATE_REPORT=1 "${EXTRA_NODE_ENV[@]}" \
             bash ./send_telegram_notification.sh "$TELEGRAM_MESSAGE" >/dev/null 2>&1; then
             TELEGRAM_SEND_OK=0
         fi

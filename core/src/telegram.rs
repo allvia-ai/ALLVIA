@@ -114,15 +114,29 @@ impl TelegramBot {
                                             .await
                                         {
                                             Ok(outcome) => {
+                                                let summary = outcome
+                                                    .summary
+                                                    .clone()
+                                                    .unwrap_or_else(|| "n/a".to_string());
                                                 let reply = if outcome.business_complete {
                                                     format!(
-                                                        "✅ Task Completed. (run_id={})",
-                                                        outcome.run_id
+                                                        "✅ Task Completed.\nrun_id={}\nstatus={}\nplanner_complete={}\nexecution_complete={}\nbusiness_complete={}\nsummary={}",
+                                                        outcome.run_id,
+                                                        outcome.status,
+                                                        outcome.planner_complete,
+                                                        outcome.execution_complete,
+                                                        outcome.business_complete,
+                                                        summary
                                                     )
                                                 } else {
                                                     format!(
-                                                        "⚠️ 실행은 완료됐지만 최종 완료 조건이 충족되지 않았습니다 (run_id={}, status={}). 로그/증거를 확인하세요.",
-                                                        outcome.run_id, outcome.status
+                                                        "❌ Task Incomplete.\nrun_id={}\nstatus={}\nplanner_complete={}\nexecution_complete={}\nbusiness_complete={}\nsummary={}\n로그/증거를 확인하세요.",
+                                                        outcome.run_id,
+                                                        outcome.status,
+                                                        outcome.planner_complete,
+                                                        outcome.execution_complete,
+                                                        outcome.business_complete,
+                                                        summary
                                                     )
                                                 };
                                                 let _ =

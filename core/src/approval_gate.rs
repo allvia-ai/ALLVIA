@@ -2,6 +2,8 @@
 // Provides command approval workflow for dangerous operations
 
 use lazy_static::lazy_static;
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -54,7 +56,7 @@ lazy_static! {
         "> /dev/sda",
     ];
 
-    /// Safe commands (always auto-approve)
+    /// Safe binaries (conditionally auto-approved when arguments are non-risky)
     static ref SAFE_BINS: HashSet<&'static str> = {
         let mut set = HashSet::new();
         set.insert("ls");
@@ -64,6 +66,8 @@ lazy_static! {
         set.insert("head");
         set.insert("tail");
         set.insert("grep");
+        set.insert("cut");
+        set.insert("tr");
         set.insert("find");
         set.insert("which");
         set.insert("whoami");
@@ -109,33 +113,157 @@ struct DecisionEntry {
 
 pub struct ApprovalGate;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellOperator {
+    Pipe,
+    And,
+    Or,
+    Seq,
+}
+
+#[derive(Debug, Default)]
+struct ParsedShellCommand {
+    segments: Vec<String>,
+    operators: Vec<ShellOperator>,
+    has_redirection: bool,
+    has_substitution: bool,
+    has_unterminated_quote: bool,
+}
+
 impl ApprovalGate {
-    fn has_shell_features(cmd: &str) -> bool {
-        let compact = cmd.trim();
-        if compact.is_empty() {
-            return false;
+    fn push_segment(buffer: &mut String, segments: &mut Vec<String>) {
+        let trimmed = buffer.trim();
+        if !trimmed.is_empty() {
+            segments.push(trimmed.to_string());
         }
-        // Conservative: if shell chaining/redirection/substitution exists, require approval.
-        compact.contains("&&")
-            || compact.contains("||")
-            || compact.contains(';')
-            || compact.contains('|')
-            || compact.contains('>')
-            || compact.contains('<')
-            || compact.contains("$(")
-            || compact.contains('`')
+        buffer.clear();
+    }
+
+    fn parse_shell_command(cmd: &str) -> ParsedShellCommand {
+        let mut parsed = ParsedShellCommand::default();
+        let mut current = String::new();
+        let mut chars = cmd.chars().peekable();
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut escaped = false;
+
+        while let Some(ch) = chars.next() {
+            if escaped {
+                current.push(ch);
+                escaped = false;
+                continue;
+            }
+
+            if ch == '\\' && !in_single {
+                escaped = true;
+                current.push(ch);
+                continue;
+            }
+
+            if ch == '\'' && !in_double {
+                in_single = !in_single;
+                current.push(ch);
+                continue;
+            }
+            if ch == '"' && !in_single {
+                in_double = !in_double;
+                current.push(ch);
+                continue;
+            }
+
+            if !in_single && !in_double {
+                if ch == '`' {
+                    parsed.has_substitution = true;
+                    current.push(ch);
+                    continue;
+                }
+                if ch == '$' && matches!(chars.peek(), Some('(')) {
+                    parsed.has_substitution = true;
+                    current.push(ch);
+                    continue;
+                }
+                if ch == '>' || ch == '<' {
+                    parsed.has_redirection = true;
+                    current.push(ch);
+                    continue;
+                }
+                if ch == '&' && matches!(chars.peek(), Some('&')) {
+                    let _ = chars.next();
+                    Self::push_segment(&mut current, &mut parsed.segments);
+                    parsed.operators.push(ShellOperator::And);
+                    continue;
+                }
+                if ch == '|' {
+                    if matches!(chars.peek(), Some('|')) {
+                        let _ = chars.next();
+                        Self::push_segment(&mut current, &mut parsed.segments);
+                        parsed.operators.push(ShellOperator::Or);
+                        continue;
+                    }
+                    Self::push_segment(&mut current, &mut parsed.segments);
+                    parsed.operators.push(ShellOperator::Pipe);
+                    continue;
+                }
+                if ch == ';' {
+                    Self::push_segment(&mut current, &mut parsed.segments);
+                    parsed.operators.push(ShellOperator::Seq);
+                    continue;
+                }
+            }
+
+            current.push(ch);
+        }
+
+        if escaped || in_single || in_double {
+            parsed.has_unterminated_quote = true;
+        }
+        Self::push_segment(&mut current, &mut parsed.segments);
+        parsed
     }
 
     fn command_words(cmd: &str) -> Vec<String> {
-        cmd.split_whitespace()
-            .map(|part| {
-                part.trim_matches(|c: char| {
-                    matches!(c, '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',')
-                })
-                .to_lowercase()
-            })
-            .filter(|part| !part.is_empty())
-            .collect()
+        let mut words = Vec::new();
+        let mut current = String::new();
+        let mut chars = cmd.chars().peekable();
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut escaped = false;
+
+        while let Some(ch) = chars.next() {
+            if escaped {
+                current.push(ch);
+                escaped = false;
+                continue;
+            }
+
+            if ch == '\\' && !in_single {
+                escaped = true;
+                continue;
+            }
+
+            if ch == '\'' && !in_double {
+                in_single = !in_single;
+                continue;
+            }
+            if ch == '"' && !in_single {
+                in_double = !in_double;
+                continue;
+            }
+
+            if ch.is_whitespace() && !in_single && !in_double {
+                if !current.is_empty() {
+                    words.push(current.to_lowercase());
+                    current.clear();
+                }
+                continue;
+            }
+            current.push(ch);
+        }
+
+        if !current.is_empty() {
+            words.push(current.to_lowercase());
+        }
+        words
     }
 
     fn command_binary(words: &[String]) -> String {
@@ -183,37 +311,134 @@ impl ApprovalGate {
         false
     }
 
-    /// Check if a command requires approval, is blocked, or can auto-run
-    pub fn check_command(cmd: &str) -> ApprovalLevel {
-        let cmd_lower = cmd.to_lowercase();
-        let cmd_trimmed = cmd.trim();
+    fn is_blocked_segment(segment: &str, binary: &str, words: &[String]) -> bool {
+        let seg_lc = segment.trim().to_lowercase();
+        if seg_lc.is_empty() {
+            return false;
+        }
 
-        // 1. Check blocked patterns first
         for pattern in BLOCKED_PATTERNS.iter() {
-            if cmd_lower.contains(pattern) {
-                return ApprovalLevel::Blocked;
+            if seg_lc.starts_with(pattern) {
+                return true;
             }
         }
 
-        // 2. Chaining/redirection/substitution always requires explicit approval.
-        if Self::has_shell_features(cmd_trimmed) {
+        if binary == "mkfs" {
+            return true;
+        }
+        if binary == "rm" {
+            let has_rf = words
+                .iter()
+                .any(|w| w.starts_with('-') && w.contains('r') && w.contains('f'));
+            let has_root_target = words
+                .iter()
+                .any(|w| matches!(w.as_str(), "/" | "/*" | "~" | "~/"));
+            if has_rf && has_root_target {
+                return true;
+            }
+        }
+        if seg_lc.contains("/dev/sda") && seg_lc.contains('>') {
+            return true;
+        }
+
+        false
+    }
+
+    fn token_looks_path_like(token: &str) -> bool {
+        token.contains('/')
+            || token.contains('\\')
+            || token.starts_with('.')
+            || token.starts_with('~')
+            || token.starts_with('*')
+            || token.ends_with('*')
+    }
+
+    fn safe_bin_args_ok(binary: &str, words: &[String]) -> bool {
+        if words.len() <= 1 {
+            return true;
+        }
+        for arg in words.iter().skip(1) {
+            if arg.is_empty() {
+                continue;
+            }
+            if arg.starts_with('-') {
+                continue;
+            }
+            if arg.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            // echo is text-oriented; keep existing low-friction behavior for literals.
+            if binary == "echo" {
+                continue;
+            }
+            // Safe bins should not auto-approve positional/path-like args.
+            if Self::token_looks_path_like(arg) {
+                return false;
+            }
+            return false;
+        }
+        true
+    }
+
+    /// Check if a command requires approval, is blocked, or can auto-run
+    pub fn check_command(cmd: &str) -> ApprovalLevel {
+        let cmd_trimmed = cmd.trim();
+        if cmd_trimmed.is_empty() {
             return ApprovalLevel::RequireApproval;
         }
 
-        // 3. Token-aware command classification.
-        let words = Self::command_words(cmd_trimmed);
-        let binary_name = Self::command_binary(&words);
-        if Self::requires_approval_by_tokens(&binary_name, &words) {
+        let parsed = Self::parse_shell_command(cmd_trimmed);
+        if parsed.has_unterminated_quote {
+            return ApprovalLevel::RequireApproval;
+        }
+        if parsed.has_substitution {
             return ApprovalLevel::RequireApproval;
         }
 
-        // 4. Safe read-only binaries.
-        if SAFE_BINS.contains(binary_name.as_str()) {
-            return ApprovalLevel::AutoApprove;
+        if parsed.has_redirection {
+            if parsed.segments.iter().any(|segment| {
+                let lowered = segment.to_lowercase();
+                lowered.contains("/dev/sda") && lowered.contains('>')
+            }) {
+                return ApprovalLevel::Blocked;
+            }
+            return ApprovalLevel::RequireApproval;
         }
 
-        // 5. Default: require approval for unknown commands.
-        ApprovalLevel::RequireApproval
+        let mut has_required_segment = false;
+        for segment in &parsed.segments {
+            let words = Self::command_words(segment);
+            let binary_name = Self::command_binary(&words);
+
+            if Self::is_blocked_segment(segment, &binary_name, &words) {
+                return ApprovalLevel::Blocked;
+            }
+            if Self::requires_approval_by_tokens(&binary_name, &words) {
+                has_required_segment = true;
+                continue;
+            }
+            if SAFE_BINS.contains(binary_name.as_str())
+                && Self::safe_bin_args_ok(&binary_name, &words)
+            {
+                continue;
+            }
+            has_required_segment = true;
+        }
+
+        if has_required_segment {
+            return ApprovalLevel::RequireApproval;
+        }
+
+        if parsed.operators.iter().any(|op| {
+            matches!(
+                op,
+                ShellOperator::And | ShellOperator::Or | ShellOperator::Seq
+            )
+        }) {
+            return ApprovalLevel::RequireApproval;
+        }
+
+        ApprovalLevel::AutoApprove
     }
 
     /// Create an approval request for a command
@@ -306,6 +531,14 @@ mod tests {
         );
         assert_eq!(
             ApprovalGate::check_command("cat file.txt"),
+            ApprovalLevel::RequireApproval
+        );
+        assert_eq!(
+            ApprovalGate::check_command("echo hello world"),
+            ApprovalLevel::AutoApprove
+        );
+        assert_eq!(
+            ApprovalGate::check_command("echo 'rm -rf /'"),
             ApprovalLevel::AutoApprove
         );
     }
@@ -345,11 +578,25 @@ mod tests {
     #[test]
     fn test_unknown_json_action_requires_approval() {
         reset_decisions();
-        let plan = test_plan("plan-unknown-action");
+        let plan = test_plan(&format!("plan-unknown-action-{}", uuid::Uuid::new_v4()));
         let action = r#"{"action":"open_app","name":"Safari"}"#;
         let decision = preview_approval(action, &plan);
         assert_eq!(decision.status, "pending");
         assert!(decision.requires_approval);
+    }
+
+    #[test]
+    fn test_json_action_key_is_canonicalized_for_decision_reuse() {
+        reset_decisions();
+        let plan = test_plan("plan-json-canonical-key");
+        let action_a = r#"{"action":"open_app","name":"Safari","meta":{"b":2,"a":1},"args":[2,1]}"#;
+        let action_b =
+            r#"{ "name":"Safari","meta":{"a":1,"b":2},"args":[2,1],"action":"open_app" }"#;
+        register_decision("approve", action_a, &plan);
+        let decision = preview_approval(action_b, &plan);
+        assert_eq!(decision.status, "approved");
+        assert!(!decision.requires_approval);
+        assert_eq!(decision.policy, "user_decision");
     }
 
     #[test]
@@ -362,12 +609,20 @@ mod tests {
             ApprovalGate::check_command("cat file.txt | wc -l"),
             ApprovalLevel::RequireApproval
         );
+        assert_eq!(
+            ApprovalGate::check_command("echo hello | wc -c"),
+            ApprovalLevel::AutoApprove
+        );
+        assert_eq!(
+            ApprovalGate::check_command("echo hello && pwd"),
+            ApprovalLevel::RequireApproval
+        );
     }
 
     #[test]
     fn test_user_approval_overrides_policy() {
         reset_decisions();
-        let plan = test_plan("plan-approval-override");
+        let plan = test_plan(&format!("plan-approval-override-{}", uuid::Uuid::new_v4()));
         let action = r#"{"action":"shell","command":"sudo apt install git"}"#;
 
         let before = preview_approval(action, &plan);
@@ -384,7 +639,7 @@ mod tests {
     #[test]
     fn test_user_denial_overrides_policy() {
         reset_decisions();
-        let plan = test_plan("plan-deny-override");
+        let plan = test_plan(&format!("plan-deny-override-{}", uuid::Uuid::new_v4()));
         let action = r#"{"action":"shell","command":"sudo apt install git"}"#;
 
         register_decision("deny", action, &plan);
@@ -568,32 +823,18 @@ pub fn preview_approval(action: &str, plan: &crate::nl_automation::Plan) -> Appr
     }
 
     let trimmed = action.trim();
-    let looks_like_shell = trimmed.contains(' ')
-        || trimmed.contains('/')
-        || trimmed.contains('|')
-        || trimmed.contains(';')
-        || trimmed.starts_with("sudo");
-    if !looks_like_shell {
-        let action_lc = trimmed.to_lowercase();
-        if matches!(action_lc.as_str(), "done" | "continue" | "next" | "skip") {
-            return ApprovalDecision {
-                status: "approved".to_string(),
-                risk_level: "low".to_string(),
-                policy: "default".to_string(),
-                message: format!("Action: {}", action),
-                requires_approval: false,
-            };
-        }
+    let action_lc = trimmed.to_lowercase();
+    if matches!(action_lc.as_str(), "done" | "continue" | "next" | "skip") {
         return ApprovalDecision {
-            status: "pending".to_string(),
-            risk_level: "high".to_string(),
+            status: "approved".to_string(),
+            risk_level: "low".to_string(),
             policy: "default".to_string(),
-            message: format!("Action requires explicit approval: {}", action),
-            requires_approval: true,
+            message: format!("Action: {}", action),
+            requires_approval: false,
         };
     }
 
-    // Shell-like plain text action: gate by command policy.
+    // Plain text action: gate by the same segmented command policy.
     let level = ApprovalGate::check_command(trimmed);
     let (status, risk, requires_approval) = match level {
         ApprovalLevel::Blocked => ("denied".to_string(), "critical".to_string(), true),
@@ -623,7 +864,42 @@ fn normalize_action(action: &str) -> String {
         .to_string()
 }
 
+fn canonicalize_json_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut keys = map.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            let mut sorted = Map::new();
+            for key in keys {
+                if let Some(item) = map.get(&key) {
+                    sorted.insert(key, canonicalize_json_value(item));
+                }
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize_json_value).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn action_fingerprint(action: &str) -> String {
+    let normalized = normalize_action(action);
+    let canonical = if let Ok(parsed) = serde_json::from_str::<Value>(&normalized) {
+        let stable = canonicalize_json_value(&parsed);
+        serde_json::to_string(&stable).unwrap_or(normalized)
+    } else {
+        normalized.to_lowercase()
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 fn decision_key(plan_id: &str, action: &str) -> String {
+    format!("{}::{}", plan_id, action_fingerprint(action))
+}
+
+fn legacy_decision_key(plan_id: &str, action: &str) -> String {
     format!("{}::{}", plan_id, normalize_action(action))
 }
 
@@ -679,23 +955,55 @@ fn cleanup_expired_decisions_locked(registry: &mut HashMap<String, DecisionEntry
 
 fn get_registered_decision(plan_id: &str, action: &str) -> Option<ApprovalStatus> {
     let key = decision_key(plan_id, action);
+    let legacy_key = legacy_decision_key(plan_id, action);
+    let mut keys = vec![key.clone()];
+    if legacy_key != key {
+        keys.push(legacy_key.clone());
+    }
+
     if let Ok(mut registry) = DECISION_REGISTRY.lock() {
         cleanup_expired_decisions_locked(&mut registry);
-        if let Some(entry) = registry.get(&key) {
-            return Some(entry.status);
+        for candidate in &keys {
+            if let Some(entry) = registry.get(candidate).cloned() {
+                if candidate != &key {
+                    registry.insert(key.clone(), entry.clone());
+                }
+                return Some(entry.status);
+            }
         }
     }
 
-    let stored = crate::db::get_active_approval_decision(&key)
-        .ok()
-        .flatten()?;
-    let status = parse_stored_status(&stored.status)?;
-    if let Ok(mut registry) = DECISION_REGISTRY.lock() {
+    for candidate in &keys {
+        let Some(stored) = crate::db::get_active_approval_decision(candidate)
+            .ok()
+            .flatten()
+        else {
+            continue;
+        };
+        let Some(status) = parse_stored_status(&stored.status) else {
+            continue;
+        };
         let expires_at = instant_from_expiry(&stored.expires_at)
             .unwrap_or_else(|| Instant::now() + decision_ttl());
-        registry.insert(key, DecisionEntry { status, expires_at });
+        if let Ok(mut registry) = DECISION_REGISTRY.lock() {
+            registry.insert(key.clone(), DecisionEntry { status, expires_at });
+            if candidate != &key {
+                registry.insert(candidate.clone(), DecisionEntry { status, expires_at });
+            }
+        }
+        if candidate != &key {
+            let _ = crate::db::upsert_approval_decision(
+                &key,
+                plan_id,
+                action,
+                status_to_storage(status),
+                std::cmp::min(decision_ttl().as_secs(), i64::MAX as u64) as i64,
+            );
+        }
+        return Some(status);
     }
-    Some(status)
+
+    None
 }
 
 fn status_to_storage(status: ApprovalStatus) -> &'static str {

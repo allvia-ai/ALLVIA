@@ -219,21 +219,26 @@ def _resolve_db_path(value: Any) -> Path:
     if not raw_value:
         raw_value = "collector.db"
 
+    def _env_bool(key: str, default: bool) -> bool:
+        raw = os.environ.get(key)
+        if raw is None:
+            return default
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
     # Explicit integration mode:
     # Use shared DB only when env override is explicitly provided.
     env_override = os.environ.get("STEER_COLLECTOR_DB_PATH") or os.environ.get("STEER_DB_PATH")
     if env_override and raw_value in {"collector.db", "./collector.db"}:
         return _resolve_path(env_override)
 
-    # Optional auto-link mode (disabled by default).
-    # This is useful when users intentionally want collector to follow the core DB path,
-    # but avoids accidental migration conflicts on legacy steer.db schemas.
-    auto_link = os.environ.get("STEER_COLLECTOR_AUTO_LINK", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    # Explicit separation mode:
+    # keep collector.db isolated even when a shared steer.db exists.
+    if _env_bool("STEER_COLLECTOR_SEPARATE_DB", False):
+        return _resolve_path(raw_value)
+
+    # Auto-link mode defaults to ON so collector follows core DB by default.
+    # Set STEER_COLLECTOR_AUTO_LINK=0 to disable auto-linking.
+    auto_link = _env_bool("STEER_COLLECTOR_AUTO_LINK", True)
     if auto_link and raw_value in {"collector.db", "./collector.db"}:
         shared_path = _discover_shared_steer_db()
         if shared_path is not None:

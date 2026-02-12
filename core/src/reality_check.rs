@@ -58,8 +58,31 @@ pub fn scan_app_inventory() -> Result<()> {
     Ok(())
 }
 
+fn normalize_app_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_lowercase()
+}
+
+fn target_aliases(target_norm: &str) -> Vec<String> {
+    let mut aliases = vec![target_norm.to_string()];
+    match target_norm {
+        "textedit" | "texteditor" => aliases.push("textedit".to_string()),
+        "googlechrome" | "chrome" => aliases.push("googlechrome".to_string()),
+        "chatgptatlas" | "atlas" => aliases.push("chatgptatlas".to_string()),
+        _ => {}
+    }
+    aliases
+}
+
 /// 2. Pre-Flight Check: App Existence
 pub fn verify_app_exists(app_name: &str) -> Result<String> {
+    let app_name = app_name.trim();
+    if app_name.is_empty() {
+        return Err(anyhow!("REALITY_CHECK_INVALID_INPUT: app name is empty"));
+    }
+
     let has_cache = INSTALLED_APPS.lock().map(|c| c.is_some()).unwrap_or(false);
     if !has_cache {
         println!("⚠️ [Reality] Inventory is NONE. Attempting lazy app scan...");
@@ -71,11 +94,27 @@ pub fn verify_app_exists(app_name: &str) -> Result<String> {
     if let Ok(cache) = INSTALLED_APPS.lock() {
         if let Some(ref apps) = *cache {
             let target = app_name.to_lowercase();
+            let target_norm = normalize_app_name(&target);
+            let aliases = target_aliases(&target_norm);
+
             if apps.contains(&target) {
                 return Ok(app_name.to_string());
             }
             for installed in apps {
-                if installed.contains(&target) || target.contains(installed) {
+                let installed_norm = normalize_app_name(installed);
+                if aliases.iter().any(|alias| alias == &installed_norm) {
+                    println!(
+                        "      ℹ️ [Reality] Normalized match: '{}' -> '{}'",
+                        app_name, installed
+                    );
+                    return Ok(installed.clone());
+                }
+            }
+            for installed in apps {
+                if target.len() >= 5
+                    && ((installed.starts_with(&target))
+                        || (target.starts_with(installed) && installed.len() >= 5))
+                {
                     println!(
                         "      ⚠️ [Reality] Fuzzy match: '{}' -> '{}'",
                         app_name, installed
@@ -113,5 +152,41 @@ pub fn verify_file_exists(path: &str) -> Result<()> {
             "HALLUCINATION DETECTED: File '{}' does not exist.",
             path
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    lazy_static! {
+        static ref TEST_MUTEX: Mutex<()> = Mutex::new(());
+    }
+
+    fn set_cache(apps: &[&str]) {
+        if let Ok(mut cache) = INSTALLED_APPS.lock() {
+            let mut set = HashSet::new();
+            for app in apps {
+                set.insert(app.to_lowercase());
+            }
+            *cache = Some(set);
+        }
+    }
+
+    #[test]
+    fn verify_app_exists_uses_normalized_exact_match() {
+        let _guard = TEST_MUTEX.lock().expect("test mutex");
+        set_cache(&["google chrome", "textedit"]);
+        let result = verify_app_exists("GoogleChrome");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn verify_app_exists_rejects_short_substring_false_positive() {
+        let _guard = TEST_MUTEX.lock().expect("test mutex");
+        set_cache(&["calendar", "mail"]);
+        let result = verify_app_exists("cal");
+        assert!(result.is_err());
     }
 }
