@@ -976,6 +976,55 @@ impl Planner {
         }
     }
 
+    fn maybe_rewrite_open_app_to_pending_text_action(
+        goal: &str,
+        history: &[String],
+        plan: &mut serde_json::Value,
+    ) {
+        if plan["action"].as_str() != Some("open_app") {
+            return;
+        }
+
+        let Some(current_app) = Self::last_opened_app_from_history(history) else {
+            return;
+        };
+        if !Self::is_textual_app(&current_app) {
+            return;
+        }
+
+        let has_pending_literal = Self::extract_quoted_fragments(goal)
+            .into_iter()
+            .any(|frag| {
+                let trimmed = frag.trim();
+                let lower = trimmed.to_lowercase();
+                if trimmed.len() < 2
+                    || lower.starts_with("cmd+")
+                    || lower == "done"
+                    || lower.starts_with("status:")
+                {
+                    return false;
+                }
+                !Self::history_contains_case_insensitive(history, trimmed)
+            });
+        if !has_pending_literal {
+            return;
+        }
+
+        if let Some(fallback_plan) = Self::fallback_plan_from_goal(goal, history) {
+            let action = fallback_plan["action"].as_str().unwrap_or("").to_string();
+            if matches!(
+                action.as_str(),
+                "type" | "select_all" | "copy" | "paste" | "shortcut"
+            ) {
+                *plan = fallback_plan;
+                println!(
+                    "   🔁 Rewrote open_app to pending text-flow action: {} (current app: {})",
+                    action, current_app
+                );
+            }
+        }
+    }
+
     fn can_force_done_for_simple_goal(
         goal: &str,
         plan: &serde_json::Value,
@@ -1527,6 +1576,7 @@ impl Planner {
             Self::maybe_rewrite_click_visual_to_app_action(goal, &history, &mut plan);
             Self::maybe_rewrite_shortcut_to_next_app(goal, &history, &mut plan);
             Self::maybe_rewrite_mail_subject_before_paste(goal, &history, &mut plan);
+            Self::maybe_rewrite_open_app_to_pending_text_action(goal, &history, &mut plan);
 
             if scenario_mode {
                 if let Some(fallback_plan) = Self::fallback_plan_from_goal(goal, &history) {
