@@ -142,13 +142,16 @@ impl ActionRunner {
     }
 
     fn normalize_email_candidate(raw: &str) -> Option<String> {
-        let trimmed = raw.trim_matches(|c: char| {
+        let email_re =
+            regex::Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}").ok()?;
+        let matched = email_re.find(raw)?.as_str();
+        let trimmed = matched.trim_matches(|c: char| {
             matches!(
                 c,
                 '"' | '\'' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':' | '.'
             )
         });
-        if trimmed.is_empty() || trimmed.contains(' ') || !trimmed.contains('@') {
+        if trimmed.is_empty() || trimmed.contains(' ') {
             return None;
         }
         let mut parts = trimmed.split('@');
@@ -164,12 +167,7 @@ impl ActionRunner {
     }
 
     fn extract_mail_recipient_from_goal(goal: &str) -> Option<String> {
-        for token in goal.split_whitespace() {
-            if let Some(email) = Self::normalize_email_candidate(token) {
-                return Some(email);
-            }
-        }
-        None
+        Self::normalize_email_candidate(goal)
     }
 
     fn preferred_mail_recipient(goal: Option<&str>) -> Option<String> {
@@ -337,6 +335,64 @@ impl ActionRunner {
         let subject_hint = Self::preferred_mail_subject(goal).unwrap_or_default();
         let marker_hint = Self::preferred_run_scope_marker(goal).unwrap_or_default();
         let lines = [
+            "on sent_message_exists(targetSubject, targetRecipient, targetMarker)",
+            "set matched to false",
+            "tell application \"Mail\"",
+            "repeat with ac in accounts",
+            "try",
+            "set sentMbx to sent mailbox of ac",
+            "if sentMbx is not missing value then",
+            "set sentCount to count of messages of sentMbx",
+            "if sentCount > 0 then",
+            "set lowerBound to sentCount - 120",
+            "if lowerBound < 1 then set lowerBound to 1",
+            "repeat with idx from sentCount to lowerBound by -1",
+            "set sm to message idx of sentMbx",
+            "set ss to \"\"",
+            "set bodyText to \"\"",
+            "set recipientText to \"\"",
+            "try",
+            "set ss to subject of sm as text",
+            "end try",
+            "try",
+            "set bodyText to content of sm as text",
+            "end try",
+            "try",
+            "repeat with r in to recipients of sm",
+            "set recipientText to recipientText & \" \" & (address of r as text)",
+            "end repeat",
+            "end try",
+            "set subjectOk to false",
+            "if targetSubject is \"\" then",
+            "set subjectOk to true",
+            "else if ss is targetSubject then",
+            "set subjectOk to true",
+            "end if",
+            "set markerOk to false",
+            "if targetMarker is \"\" then",
+            "set markerOk to true",
+            "else if ss contains targetMarker or bodyText contains targetMarker then",
+            "set markerOk to true",
+            "end if",
+            "set recipientOk to false",
+            "if targetRecipient is \"\" then",
+            "set recipientOk to true",
+            "else if recipientText contains targetRecipient then",
+            "set recipientOk to true",
+            "end if",
+            "if subjectOk and markerOk and recipientOk then",
+            "set matched to true",
+            "exit repeat",
+            "end if",
+            "end repeat",
+            "end if",
+            "end if",
+            "end try",
+            "if matched then exit repeat",
+            "end repeat",
+            "end tell",
+            "return matched",
+            "end sent_message_exists",
             "on run argv",
             "set fallbackAddress to \"\"",
             "set subjectHint to \"\"",
@@ -344,10 +400,15 @@ impl ActionRunner {
             "if (count of argv) >= 1 then set fallbackAddress to item 1 of argv",
             "if (count of argv) >= 2 then set subjectHint to item 2 of argv",
             "if (count of argv) >= 3 then set markerHint to item 3 of argv",
+            "tell application \"Mail\" to activate",
             "tell application \"Mail\"",
-            "activate",
             "set beforeOutgoing to (count of outgoing messages)",
-            "if beforeOutgoing = 0 then return \"no_draft|0|0\"",
+            "if beforeOutgoing = 0 then",
+            "if my sent_message_exists(subjectHint, fallbackAddress, markerHint) then",
+            "return \"sent_confirmed|0|0\"",
+            "end if",
+            "return \"no_draft|0|0\"",
+            "end if",
             "set _msg to missing value",
             "if subjectHint is not \"\" then",
             "repeat with idx from beforeOutgoing to 1 by -1",
@@ -382,54 +443,45 @@ impl ActionRunner {
             "try",
             "set _subject to (subject of _msg as text)",
             "end try",
-            "if (count of to recipients of _msg) = 0 then",
+            "if subjectHint is not \"\" and _subject is \"\" then",
+            "set subject of _msg to subjectHint",
+            "set _subject to subjectHint",
+            "end if",
             "if fallbackAddress is not \"\" then",
+            "set hasTarget to false",
+            "repeat with r in to recipients of _msg",
+            "try",
+            "if (address of r as text) is fallbackAddress then set hasTarget to true",
+            "end try",
+            "end repeat",
+            "if hasTarget is false then",
             "make new to recipient at end of to recipients of _msg with properties {address:fallbackAddress}",
+            "end if",
             "set _recipient to fallbackAddress",
             "else",
+            "if (count of to recipients of _msg) = 0 then",
             "return \"missing_recipient|\" & beforeOutgoing & \"|\" & beforeOutgoing",
-            "end if",
             "else",
             "try",
             "set _recipient to (address of first to recipient of _msg as text)",
             "end try",
             "end if",
+            "end if",
             "send _msg",
-            "delay 0.8",
+            "set afterOutgoing to beforeOutgoing",
+            "repeat with _tick from 1 to 20",
+            "delay 0.4",
             "set afterOutgoing to (count of outgoing messages)",
             "if afterOutgoing = 0 then return \"sent_confirmed|\" & beforeOutgoing & \"|\" & afterOutgoing",
             "if afterOutgoing < beforeOutgoing then return \"sent_confirmed|\" & beforeOutgoing & \"|\" & afterOutgoing",
-            "if _subject is not \"\" then",
-            "repeat with ac in accounts",
-            "try",
-            "set sentMbx to sent mailbox of ac",
-            "if sentMbx is not missing value then",
-            "set sentCount to count of messages of sentMbx",
-            "if sentCount > 0 then",
-            "set lowerBound to sentCount - 40",
-            "if lowerBound < 1 then set lowerBound to 1",
-            "repeat with idx from sentCount to lowerBound by -1",
-            "set sm to message idx of sentMbx",
-            "set ss to \"\"",
-            "set recipientText to \"\"",
-            "try",
-            "set ss to subject of sm as text",
-            "end try",
-            "if ss is _subject then",
-            "if _recipient is \"\" then return \"sent_confirmed|\" & beforeOutgoing & \"|\" & afterOutgoing",
-            "try",
-            "repeat with r in to recipients of sm",
-            "set recipientText to recipientText & \" \" & (address of r as text)",
-            "end repeat",
-            "end try",
-            "if recipientText contains _recipient then return \"sent_confirmed|\" & beforeOutgoing & \"|\" & afterOutgoing",
+            "set checkSubject to _subject",
+            "if checkSubject is \"\" then set checkSubject to subjectHint",
+            "set checkRecipient to _recipient",
+            "if checkRecipient is \"\" then set checkRecipient to fallbackAddress",
+            "if my sent_message_exists(checkSubject, checkRecipient, markerHint) then",
+            "return \"sent_confirmed|\" & beforeOutgoing & \"|\" & afterOutgoing",
             "end if",
             "end repeat",
-            "end if",
-            "end if",
-            "end try",
-            "end repeat",
-            "end if",
             "end tell",
             "return \"sent_pending|\" & beforeOutgoing & \"|\" & afterOutgoing",
             "end run",
@@ -1797,5 +1849,24 @@ impl ActionRunner {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ActionRunner;
+
+    #[test]
+    fn normalize_email_candidate_strips_korean_particle_suffix() {
+        let got = ActionRunner::normalize_email_candidate("\"qed4950@gmail.com\"를");
+        assert_eq!(got.as_deref(), Some("qed4950@gmail.com"));
+    }
+
+    #[test]
+    fn extract_mail_recipient_from_goal_uses_plain_email() {
+        let goal =
+            "받는 사람에 \"qed4950@gmail.com\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요.";
+        let got = ActionRunner::extract_mail_recipient_from_goal(goal);
+        assert_eq!(got.as_deref(), Some("qed4950@gmail.com"));
     }
 }
