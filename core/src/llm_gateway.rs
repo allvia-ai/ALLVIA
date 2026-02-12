@@ -826,47 +826,91 @@ Respond with ONE JSON object only.
                     goal, history_str, mcp_tools_doc
                 );
 
-                // Use execute_with_vision to actually see the screen
-                match cli_client.execute_with_vision(&final_image_b64, &cli_prompt) {
-                    Ok(response) => {
-                        log::info!(
-                            "[CLI LLM] Response: {}",
-                            &response[..response.len().min(200)]
-                        );
-                        let clean = response
-                            .trim()
-                            .trim_start_matches("```json")
-                            .trim_start_matches("```")
-                            .trim_end_matches("```")
-                            .trim();
+                let parse_cli_action = |response: &str| -> Option<Value> {
+                    let clean = response
+                        .trim()
+                        .trim_start_matches("```json")
+                        .trim_start_matches("```")
+                        .trim_end_matches("```")
+                        .trim();
 
-                        // Try to find JSON in response
-                        if let Some(start) = clean.find('{') {
-                            if let Some(end) = clean.rfind('}') {
-                                let json_str = &clean[start..=end];
-                                if let Ok(json_val) = serde_json::from_str::<Value>(json_str) {
-                                    // Phase 29: Support CoT (Wrapper Object)
-                                    if let Some(thought) =
-                                        json_val.get("thought").and_then(|t| t.as_str())
-                                    {
-                                        log::info!("[Vision] 🤔 Thought: {}", thought);
-                                    }
-
-                                    if let Some(inner_action) = json_val.get("action") {
-                                        if inner_action.is_object() {
-                                            return Ok(inner_action.clone());
-                                        }
-                                    }
-
-                                    // Fallback: If it's a direct action object (no wrapper)
-                                    return Ok(json_val);
+                    if let Some(start) = clean.find('{') {
+                        if let Some(end) = clean.rfind('}') {
+                            let json_str = &clean[start..=end];
+                            if let Ok(json_val) = serde_json::from_str::<Value>(json_str) {
+                                if let Some(thought) =
+                                    json_val.get("thought").and_then(|t| t.as_str())
+                                {
+                                    log::info!("[Vision] 🤔 Thought: {}", thought);
                                 }
+
+                                if let Some(inner_action) = json_val.get("action") {
+                                    if inner_action.is_object() {
+                                        return Some(inner_action.clone());
+                                    }
+                                }
+
+                                return Some(json_val);
                             }
                         }
-                        log::warn!("[CLI LLM] Could not parse JSON, falling back to OpenAI");
                     }
-                    Err(e) => {
-                        log::warn!("[CLI LLM] Failed: {}, falling back to OpenAI", e);
+                    None
+                };
+
+                // Use execute_with_vision to actually see the screen
+                let primary_failed =
+                    match cli_client.execute_with_vision(&final_image_b64, &cli_prompt) {
+                        Ok(response) => {
+                            log::info!(
+                                "[CLI LLM] Response: {}",
+                                &response[..response.len().min(200)]
+                            );
+                            if let Some(action) = parse_cli_action(&response) {
+                                return Ok(action);
+                            }
+                            log::warn!("[CLI LLM] Could not parse JSON from primary provider.");
+                            true
+                        }
+                        Err(e) => {
+                            log::warn!("[CLI LLM] Failed: {}", e);
+                            true
+                        }
+                    };
+
+                // If Gemini fails, try Codex CLI before OpenAI fallback to avoid API hard-fail cascades.
+                if primary_failed
+                    && std::env::var("STEER_CLI_LLM_FAILOVER")
+                        .map(|v| !matches!(v.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+                        .unwrap_or(true)
+                    && std::env::var("STEER_CLI_LLM")
+                        .map(|v| v.eq_ignore_ascii_case("gemini"))
+                        .unwrap_or(false)
+                {
+                    println!("⚠️ [Vision] Gemini CLI failed; trying Codex CLI failover...");
+                    let codex_client =
+                        crate::cli_llm::CLILLMClient::new(crate::cli_llm::LLMProvider::Codex)
+                            .with_cwd("/tmp");
+
+                    match codex_client.execute_with_vision(&final_image_b64, &cli_prompt) {
+                        Ok(response) => {
+                            log::info!(
+                                "[CLI LLM:codex failover] Response: {}",
+                                &response[..response.len().min(200)]
+                            );
+                            if let Some(action) = parse_cli_action(&response) {
+                                println!("✅ [Vision] Codex CLI failover succeeded.");
+                                return Ok(action);
+                            }
+                            log::warn!(
+                                "[CLI LLM:codex failover] Could not parse JSON, falling back to OpenAI"
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "[CLI LLM:codex failover] Failed: {}, falling back to OpenAI",
+                                e
+                            );
+                        }
                     }
                 }
             } // End else
