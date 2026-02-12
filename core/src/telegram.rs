@@ -71,6 +71,7 @@ impl TelegramBot {
         llm: Arc<dyn LLMClient>,
         tx_analyzer: Option<mpsc::Sender<String>>,
     ) -> Option<Self> {
+        crate::load_env_with_fallback();
         let token = std::env::var("TELEGRAM_BOT_TOKEN").ok()?;
         let allowed_user_id = std::env::var("TELEGRAM_USER_ID")
             .ok()

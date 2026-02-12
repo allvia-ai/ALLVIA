@@ -17,7 +17,7 @@ impl TelegramBot {
     }
 
     pub fn from_env() -> Result<Self> {
-        dotenv::dotenv().ok();
+        crate::load_env_with_fallback();
         let token = std::env::var("TELEGRAM_BOT_TOKEN")
             .map_err(|_| anyhow::anyhow!("TELEGRAM_BOT_TOKEN not set"))?;
         let chat_id = std::env::var("TELEGRAM_CHAT_ID")
@@ -33,6 +33,21 @@ impl TelegramBot {
             ("text", message),
             ("parse_mode", "Markdown"),
         ];
+
+        let resp = self.client.post(&url).form(&params).send().await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await?;
+            return Err(anyhow::anyhow!("Telegram API Error: {}", err));
+        }
+
+        Ok(())
+    }
+
+    pub async fn send_plain(&self, message: &str) -> Result<()> {
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.token);
+
+        let params = [("chat_id", self.chat_id.as_str()), ("text", message)];
 
         let resp = self.client.post(&url).form(&params).send().await?;
 

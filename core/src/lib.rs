@@ -79,6 +79,33 @@ pub mod reality_check;
 pub mod screen_recorder;
 pub mod telegram;
 
+pub fn load_env_with_fallback() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+
+    INIT.call_once(|| {
+        let _ = dotenv::dotenv();
+
+        let mut candidates: Vec<std::path::PathBuf> = vec![
+            std::path::PathBuf::from("core/.env"),
+            std::path::PathBuf::from(".env"),
+        ];
+
+        if let Ok(exe) = std::env::current_exe() {
+            for ancestor in exe.ancestors().take(8) {
+                candidates.push(ancestor.join(".env"));
+                candidates.push(ancestor.join("core").join(".env"));
+            }
+        }
+
+        for path in candidates {
+            if path.exists() {
+                let _ = dotenv::from_path(path);
+            }
+        }
+    });
+}
+
 pub fn env_flag(key: &str) -> bool {
     std::env::var(key)
         .ok()

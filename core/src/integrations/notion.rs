@@ -24,7 +24,7 @@ impl NotionClient {
     }
 
     pub fn from_env() -> Result<Self> {
-        dotenv::dotenv().ok();
+        crate::load_env_with_fallback();
         let token = std::env::var("NOTION_API_KEY")
             .map_err(|_| anyhow::anyhow!("NOTION_API_KEY not set"))?;
         Ok(Self::new(&token))
@@ -182,5 +182,57 @@ impl NotionClient {
         }
 
         Ok(pages)
+    }
+
+    /// Append paragraph blocks to an existing page
+    pub async fn append_paragraphs(&self, page_id: &str, paragraphs: &[String]) -> Result<()> {
+        if paragraphs.is_empty() {
+            return Ok(());
+        }
+
+        let url = format!("https://api.notion.com/v1/blocks/{}/children", page_id);
+        let children: Vec<serde_json::Value> = paragraphs
+            .iter()
+            .filter_map(|p| {
+                let text = p.trim();
+                if text.is_empty() {
+                    None
+                } else {
+                    let clipped: String = text.chars().take(1800).collect();
+                    Some(json!({
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": {
+                            "rich_text": [{
+                                "type": "text",
+                                "text": { "content": clipped }
+                            }]
+                        }
+                    }))
+                }
+            })
+            .collect();
+
+        if children.is_empty() {
+            return Ok(());
+        }
+
+        let body = json!({ "children": children });
+        let resp = self
+            .client
+            .patch(&url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Notion-Version", "2022-06-28")
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await?;
+            return Err(anyhow::anyhow!("Notion Append Error: {}", err));
+        }
+
+        Ok(())
     }
 }

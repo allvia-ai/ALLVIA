@@ -145,7 +145,7 @@ pub struct OpenAILLMClient {
 
 impl OpenAILLMClient {
     pub fn new() -> Result<Self> {
-        dotenv::dotenv().ok(); // Load .env
+        crate::load_env_with_fallback();
         let api_key = env::var("OPENAI_API_KEY")
             .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY not set in .env"))?;
         let client = Client::builder()
@@ -667,45 +667,67 @@ Output internal monologue in <think>...</think> followed by ONLY valid JSON.
         // Try CLI LLM first if STEER_CLI_LLM is set (skip only when CLI can't use stdin and payload is large)
         if let Some(cli_client) = crate::cli_llm::CLILLMClient::from_env() {
             let mut final_image_b64 = image_b64.to_string();
+            let cli_max_b64 = std::env::var("STEER_CLI_VISION_MAX_B64")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|v| *v >= 4_000)
+                .unwrap_or(24_000);
 
-            // Optimization: If payload is too large for CLI and client doesn't support stdin (gemini currently),
-            // shrink the image aggressively to try fitting it in argv (ARG_MAX ~1MB, but safer < 200KB).
-            if !cli_client.uses_stdin() && final_image_b64.len() > 1024 * 50 {
+            // Keep vision payload small enough for CLI model context.
+            // Applies to all providers (including stdin-based Codex/Claude).
+            if final_image_b64.len() > cli_max_b64 {
                 println!(
-                    "⚠️ [Vision] Image payload large ({} bytes). Attempting to resize for CLI...",
+                    "⚠️ [Vision] Image payload large for CLI context ({} bytes). Attempting to downscale...",
                     final_image_b64.len()
                 );
-
-                // Decode -> Resize -> Encode
-                // use image::Engine; // Removed invalid import
                 use base64::{engine::general_purpose, Engine as _};
                 use std::io::Cursor;
 
                 if let Ok(data) = general_purpose::STANDARD.decode(&final_image_b64) {
                     if let Ok(img) = image::load_from_memory(&data) {
-                        // Resize to max 1024px width (aggressive)
-                        let resized = img.resize(1024, 768, image::imageops::FilterType::Triangle);
-                        let mut buffer = Cursor::new(Vec::new());
-                        // Use lower JPEG quality (60)
-                        if resized
-                            .write_to(&mut buffer, image::ImageOutputFormat::Jpeg(60))
-                            .is_ok()
-                        {
-                            let new_b64 = general_purpose::STANDARD.encode(buffer.get_ref());
-                            println!(
-                                "      📉 Resized: {} -> {} bytes",
-                                final_image_b64.len(),
-                                new_b64.len()
-                            );
-                            final_image_b64 = new_b64;
+                        let profiles: &[(u32, u32, u8)] = &[
+                            (1024, 768, 60),
+                            (800, 600, 50),
+                            (640, 480, 42),
+                            (512, 384, 36),
+                            (384, 288, 30),
+                            (320, 240, 28),
+                        ];
+                        for (w, h, q) in profiles {
+                            let resized = img.resize(*w, *h, image::imageops::FilterType::Triangle);
+                            let mut buffer = Cursor::new(Vec::new());
+                            if resized
+                                .write_to(&mut buffer, image::ImageOutputFormat::Jpeg(*q))
+                                .is_ok()
+                            {
+                                let candidate_b64 =
+                                    general_purpose::STANDARD.encode(buffer.get_ref());
+                                if candidate_b64.len() < final_image_b64.len() {
+                                    println!(
+                                        "      📉 Downscaled: {} -> {} bytes ({}x{}, q={})",
+                                        final_image_b64.len(),
+                                        candidate_b64.len(),
+                                        w,
+                                        h,
+                                        q
+                                    );
+                                    final_image_b64 = candidate_b64;
+                                }
+                                if final_image_b64.len() <= cli_max_b64 {
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
             }
 
-            if !cli_client.uses_stdin() && final_image_b64.len() > 1024 * 200 {
-                // Still too big?
-                println!("⚠️ [Vision] Image still too large ({} bytes) for CLI args. Routing to Cloud LLM for stability.", final_image_b64.len());
+            if final_image_b64.len() > cli_max_b64 {
+                println!(
+                    "⚠️ [Vision] Image still too large for CLI context ({} > {} bytes). Routing to Cloud LLM.",
+                    final_image_b64.len(),
+                    cli_max_b64
+                );
                 // Fall through to OpenAI logic below
             } else {
                 println!(
@@ -927,6 +949,17 @@ Respond with ONE JSON object only.
         };
         let user_msg = format!("GOAL: {}\n\nHISTORY:\n- {}", goal, history_str);
 
+        let vision_detail = std::env::var("STEER_OPENAI_VISION_DETAIL")
+            .ok()
+            .map(|v| v.trim().to_lowercase())
+            .filter(|v| matches!(v.as_str(), "low" | "high" | "auto"))
+            .unwrap_or_else(|| "low".to_string());
+        let vision_max_tokens = std::env::var("STEER_VISION_MAX_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v >= 80 && *v <= 800)
+            .unwrap_or(180);
+
         let body = json!({
             "model": "gpt-4o",
             "messages": [
@@ -939,13 +972,13 @@ Respond with ONE JSON object only.
                             "type": "image_url",
                             "image_url": {
                                 "url": format!("data:image/jpeg;base64,{}", image_b64),
-                                "detail": "high" // Need details for text reading
+                                "detail": vision_detail
                             }
                         }
                     ]
                 }
             ],
-            "max_tokens": 300,
+            "max_tokens": vision_max_tokens,
             "response_format": { "type": "json_object" }
         });
 

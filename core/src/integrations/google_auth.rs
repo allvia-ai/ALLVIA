@@ -13,9 +13,28 @@ pub const ALL_SCOPES: &[&str] = &[
 
 /// Get the path to the credentials file
 fn credentials_path() -> PathBuf {
-    let mut path = std::env::current_dir().unwrap_or_default();
-    path.push("credentials.json");
-    path
+    // 1) Explicit override for deployments/CI.
+    if let Ok(raw) = std::env::var("GMAIL_CREDENTIALS_PATH") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
+    // 2) Auto-discover for local development. We support both repo root and core folder.
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let candidates = [
+        cwd.join("credentials.json"),
+        cwd.join("core").join("credentials.json"),
+    ];
+    for candidate in candidates {
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+
+    // 3) Default fallback (keeps previous behavior for error messaging).
+    cwd.join("credentials.json")
 }
 
 /// Get the path to store the token cache
@@ -39,13 +58,17 @@ pub async fn get_authenticator() -> Result<GoogleAuthenticator> {
 
     if !creds_path.exists() {
         return Err(anyhow::anyhow!(
-            "credentials.json not found!\n\
+            "Google OAuth credentials not found at: {}\n\
             Please download it from Google Cloud Console:\n\
             1. Go to https://console.cloud.google.com/\n\
             2. Create/Select a project\n\
             3. Enable Gmail API and Calendar API\n\
             4. Create OAuth 2.0 Client ID (Desktop App)\n\
-            5. Download and save as 'core/credentials.json'"
+            5. Download and save as either:\n\
+               - ./credentials.json (repo root)\n\
+               - ./core/credentials.json\n\
+               - or set GMAIL_CREDENTIALS_PATH=/absolute/path/to/credentials.json",
+            creds_path.display()
         ));
     }
 

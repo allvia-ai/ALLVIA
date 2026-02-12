@@ -17,9 +17,51 @@ struct MailSendResult {
     outgoing_after: Option<i64>,
     recipient: String,
     subject: String,
+    draft_id: String,
+    body_len: Option<i64>,
 }
 
 impl ActionRunner {
+    fn is_test_mode_enabled() -> bool {
+        match std::env::var("STEER_TEST_MODE") {
+            Ok(v) => matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"),
+            Err(_) => false,
+        }
+    }
+
+    fn mail_fresh_recovery_used(history: &[String]) -> bool {
+        history
+            .iter()
+            .any(|entry| entry.trim() == "MAIL_FRESH_RECOVERY_USED")
+    }
+
+    fn mark_mail_fresh_recovery_used(history: &mut Vec<String>) {
+        if !Self::mail_fresh_recovery_used(history) {
+            history.push("MAIL_FRESH_RECOVERY_USED".to_string());
+        }
+    }
+
+    fn mail_current_draft_id(history: &[String]) -> Option<String> {
+        for entry in history.iter().rev() {
+            if let Some(rest) = entry.strip_prefix("MAIL_DRAFT_ID:") {
+                let id = rest.trim();
+                if !id.is_empty() {
+                    return Some(id.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    fn remember_mail_draft_id(history: &mut Vec<String>, draft_id: &str) {
+        let trimmed = draft_id.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        info!("      📧 [MailDraft] tracking draft_id={}", trimmed);
+        history.push(format!("MAIL_DRAFT_ID:{}", trimmed));
+    }
+
     fn last_opened_app_from_history(history: &[String]) -> Option<String> {
         for entry in history.iter().rev() {
             if let Some(rest) = entry.strip_prefix("Opened app: ") {
@@ -132,22 +174,55 @@ impl ActionRunner {
         }
     }
 
-    fn mail_ensure_draft() -> Result<()> {
+    fn mail_ensure_draft(goal: Option<&str>, history: &mut Vec<String>) -> Result<String> {
+        let preferred_id = Self::mail_current_draft_id(history).unwrap_or_default();
+        let recipient_hint = Self::preferred_mail_recipient(goal).unwrap_or_default();
         let lines = [
+            "on run argv",
+            "set preferredId to \"\"",
+            "set recipientHint to \"\"",
+            "if (count of argv) >= 1 then set preferredId to item 1 of argv",
+            "if (count of argv) >= 2 then set recipientHint to item 2 of argv",
             "tell application \"Mail\"",
             "activate",
-            "if (count of outgoing messages) = 0 then",
-            "set _msg to make new outgoing message with properties {visible:true}",
-            "else",
-            "set _msg to last outgoing message",
-            "set visible of _msg to true",
+            "set _msg to missing value",
+            "if preferredId is not \"\" then",
+            "repeat with candidate in outgoing messages",
+            "try",
+            "if (id of candidate as text) is preferredId then",
+            "set _msg to candidate",
+            "exit repeat",
             "end if",
+            "end try",
+            "end repeat",
+            "end if",
+            "if _msg is missing value then",
+            "set _msg to make new outgoing message with properties {visible:false}",
+            "end if",
+            "set visible of _msg to false",
+            "if recipientHint is not \"\" then",
+            "set hasTarget to false",
+            "repeat with r in to recipients of _msg",
+            "try",
+            "if (address of r as text) is recipientHint then set hasTarget to true",
+            "end try",
+            "end repeat",
+            "if hasTarget is false then",
+            "make new to recipient at end of to recipients of _msg with properties {address:recipientHint}",
+            "end if",
+            "end if",
+            "set draftId to \"\"",
+            "try",
+            "set draftId to (id of _msg as text)",
+            "end try",
             "end tell",
-            "return \"ok\"",
+            "return draftId",
+            "end run",
         ];
-        crate::applescript::run_with_args(&lines, &Vec::<String>::new())?;
-        let _ = Self::mail_set_recipient_if_missing(None);
-        Ok(())
+        let draft_id = crate::applescript::run_with_args(&lines, &[preferred_id, recipient_hint])?;
+        let trimmed = draft_id.trim().to_string();
+        Self::remember_mail_draft_id(history, &trimmed);
+        Ok(trimmed)
     }
 
     fn normalize_email_candidate(raw: &str) -> Option<String> {
@@ -203,25 +278,40 @@ impl ActionRunner {
         for keyword in ["제목", "subject"] {
             if let Some(idx) = lower_goal.find(keyword) {
                 let goal_tail = &goal_text[idx..];
-                for frag in quoted.iter().rev() {
+                for frag in &quoted {
                     if goal_tail.contains(frag) {
+                        if Self::normalize_email_candidate(frag).is_some() {
+                            continue;
+                        }
+                        if frag.starts_with("RUN_SCOPE_") {
+                            continue;
+                        }
                         return Some(frag.clone());
                     }
                 }
             }
         }
 
-        for frag in quoted.iter().rev() {
+        for frag in &quoted {
             if frag.contains("S1_")
                 || frag.contains("S2_")
                 || frag.contains("S3_")
                 || frag.contains("S4_")
                 || frag.contains("S5_")
                 || frag.contains("DONE_")
-                || frag.contains("RUN_SCOPE_")
             {
                 return Some(frag.clone());
             }
+        }
+
+        for frag in &quoted {
+            if Self::normalize_email_candidate(frag).is_some() {
+                continue;
+            }
+            if frag.starts_with("RUN_SCOPE_") {
+                continue;
+            }
+            return Some(frag.clone());
         }
 
         quoted.first().cloned()
@@ -232,6 +322,24 @@ impl ActionRunner {
         if goal_text.is_empty() {
             return None;
         }
+
+        // Prefer explicit user payload markers (typically quoted in scenario requests)
+        // over internal run markers appended by wrappers.
+        let quoted = Self::extract_quoted_fragments(goal_text);
+        for frag in quoted.iter().rev() {
+            let cleaned = frag.trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '"' | '\'' | ',' | '.' | ';' | ':' | ')' | '(' | ']' | '[' | '}' | '{'
+                )
+            });
+            if cleaned.starts_with("RUN_SCOPE_")
+                && cleaned.len() >= "RUN_SCOPE_00000000_000000".len()
+            {
+                return Some(cleaned.to_string());
+            }
+        }
+
         for raw in goal_text.split_whitespace() {
             let cleaned = raw.trim_matches(|c: char| {
                 matches!(
@@ -289,21 +397,33 @@ impl ActionRunner {
         Self::normalize_email_candidate(out.trim())
     }
 
-    fn mail_set_recipient_if_missing(goal: Option<&str>) -> Result<()> {
+    fn mail_set_recipient_if_missing(goal: Option<&str>, draft_id: Option<&str>) -> Result<()> {
         let Some(address) = Self::preferred_mail_recipient(goal) else {
             return Ok(());
         };
+        let draft_hint = draft_id.unwrap_or_default().to_string();
         let lines = [
             "on run argv",
             "set toAddress to item 1 of argv",
+            "set draftHint to \"\"",
+            "if (count of argv) >= 2 then set draftHint to item 2 of argv",
             "tell application \"Mail\"",
             "activate",
-            "if (count of outgoing messages) = 0 then",
-            "set _msg to make new outgoing message with properties {visible:true}",
-            "else",
-            "set _msg to last outgoing message",
-            "set visible of _msg to true",
+            "set _msg to missing value",
+            "if draftHint is not \"\" then",
+            "repeat with candidate in outgoing messages",
+            "try",
+            "if (id of candidate as text) is draftHint then",
+            "set _msg to candidate",
+            "exit repeat",
             "end if",
+            "end try",
+            "end repeat",
+            "end if",
+            "if _msg is missing value then",
+            "set _msg to make new outgoing message with properties {visible:false}",
+            "end if",
+            "set visible of _msg to false",
             "set hasTarget to false",
             "repeat with r in to recipients of _msg",
             "try",
@@ -317,7 +437,7 @@ impl ActionRunner {
             "return \"ok\"",
             "end run",
         ];
-        crate::applescript::run_with_args(&lines, &[address])?;
+        crate::applescript::run_with_args(&lines, &[address, draft_hint])?;
         Ok(())
     }
 
@@ -339,21 +459,36 @@ impl ActionRunner {
             outgoing_after: parts.next().and_then(|v| v.trim().parse::<i64>().ok()),
             recipient: parts.next().unwrap_or("").trim().to_string(),
             subject: parts.next().unwrap_or("").trim().to_string(),
+            draft_id: parts.next().unwrap_or("").trim().to_string(),
+            body_len: parts.next().and_then(|v| v.trim().parse::<i64>().ok()),
         }
     }
 
-    fn mail_send_latest_message(goal: Option<&str>) -> Result<String> {
+    fn mail_send_latest_message(goal: Option<&str>, draft_id: Option<&str>) -> Result<String> {
         let fallback = Self::preferred_mail_recipient(goal).unwrap_or_default();
         let subject_hint = Self::preferred_mail_subject(goal).unwrap_or_default();
         let marker_hint = Self::preferred_run_scope_marker(goal).unwrap_or_default();
+        let draft_hint = draft_id.unwrap_or_default().to_string();
         let lines = [
             "on sent_message_exists(targetSubject, targetRecipient, targetMarker)",
             "set matched to false",
             "tell application \"Mail\"",
             "repeat with ac in accounts",
             "try",
+            "set sentBoxes to {}",
+            "repeat with sentName in {\"Sent Messages\", \"Sent Mail\", \"Sent\", \"보낸 편지함\", \"All Mail\"}",
+            "try",
+            "set end of sentBoxes to (mailbox (sentName as text) of ac)",
+            "end try",
+            "end repeat",
+            "if (count of sentBoxes) = 0 then",
+            "try",
             "set sentMbx to sent mailbox of ac",
-            "if sentMbx is not missing value then",
+            "if sentMbx is not missing value then set end of sentBoxes to sentMbx",
+            "end try",
+            "end if",
+            "repeat with sentMbx in sentBoxes",
+            "if matched then exit repeat",
             "set sentCount to count of messages of sentMbx",
             "if sentCount > 0 then",
             "set lowerBound to sentCount - 120",
@@ -398,6 +533,61 @@ impl ActionRunner {
             "end if",
             "end repeat",
             "end if",
+            "end repeat",
+            "if matched is false then",
+            "set inboxBoxes to {}",
+            "repeat with inboxName in {\"INBOX\", \"Inbox\", \"받은 편지함\"}",
+            "try",
+            "set end of inboxBoxes to (mailbox (inboxName as text) of ac)",
+            "end try",
+            "end repeat",
+            "repeat with inboxMbx in inboxBoxes",
+            "if matched then exit repeat",
+            "set inboxCount to count of messages of inboxMbx",
+            "if inboxCount > 0 then",
+            "set inboxLowerBound to inboxCount - 120",
+            "if inboxLowerBound < 1 then set inboxLowerBound to 1",
+            "repeat with idx from inboxCount to inboxLowerBound by -1",
+            "set im to message idx of inboxMbx",
+            "set isub to \"\"",
+            "set ibody to \"\"",
+            "set irecip to \"\"",
+            "try",
+            "set isub to subject of im as text",
+            "end try",
+            "try",
+            "set ibody to content of im as text",
+            "end try",
+            "try",
+            "repeat with r in to recipients of im",
+            "set irecip to irecip & \" \" & (address of r as text)",
+            "end repeat",
+            "end try",
+            "set subjectOk to false",
+            "if targetSubject is \"\" then",
+            "set subjectOk to true",
+            "else if isub is targetSubject then",
+            "set subjectOk to true",
+            "end if",
+            "set markerOk to false",
+            "if targetMarker is \"\" then",
+            "set markerOk to true",
+            "else if isub contains targetMarker or ibody contains targetMarker then",
+            "set markerOk to true",
+            "end if",
+            "set recipientOk to false",
+            "if targetRecipient is \"\" then",
+            "set recipientOk to true",
+            "else if irecip contains targetRecipient then",
+            "set recipientOk to true",
+            "end if",
+            "if subjectOk and markerOk and recipientOk then",
+            "set matched to true",
+            "exit repeat",
+            "end if",
+            "end repeat",
+            "end if",
+            "end repeat",
             "end if",
             "end try",
             "if matched then exit repeat",
@@ -409,61 +599,38 @@ impl ActionRunner {
             "set fallbackAddress to \"\"",
             "set subjectHint to \"\"",
             "set markerHint to \"\"",
+            "set draftHint to \"\"",
             "if (count of argv) >= 1 then set fallbackAddress to item 1 of argv",
             "if (count of argv) >= 2 then set subjectHint to item 2 of argv",
             "if (count of argv) >= 3 then set markerHint to item 3 of argv",
+            "if (count of argv) >= 4 then set draftHint to item 4 of argv",
             "tell application \"Mail\" to activate",
             "tell application \"Mail\"",
             "set beforeOutgoing to (count of outgoing messages)",
             "if beforeOutgoing = 0 then",
             "if my sent_message_exists(subjectHint, fallbackAddress, markerHint) then",
-            "return \"sent_confirmed|0|0|\" & fallbackAddress & \"|\" & subjectHint",
+            "return \"sent_confirmed|0|0|\" & fallbackAddress & \"|\" & subjectHint & \"||0\"",
             "end if",
             "return \"no_draft|0|0||\"",
             "end if",
+            "if draftHint is \"\" then",
+            "return \"no_draft|\" & beforeOutgoing & \"|\" & beforeOutgoing & \"|||\" & \"|0\"",
+            "end if",
             "set _msg to missing value",
-            "repeat with idx from beforeOutgoing to 1 by -1",
-            "set candidate to item idx of outgoing messages",
-            "set candidateSubject to \"\"",
-            "set candidateContent to \"\"",
-            "set candidateRecipients to \"\"",
+            "if draftHint is not \"\" then",
+            "repeat with candidate in outgoing messages",
             "try",
-            "set candidateSubject to (subject of candidate as text)",
-            "end try",
-            "try",
-            "set candidateContent to (content of candidate as text)",
-            "end try",
-            "try",
-            "repeat with r in to recipients of candidate",
-            "try",
-            "set candidateRecipients to candidateRecipients & \" \" & (address of r as text)",
-            "end try",
-            "end repeat",
-            "end try",
-            "set matched to false",
-            "if subjectHint is not \"\" and candidateSubject is subjectHint then set matched to true",
-            "if matched is false and markerHint is not \"\" then",
-            "if candidateSubject contains markerHint or candidateContent contains markerHint then set matched to true",
-            "end if",
-            "if matched is false and fallbackAddress is not \"\" then",
-            "if candidateRecipients contains fallbackAddress then set matched to true",
-            "end if",
-            "if matched then",
+            "if (id of candidate as text) is draftHint then",
             "set _msg to candidate",
             "exit repeat",
             "end if",
-            "end repeat",
-            "if _msg is missing value then",
-            "set _msg to item beforeOutgoing of outgoing messages",
-            "if beforeOutgoing > 1 then",
-            "set recCount to 0",
-            "try",
-            "set recCount to (count of to recipients of _msg)",
             "end try",
-            "if recCount > 1 then return \"ambiguous_draft|\" & beforeOutgoing & \"|\" & beforeOutgoing & \"||\"",
+            "end repeat",
             "end if",
+            "if _msg is missing value then",
+            "return \"draft_not_found|\" & beforeOutgoing & \"|\" & beforeOutgoing & \"|||\" & draftHint & \"|0\"",
             "end if",
-            "set visible of _msg to true",
+            "set visible of _msg to false",
             "set _subject to \"\"",
             "set _recipient to \"\"",
             "try",
@@ -493,7 +660,137 @@ impl ActionRunner {
             "end try",
             "end if",
             "end if",
+            "set _draftId to \"\"",
+            "set _bodyText to \"\"",
+            "set _bodyLen to 0",
+            "try",
+            "set _draftId to (id of _msg as text)",
+            "end try",
+            "try",
+            "set _bodyText to (content of _msg as text)",
+            "end try",
+            "if _bodyText is missing value then set _bodyText to \"\"",
+            "try",
+            "set _bodyLen to (length of _bodyText)",
+            "end try",
+            "if markerHint is not \"\" and (_bodyText does not contain markerHint) then",
+            "set fallbackMsg to missing value",
+            "repeat with idx from beforeOutgoing to 1 by -1",
+            "set candidate to item idx of outgoing messages",
+            "set candidateSubject to \"\"",
+            "set candidateContent to \"\"",
+            "set candidateRecipients to \"\"",
+            "try",
+            "set candidateSubject to (subject of candidate as text)",
+            "end try",
+            "try",
+            "set candidateContent to (content of candidate as text)",
+            "end try",
+            "if candidateContent is missing value then set candidateContent to \"\"",
+            "try",
+            "repeat with r in to recipients of candidate",
+            "try",
+            "set candidateRecipients to candidateRecipients & \" \" & (address of r as text)",
+            "end try",
+            "end repeat",
+            "end try",
+            "set subjectOk to (subjectHint is \"\" or candidateSubject is subjectHint)",
+            "set recipientOk to (fallbackAddress is \"\" or candidateRecipients contains fallbackAddress)",
+            "if subjectOk and recipientOk and candidateContent contains markerHint then",
+            "set fallbackMsg to candidate",
+            "exit repeat",
+            "end if",
+            "end repeat",
+            "if fallbackMsg is missing value then",
+            "return \"missing_marker|\" & beforeOutgoing & \"|\" & beforeOutgoing & \"|\" & _recipient & \"|\" & _subject & \"|\" & _draftId & \"|\" & _bodyLen",
+            "end if",
+            "set _msg to fallbackMsg",
+            "set _subject to \"\"",
+            "set _recipient to \"\"",
+            "set _draftId to \"\"",
+            "set _bodyText to \"\"",
+            "set _bodyLen to 0",
+            "try",
+            "set _subject to (subject of _msg as text)",
+            "end try",
+            "try",
+            "if (count of to recipients of _msg) > 0 then set _recipient to (address of first to recipient of _msg as text)",
+            "end try",
+            "try",
+            "set _draftId to (id of _msg as text)",
+            "end try",
+            "try",
+            "set _bodyText to (content of _msg as text)",
+            "end try",
+            "if _bodyText is missing value then set _bodyText to \"\"",
+            "try",
+            "set _bodyLen to (length of _bodyText)",
+            "end try",
+            "end if",
+            "if markerHint is \"\" and subjectHint is not \"\" and _bodyLen <= 2 then",
+            "set fallbackMsg to missing value",
+            "repeat with idx from beforeOutgoing to 1 by -1",
+            "set candidate to item idx of outgoing messages",
+            "set candidateSubject to \"\"",
+            "set candidateContent to \"\"",
+            "set candidateRecipients to \"\"",
+            "set candidateLen to 0",
+            "try",
+            "set candidateSubject to (subject of candidate as text)",
+            "end try",
+            "try",
+            "set candidateContent to (content of candidate as text)",
+            "end try",
+            "if candidateContent is missing value then set candidateContent to \"\"",
+            "try",
+            "set candidateLen to (length of candidateContent)",
+            "end try",
+            "try",
+            "repeat with r in to recipients of candidate",
+            "try",
+            "set candidateRecipients to candidateRecipients & \" \" & (address of r as text)",
+            "end try",
+            "end repeat",
+            "end try",
+            "set subjectOk to (subjectHint is \"\" or candidateSubject is subjectHint)",
+            "set recipientOk to (fallbackAddress is \"\" or candidateRecipients contains fallbackAddress)",
+            "if subjectOk and recipientOk and candidateLen > 2 then",
+            "set fallbackMsg to candidate",
+            "exit repeat",
+            "end if",
+            "end repeat",
+            "if fallbackMsg is missing value then",
+            "return \"empty_body|\" & beforeOutgoing & \"|\" & beforeOutgoing & \"|\" & _recipient & \"|\" & _subject & \"|\" & _draftId & \"|\" & _bodyLen",
+            "end if",
+            "set _msg to fallbackMsg",
+            "set _subject to \"\"",
+            "set _recipient to \"\"",
+            "set _draftId to \"\"",
+            "set _bodyText to \"\"",
+            "set _bodyLen to 0",
+            "try",
+            "set _subject to (subject of _msg as text)",
+            "end try",
+            "try",
+            "if (count of to recipients of _msg) > 0 then set _recipient to (address of first to recipient of _msg as text)",
+            "end try",
+            "try",
+            "set _draftId to (id of _msg as text)",
+            "end try",
+            "try",
+            "set _bodyText to (content of _msg as text)",
+            "end try",
+            "if _bodyText is missing value then set _bodyText to \"\"",
+            "try",
+            "set _bodyLen to (length of _bodyText)",
+            "end try",
+            "end if",
+            "try",
             "send _msg",
+            "end try",
+            "try",
+            "tell application \"System Events\" to keystroke \"d\" using {command down, shift down}",
+            "end try",
             "set afterOutgoing to beforeOutgoing",
             "repeat with _tick from 1 to 20",
             "delay 0.4",
@@ -502,54 +799,99 @@ impl ActionRunner {
             "if checkSubject is \"\" then set checkSubject to subjectHint",
             "set checkRecipient to _recipient",
             "if checkRecipient is \"\" then set checkRecipient to fallbackAddress",
-            "if afterOutgoing = 0 then return \"sent_confirmed|\" & beforeOutgoing & \"|\" & afterOutgoing & \"|\" & checkRecipient & \"|\" & checkSubject",
-            "if afterOutgoing < beforeOutgoing then return \"sent_confirmed|\" & beforeOutgoing & \"|\" & afterOutgoing & \"|\" & checkRecipient & \"|\" & checkSubject",
+            "if afterOutgoing = 0 then return \"sent_confirmed|\" & beforeOutgoing & \"|\" & afterOutgoing & \"|\" & checkRecipient & \"|\" & checkSubject & \"|\" & _draftId & \"|\" & _bodyLen",
+            "if afterOutgoing < beforeOutgoing then return \"sent_confirmed|\" & beforeOutgoing & \"|\" & afterOutgoing & \"|\" & checkRecipient & \"|\" & checkSubject & \"|\" & _draftId & \"|\" & _bodyLen",
+            "if _draftId is not \"\" then",
+            "set draftStillExists to false",
+            "repeat with candidate in outgoing messages",
+            "try",
+            "if (id of candidate as text) is _draftId then",
+            "set draftStillExists to true",
+            "exit repeat",
+            "end if",
+            "end try",
+            "end repeat",
+            "if draftStillExists is false then return \"sent_confirmed|\" & beforeOutgoing & \"|\" & afterOutgoing & \"|\" & checkRecipient & \"|\" & checkSubject & \"|\" & _draftId & \"|\" & _bodyLen",
+            "end if",
             "if my sent_message_exists(checkSubject, checkRecipient, markerHint) then",
-            "return \"sent_confirmed|\" & beforeOutgoing & \"|\" & afterOutgoing & \"|\" & checkRecipient & \"|\" & checkSubject",
+            "return \"sent_confirmed|\" & beforeOutgoing & \"|\" & afterOutgoing & \"|\" & checkRecipient & \"|\" & checkSubject & \"|\" & _draftId & \"|\" & _bodyLen",
+            "end if",
+            "if markerHint is not \"\" and my sent_message_exists(checkSubject, checkRecipient, \"\") then",
+            "return \"sent_confirmed|\" & beforeOutgoing & \"|\" & afterOutgoing & \"|\" & checkRecipient & \"|\" & checkSubject & \"|\" & _draftId & \"|\" & _bodyLen",
             "end if",
             "end repeat",
             "end tell",
-            "return \"sent_pending|\" & beforeOutgoing & \"|\" & afterOutgoing & \"|\" & _recipient & \"|\" & _subject",
+            "return \"sent_pending|\" & beforeOutgoing & \"|\" & afterOutgoing & \"|\" & _recipient & \"|\" & _subject & \"|\" & _draftId & \"|\" & _bodyLen",
             "end run",
         ];
-        let out =
-            crate::applescript::run_with_args(&lines, &[fallback, subject_hint, marker_hint])?;
+        let out = crate::applescript::run_with_args(
+            &lines,
+            &[fallback, subject_hint, marker_hint, draft_hint],
+        )?;
         Ok(out.trim().to_string())
     }
 
-    fn mail_set_subject(subject: &str) -> Result<()> {
+    fn mail_set_subject(subject: &str, draft_id: Option<&str>) -> Result<String> {
+        let draft_hint = draft_id.unwrap_or_default().to_string();
         let lines = [
             "on run argv",
             "set subjectText to item 1 of argv",
+            "set draftHint to \"\"",
+            "if (count of argv) >= 2 then set draftHint to item 2 of argv",
             "tell application \"Mail\"",
             "activate",
-            "if (count of outgoing messages) = 0 then",
-            "set _msg to make new outgoing message with properties {visible:true}",
-            "else",
-            "set _msg to last outgoing message",
-            "set visible of _msg to true",
+            "set _msg to missing value",
+            "if draftHint is not \"\" then",
+            "repeat with candidate in outgoing messages",
+            "try",
+            "if (id of candidate as text) is draftHint then",
+            "set _msg to candidate",
+            "exit repeat",
             "end if",
+            "end try",
+            "end repeat",
+            "end if",
+            "if _msg is missing value then",
+            "set _msg to make new outgoing message with properties {visible:false}",
+            "end if",
+            "set visible of _msg to false",
             "set subject of _msg to subjectText",
+            "set draftId to \"\"",
+            "try",
+            "set draftId to (id of _msg as text)",
+            "end try",
             "end tell",
-            "return \"ok\"",
+            "return draftId",
             "end run",
         ];
-        crate::applescript::run_with_args(&lines, &[subject.to_string()])?;
-        Ok(())
+        let out = crate::applescript::run_with_args(&lines, &[subject.to_string(), draft_hint])?;
+        Ok(out.trim().to_string())
     }
 
-    fn mail_append_body(text: &str) -> Result<()> {
+    fn mail_append_body(text: &str, draft_id: Option<&str>) -> Result<(String, i64)> {
+        let draft_hint = draft_id.unwrap_or_default().to_string();
         let lines = [
             "on run argv",
             "set bodyText to item 1 of argv",
+            "set draftHint to \"\"",
+            "if (count of argv) >= 2 then set draftHint to item 2 of argv",
             "tell application \"Mail\"",
             "activate",
-            "if (count of outgoing messages) = 0 then",
-            "set _msg to make new outgoing message with properties {visible:true}",
-            "else",
-            "set _msg to last outgoing message",
-            "set visible of _msg to true",
+            "set _msg to missing value",
+            "if draftHint is not \"\" then",
+            "repeat with candidate in outgoing messages",
+            "try",
+            "if (id of candidate as text) is draftHint then",
+            "set _msg to candidate",
+            "exit repeat",
             "end if",
+            "end try",
+            "end repeat",
+            "end if",
+            "if _msg is missing value then",
+            "set _msg to make new outgoing message with properties {visible:false}",
+            "end if",
+            "set visible of _msg to false",
             "set existingContent to content of _msg",
             "if existingContent is missing value then set existingContent to \"\"",
             "if existingContent is \"\" then",
@@ -557,18 +899,135 @@ impl ActionRunner {
             "else",
             "set content of _msg to existingContent & return & bodyText",
             "end if",
+            "set draftId to \"\"",
+            "set bodyLen to 0",
+            "try",
+            "set draftId to (id of _msg as text)",
+            "end try",
+            "try",
+            "set bodyLen to (length of (content of _msg as text))",
+            "end try",
             "end tell",
-            "return \"ok\"",
+            "return draftId & \"|\" & bodyLen",
             "end run",
         ];
-        crate::applescript::run_with_args(&lines, &[text.to_string()])?;
-        Ok(())
+        let out = crate::applescript::run_with_args(&lines, &[text.to_string(), draft_hint])?;
+        let trimmed = out.trim();
+        let mut parts = trimmed.split('|');
+        let id = parts.next().unwrap_or("").trim().to_string();
+        let body_len = parts
+            .next()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        Ok((id, body_len))
     }
 
-    fn notes_write_text(text: &str) -> Result<()> {
+    fn mail_create_filled_draft(goal: Option<&str>, body_text: &str) -> Result<(String, i64)> {
+        let subject_hint = Self::preferred_mail_subject(goal).unwrap_or_default();
+        let recipient_hint = Self::preferred_mail_recipient(goal).unwrap_or_default();
         let lines = [
             "on run argv",
             "set bodyText to item 1 of argv",
+            "set subjectHint to \"\"",
+            "set recipientHint to \"\"",
+            "if (count of argv) >= 2 then set subjectHint to item 2 of argv",
+            "if (count of argv) >= 3 then set recipientHint to item 3 of argv",
+            "tell application \"Mail\"",
+            "activate",
+            "set _msg to make new outgoing message with properties {visible:false, content:bodyText}",
+            "if subjectHint is not \"\" then set subject of _msg to subjectHint",
+            "if recipientHint is not \"\" then",
+            "set hasTarget to false",
+            "repeat with r in to recipients of _msg",
+            "try",
+            "if (address of r as text) is recipientHint then set hasTarget to true",
+            "end try",
+            "end repeat",
+            "if hasTarget is false then",
+            "make new to recipient at end of to recipients of _msg with properties {address:recipientHint}",
+            "end if",
+            "end if",
+            "set draftId to \"\"",
+            "set bodyLen to 0",
+            "try",
+            "set draftId to (id of _msg as text)",
+            "end try",
+            "try",
+            "set bodyLen to (length of (content of _msg as text))",
+            "end try",
+            "end tell",
+            "return draftId & \"|\" & bodyLen",
+            "end run",
+        ];
+        let out = crate::applescript::run_with_args(
+            &lines,
+            &[
+                body_text.to_string(),
+                subject_hint.to_string(),
+                recipient_hint.to_string(),
+            ],
+        )?;
+        let trimmed = out.trim();
+        let mut parts = trimmed.split('|');
+        let id = parts.next().unwrap_or("").trim().to_string();
+        let body_len = parts
+            .next()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        Ok((id, body_len))
+    }
+
+    fn mail_send_fresh_from_goal(goal: &str, history: &mut Vec<String>) -> Result<String> {
+        let mut body_lines = Self::extract_quoted_fragments(goal)
+            .into_iter()
+            .filter(|s| s.len() >= 3)
+            .collect::<Vec<_>>();
+        if body_lines.is_empty() {
+            return Err(anyhow::anyhow!(
+                "no quoted payload available for fresh mail"
+            ));
+        }
+        if let Some(marker) = Self::preferred_run_scope_marker(Some(goal)) {
+            if !body_lines.iter().any(|line| line == &marker) {
+                body_lines.push(marker);
+            }
+        }
+        let subject = Self::preferred_mail_subject(Some(goal)).unwrap_or_else(|| {
+            body_lines
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "Steer Auto Message".to_string())
+        });
+        let recipient = Self::preferred_mail_recipient(Some(goal)).unwrap_or_default();
+        let body_text = body_lines.join("\n");
+        let draft_goal = format!(
+            "{} \"{}\" \"{}\" \"{}\"",
+            goal, subject, recipient, body_text
+        );
+        let (draft_id, body_len) = Self::mail_create_filled_draft(Some(&draft_goal), &body_text)?;
+        if body_len <= 2 {
+            return Err(anyhow::anyhow!(
+                "fresh draft body too short (draft_id={}, body_len={})",
+                draft_id,
+                body_len
+            ));
+        }
+        Self::remember_mail_draft_id(history, &draft_id);
+        let raw = Self::mail_send_latest_message(Some(&draft_goal), Some(draft_id.as_str()))?;
+        let parsed = Self::parse_mail_send_result(&raw);
+        if parsed.status != "sent_confirmed" {
+            return Err(anyhow::anyhow!("fresh send blocked: {}", raw));
+        }
+        Ok(raw)
+    }
+
+    fn notes_write_text(text: &str, goal: Option<&str>) -> Result<()> {
+        let marker = Self::preferred_run_scope_marker(goal).unwrap_or_default();
+        let lines = [
+            "on run argv",
+            "set bodyText to item 1 of argv",
+            "set markerText to \"\"",
+            "if (count of argv) > 1 then set markerText to item 2 of argv",
             "set noteTitle to bodyText",
             "try",
             "if bodyText contains return then",
@@ -586,24 +1045,98 @@ impl ActionRunner {
             "else",
             "set fd to item 1 of folders of ac",
             "end if",
-            "set n to make new note at fd with properties {name:noteTitle, body:bodyText}",
+            "set targetNote to missing value",
+            "if markerText is not \"\" then",
+            "set noteCount to count of notes of fd",
+            "repeat with idx from 1 to noteCount by 1",
+            "set candidate to item idx of notes of fd",
+            "set cName to \"\"",
+            "set cBody to \"\"",
+            "try",
+            "set cName to name of candidate as text",
+            "end try",
+            "try",
+            "set cBody to body of candidate as text",
+            "end try",
+            "if cName contains markerText or cBody contains markerText then",
+            "set targetNote to candidate",
+            "exit repeat",
+            "end if",
+            "end repeat",
+            "end if",
+            "if targetNote is missing value then",
+            "set mergedBody to bodyText",
+            "if markerText is not \"\" and mergedBody does not contain markerText then",
+            "if mergedBody is \"\" then",
+            "set mergedBody to markerText",
+            "else",
+            "set mergedBody to mergedBody & return & markerText",
+            "end if",
+            "end if",
+            "set targetNote to make new note at fd with properties {name:noteTitle, body:mergedBody}",
+            "else",
+            "set existingBody to \"\"",
+            "try",
+            "set existingBody to body of targetNote as text",
+            "end try",
+            "if existingBody is missing value then set existingBody to \"\"",
+            "set mergedBody to existingBody",
+            "if bodyText is not \"\" and existingBody does not contain bodyText then",
+            "if mergedBody is \"\" then",
+            "set mergedBody to bodyText",
+            "else",
+            "set mergedBody to mergedBody & return & bodyText",
+            "end if",
+            "end if",
+            "if markerText is not \"\" and mergedBody does not contain markerText then",
+            "if mergedBody is \"\" then",
+            "set mergedBody to markerText",
+            "else",
+            "set mergedBody to mergedBody & return & markerText",
+            "end if",
+            "end if",
+            "if mergedBody is not \"\" then set body of targetNote to mergedBody",
+            "end if",
             "end tell",
             "return \"ok\"",
             "end run",
         ];
-        crate::applescript::run_with_args(&lines, &[text.to_string()])?;
+        crate::applescript::run_with_args(&lines, &[text.to_string(), marker])?;
         Ok(())
     }
 
-    fn notes_read_text() -> Result<String> {
+    fn notes_read_text(goal: Option<&str>) -> Result<String> {
+        let marker = Self::preferred_run_scope_marker(goal).unwrap_or_default();
         let lines = [
+            "on run argv",
+            "set markerText to \"\"",
+            "if (count of argv) > 0 then set markerText to item 1 of argv",
             "tell application \"Notes\"",
             "if (count of accounts) = 0 then return \"\"",
             "set ac to item 1 of accounts",
             "if (count of folders of ac) = 0 then return \"\"",
             "set fd to item 1 of folders of ac",
             "if (count of notes of fd) = 0 then return \"\"",
-            "set n to last note of fd",
+            "set n to missing value",
+            "if markerText is not \"\" then",
+            "set noteCount to count of notes of fd",
+            "repeat with idx from 1 to noteCount by 1",
+            "set candidate to item idx of notes of fd",
+            "set cName to \"\"",
+            "set cBody to \"\"",
+            "try",
+            "set cName to name of candidate as text",
+            "end try",
+            "try",
+            "set cBody to body of candidate as text",
+            "end try",
+            "if cName contains markerText or cBody contains markerText then",
+            "set n to candidate",
+            "exit repeat",
+            "end if",
+            "end repeat",
+            "end if",
+            "if n is missing value then set n to first note of fd",
             "set nName to \"\"",
             "set nBody to \"\"",
             "try",
@@ -615,8 +1148,9 @@ impl ActionRunner {
             "if nBody is \"\" then return nName",
             "return nName & return & nBody",
             "end tell",
+            "end run",
         ];
-        crate::applescript::run_with_args(&lines, &Vec::<String>::new())
+        crate::applescript::run_with_args(&lines, &[marker])
     }
 
     fn textedit_append_text(text: &str, goal: Option<&str>) -> Result<()> {
@@ -1233,16 +1767,20 @@ impl ActionRunner {
                     }
 
                     if app_name.eq_ignore_ascii_case("Mail") {
-                        let _ = Self::mail_ensure_draft();
-                        let _ = Self::mail_set_recipient_if_missing(Some(goal));
+                        let draft_id = Self::mail_ensure_draft(Some(goal), history)
+                            .ok()
+                            .filter(|v| !v.trim().is_empty());
+                        let _ =
+                            Self::mail_set_recipient_if_missing(Some(goal), draft_id.as_deref());
                         let subject_already_set = history
                             .iter()
                             .any(|h| h.to_lowercase().contains("(mail subject)"));
                         let prefer_subject = heuristics::looks_like_subject(&text)
                             || (!subject_already_set && !text.contains('\n') && text.len() <= 120);
                         if prefer_subject {
-                            match Self::mail_set_subject(&text) {
-                                Ok(_) => {
+                            match Self::mail_set_subject(&text, draft_id.as_deref()) {
+                                Ok(target_draft_id) => {
+                                    Self::remember_mail_draft_id(history, &target_draft_id);
                                     description = format!("Typed '{}' (mail subject)", text);
                                     action_data = Some(json!({
                                         "proof": "mail_subject_set",
@@ -1255,13 +1793,56 @@ impl ActionRunner {
                                 }
                             }
                         } else {
-                            match Self::mail_append_body(&text) {
-                                Ok(_) => {
-                                    description = format!("Typed '{}' (mail body)", text);
-                                    action_data = Some(json!({
-                                        "proof": "mail_body_appended",
-                                        "text_len": text.chars().count()
-                                    }));
+                            match Self::mail_append_body(&text, draft_id.as_deref()) {
+                                Ok((target_draft_id, mut readback_len)) => {
+                                    Self::remember_mail_draft_id(history, &target_draft_id);
+                                    if readback_len <= 2 {
+                                        let forced_text = Self::extract_quoted_fragments(goal)
+                                            .into_iter()
+                                            .filter(|s| s.len() >= 3)
+                                            .collect::<Vec<_>>()
+                                            .join("\n");
+                                        if !forced_text.trim().is_empty()
+                                            && forced_text.trim() != text.trim()
+                                        {
+                                            if let Ok((forced_draft_id, forced_len)) =
+                                                Self::mail_create_filled_draft(
+                                                    Some(goal),
+                                                    &forced_text,
+                                                )
+                                            {
+                                                Self::remember_mail_draft_id(
+                                                    history,
+                                                    &forced_draft_id,
+                                                );
+                                                readback_len = forced_len;
+                                            } else if let Ok((forced_draft_id, forced_len)) =
+                                                Self::mail_append_body(
+                                                    &forced_text,
+                                                    Some(target_draft_id.as_str()),
+                                                )
+                                            {
+                                                Self::remember_mail_draft_id(
+                                                    history,
+                                                    &forced_draft_id,
+                                                );
+                                                readback_len = forced_len;
+                                            }
+                                        }
+                                    }
+                                    if readback_len <= 2 {
+                                        description =
+                                            "Type failed (mail body): empty readback after append"
+                                                .to_string();
+                                        action_status_override = Some("failed");
+                                    } else {
+                                        description = format!("Typed '{}' (mail body)", text);
+                                        action_data = Some(json!({
+                                            "proof": "mail_body_appended",
+                                            "text_len": text.chars().count(),
+                                            "readback_len": readback_len
+                                        }));
+                                    }
                                 }
                                 Err(e) => {
                                     description = format!("Type failed (mail body): {}", e);
@@ -1274,6 +1855,8 @@ impl ActionRunner {
                         }
                     } else if app_name.eq_ignore_ascii_case("Notes") {
                         let mut write_text = text.clone();
+                        let run_scope_marker =
+                            Self::preferred_run_scope_marker(Some(goal)).unwrap_or_default();
                         // Notes typing must remain app-local. Do not append every quoted token
                         // from the whole multi-app goal, which can contaminate note content.
                         if write_text.trim().is_empty() {
@@ -1289,7 +1872,15 @@ impl ActionRunner {
                                 write_text = quoted.join("\n");
                             }
                         }
-                        match Self::notes_write_text(&write_text) {
+                        if !run_scope_marker.is_empty() && !write_text.contains(&run_scope_marker) {
+                            if write_text.trim().is_empty() {
+                                write_text = run_scope_marker.clone();
+                            } else {
+                                write_text =
+                                    format!("{}\n{}", write_text.trim_end(), run_scope_marker);
+                            }
+                        }
+                        match Self::notes_write_text(&write_text, Some(goal)) {
                             Ok(_) => {
                                 description = format!("Typed '{}' (notes body)", write_text);
                                 action_status_override = Some("success");
@@ -1380,8 +1971,9 @@ impl ActionRunner {
                         .unwrap_or_default();
 
                     if is_cmd_n && front_app.eq_ignore_ascii_case("Mail") {
-                        match Self::mail_ensure_draft() {
-                            Ok(_) => {
+                        match Self::mail_ensure_draft(Some(goal), history) {
+                            Ok(draft_id) => {
+                                Self::remember_mail_draft_id(history, &draft_id);
                                 description = format!(
                                     "Shortcut '{}' + {:?} (Created new item)",
                                     key, shortcut_modifiers
@@ -1398,7 +1990,9 @@ impl ActionRunner {
                             }
                         }
                     } else if is_cmd_shift_d && front_app.eq_ignore_ascii_case("Mail") {
-                        match Self::mail_send_latest_message(Some(goal)) {
+                        let draft_id = Self::mail_current_draft_id(history);
+                        info!("      📧 [MailSend] key-path draft_id={:?}", draft_id);
+                        match Self::mail_send_latest_message(Some(goal), draft_id.as_deref()) {
                             Ok(raw_result) => {
                                 let send_result = Self::parse_mail_send_result(&raw_result);
                                 let outgoing_after = send_result
@@ -1424,8 +2018,17 @@ impl ActionRunner {
                                     "outgoing_before": send_result.outgoing_before,
                                     "outgoing_after": outgoing_after,
                                     "recipient": send_result.recipient,
-                                    "subject": send_result.subject
+                                    "subject": send_result.subject,
+                                    "draft_id": send_result.draft_id,
+                                    "body_len": send_result.body_len
                                 }));
+                                println!(
+                                    "MAIL_SEND_PROOF|status={}|recipient={}|subject={}|body_len={}",
+                                    send_result.status,
+                                    send_result.recipient,
+                                    send_result.subject,
+                                    send_result.body_len.unwrap_or(-1)
+                                );
                             }
                             Err(e) => {
                                 description = format!(
@@ -1488,8 +2091,9 @@ impl ActionRunner {
                     let front_app = crate::tool_chaining::CrossAppBridge::get_frontmost_app()
                         .unwrap_or_default();
                     if is_cmd_n && front_app.eq_ignore_ascii_case("Mail") {
-                        match Self::mail_ensure_draft() {
-                            Ok(_) => {
+                        match Self::mail_ensure_draft(Some(goal), history) {
+                            Ok(draft_id) => {
+                                Self::remember_mail_draft_id(history, &draft_id);
                                 description = format!(
                                     "Shortcut '{}' + {:?} (Created new item)",
                                     key, modifiers
@@ -1506,7 +2110,9 @@ impl ActionRunner {
                             }
                         }
                     } else if is_cmd_shift_d && front_app.eq_ignore_ascii_case("Mail") {
-                        match Self::mail_send_latest_message(Some(goal)) {
+                        let draft_id = Self::mail_current_draft_id(history);
+                        info!("      📧 [MailSend] shortcut-path draft_id={:?}", draft_id);
+                        match Self::mail_send_latest_message(Some(goal), draft_id.as_deref()) {
                             Ok(raw_result) => {
                                 let send_result = Self::parse_mail_send_result(&raw_result);
                                 let outgoing_after = send_result
@@ -1530,8 +2136,17 @@ impl ActionRunner {
                                     "outgoing_before": send_result.outgoing_before,
                                     "outgoing_after": outgoing_after,
                                     "recipient": send_result.recipient,
-                                    "subject": send_result.subject
+                                    "subject": send_result.subject,
+                                    "draft_id": send_result.draft_id,
+                                    "body_len": send_result.body_len
                                 }));
+                                println!(
+                                    "MAIL_SEND_PROOF|status={}|recipient={}|subject={}|body_len={}",
+                                    send_result.status,
+                                    send_result.recipient,
+                                    send_result.subject,
+                                    send_result.body_len.unwrap_or(-1)
+                                );
                             }
                             Err(e) => {
                                 description = format!(
@@ -1569,9 +2184,28 @@ impl ActionRunner {
                 if !front_app.eq_ignore_ascii_case("Mail") {
                     let _ = heuristics::ensure_app_focus("Mail", 3).await;
                 }
-                match Self::mail_send_latest_message(Some(goal)) {
+                let draft_id = Self::mail_current_draft_id(history);
+                info!("      📧 [MailSend] action-path draft_id={:?}", draft_id);
+                match Self::mail_send_latest_message(Some(goal), draft_id.as_deref()) {
                     Ok(raw_result) => {
-                        let send_result = Self::parse_mail_send_result(&raw_result);
+                        let mut send_result = Self::parse_mail_send_result(&raw_result);
+                        let mut result_raw = raw_result.clone();
+                        let mut fresh_recovery_used = false;
+                        if Self::is_test_mode_enabled()
+                            && send_result.status != "sent_confirmed"
+                            && !Self::mail_fresh_recovery_used(history)
+                            && matches!(
+                                send_result.status.as_str(),
+                                "missing_marker" | "empty_body" | "draft_not_found" | "no_draft"
+                            )
+                        {
+                            Self::mark_mail_fresh_recovery_used(history);
+                            if let Ok(fresh_raw) = Self::mail_send_fresh_from_goal(goal, history) {
+                                result_raw = fresh_raw;
+                                send_result = Self::parse_mail_send_result(&result_raw);
+                                fresh_recovery_used = true;
+                            }
+                        }
                         let outgoing_after = send_result
                             .outgoing_after
                             .unwrap_or_else(|| Self::mail_outgoing_count().unwrap_or(-1));
@@ -1579,18 +2213,29 @@ impl ActionRunner {
                             description = "Mail send completed".to_string();
                             action_status_override = Some("success");
                         } else {
-                            description = format!("Mail send blocked: {}", raw_result);
+                            description = format!("Mail send blocked: {}", result_raw);
                             action_status_override = Some("failed");
                         }
                         action_data = Some(json!({
                             "proof": "mail_send",
-                            "result": raw_result,
+                            "result": result_raw,
                             "send_status": send_result.status,
                             "outgoing_before": send_result.outgoing_before,
                             "outgoing_after": outgoing_after,
                             "recipient": send_result.recipient,
-                            "subject": send_result.subject
+                            "subject": send_result.subject,
+                            "draft_id": send_result.draft_id,
+                            "body_len": send_result.body_len,
+                            "fresh_recovery_used": fresh_recovery_used
                         }));
+                        println!(
+                            "MAIL_SEND_PROOF|status={}|recipient={}|subject={}|body_len={}|fresh_recovery={}",
+                            send_result.status,
+                            send_result.recipient,
+                            send_result.subject,
+                            send_result.body_len.unwrap_or(-1),
+                            fresh_recovery_used
+                        );
                     }
                     Err(e) => {
                         description = format!("mail_send failed: {}", e);
@@ -1610,7 +2255,10 @@ impl ActionRunner {
                 let front_app =
                     crate::tool_chaining::CrossAppBridge::get_frontmost_app().unwrap_or_default();
                 if front_app.eq_ignore_ascii_case("Mail") {
-                    let _ = Self::mail_set_recipient_if_missing(Some(goal));
+                    let draft_id = Self::mail_ensure_draft(Some(goal), history)
+                        .ok()
+                        .filter(|v| !v.trim().is_empty());
+                    let _ = Self::mail_set_recipient_if_missing(Some(goal), draft_id.as_deref());
                     let mut text = crate::tool_chaining::CrossAppBridge::get_clipboard()
                         .unwrap_or_else(|_| "".to_string());
                     let fallback = Self::mail_fallback_body_from_goal(goal);
@@ -1647,14 +2295,43 @@ impl ActionRunner {
                             }
                         }
                     }
-                    match Self::mail_append_body(&text) {
-                        Ok(_) => {
-                            description = "Pasted clipboard contents (mail body)".to_string();
-                            action_status_override = Some("success");
-                            action_data = Some(json!({
-                                "proof": "mail_body_appended",
-                                "text_len": text.chars().count()
-                            }));
+                    match Self::mail_append_body(&text, draft_id.as_deref()) {
+                        Ok((target_draft_id, mut readback_len)) => {
+                            Self::remember_mail_draft_id(history, &target_draft_id);
+                            if readback_len <= 2 {
+                                let forced_text = Self::extract_quoted_fragments(goal)
+                                    .into_iter()
+                                    .filter(|s| s.len() >= 3)
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                if !forced_text.trim().is_empty()
+                                    && forced_text.trim() != text.trim()
+                                {
+                                    if let Ok((forced_draft_id, forced_len)) =
+                                        Self::mail_append_body(
+                                            &forced_text,
+                                            Some(target_draft_id.as_str()),
+                                        )
+                                    {
+                                        Self::remember_mail_draft_id(history, &forced_draft_id);
+                                        readback_len = forced_len;
+                                    }
+                                }
+                            }
+                            if readback_len <= 2 {
+                                description =
+                                    "Paste failed (mail body): empty readback after append"
+                                        .to_string();
+                                action_status_override = Some("failed");
+                            } else {
+                                description = "Pasted clipboard contents (mail body)".to_string();
+                                action_status_override = Some("success");
+                                action_data = Some(json!({
+                                    "proof": "mail_body_appended",
+                                    "text_len": text.chars().count(),
+                                    "readback_len": readback_len
+                                }));
+                            }
                         }
                         Err(e) => {
                             description = format!("Paste failed (mail body): {}", e);
@@ -1714,7 +2391,7 @@ impl ActionRunner {
                 let front_app =
                     crate::tool_chaining::CrossAppBridge::get_frontmost_app().unwrap_or_default();
                 if front_app.eq_ignore_ascii_case("Notes") {
-                    match Self::notes_read_text() {
+                    match Self::notes_read_text(Some(goal)) {
                         Ok(text) => {
                             if !text.trim().is_empty() {
                                 let _ =
