@@ -90,11 +90,31 @@ fn parse_bool_env_with_default(key: &str, default: bool) -> bool {
 }
 
 impl N8nApi {
+    fn build_http_client() -> Client {
+        let prefer_no_proxy =
+            cfg!(test) || parse_bool_env_with_default("STEER_HTTP_NO_SYSTEM_PROXY", false);
+        if prefer_no_proxy {
+            if let Ok(client) = Client::builder().no_proxy().build() {
+                return client;
+            }
+        }
+
+        if let Ok(client) = std::panic::catch_unwind(Client::new) {
+            return client;
+        }
+
+        eprintln!("⚠️ reqwest default client init panicked; falling back to no-proxy client");
+        Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap_or_else(|_| Client::new())
+    }
+
     pub fn new(base_url: &str, api_key: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
-            client: Client::new(),
+            client: Self::build_http_client(),
         }
     }
 
