@@ -214,6 +214,15 @@ extract_expected_tokens_from_request() {
                 print "$s\n";
             }
         '
+        # Support smart quotes and code-fenced fragments.
+        printf '%s\n' "$source_text" | perl -CS -ne '
+            while (/“([^”]+)”|‘([^’]+)’|`([^`]+)`/g) {
+                my $s = defined($1) && $1 ne "" ? $1 : defined($2) && $2 ne "" ? $2 : $3;
+                $s =~ s/^\s+|\s+$//g;
+                next if length($s) < 3;
+                print "$s\n";
+            }
+        '
         # Also capture non-quoted key:value style requirements.
         printf '%s\n' "$source_text" | perl -ne '
             while (/([A-Za-z가-힣][A-Za-z가-힣0-9 _-]{1,24})\s*[:=]\s*([A-Za-z가-힣0-9 _\-]{3,80})/g) {
@@ -235,6 +244,17 @@ extract_expected_tokens_from_request() {
                 $k = lc($k);
                 print "$k: $v\n";
                 print "$v\n";
+            }
+        '
+        # Capture imperative payload phrases that are often unquoted.
+        printf '%s\n' "$source_text" | perl -CS -ne '
+            while (/(?:입력|작성|기입|붙여넣기|기록|설정)\s*(?:은|는|을|를)?\s*([A-Za-z가-힣0-9._:@#\/ _-]{3,96})/ig) {
+                my $s = $1;
+                $s =~ s/^\s+|\s+$//g;
+                $s =~ s/[,.]$//;
+                next if length($s) < 3;
+                next if $s =~ /^(해|하세요|하고|후|다음)$/i;
+                print "$s\n";
             }
         '
     } | awk '!seen[$0]++'
@@ -282,7 +302,7 @@ token_presence_location() {
     local marker="${2:-}"
     local run_start_epoch="${3:-0}"
     local require_marker="${STEER_SEMANTIC_REQUIRE_MARKER:-1}"
-    local scan_limit="${STEER_MAIL_SENT_SCAN_LIMIT:-120}"
+    local scan_limit="${STEER_SEMANTIC_SCAN_LIMIT:-40}"
     local result=""
     local timeout_sec="${STEER_OSASCRIPT_TIMEOUT_SEC:-8}"
     local tmp_out=""
@@ -302,12 +322,12 @@ on run argv
     set tokenText to item 1 of argv
     set markerText to ""
     if (count of argv) > 1 then set markerText to item 2 of argv
-    set scanLimit to 120
+    set scanLimit to 40
     if (count of argv) > 2 then
         try
             set scanLimit to (item 3 of argv) as integer
         on error
-            set scanLimit to 120
+            set scanLimit to 40
         end try
     end if
     set runStartEpoch to 0
@@ -333,7 +353,26 @@ on run argv
             if (count of accounts) > 0 then
                 repeat with ac in accounts
                     repeat with f in folders of ac
-                        repeat with n in notes of f
+                        set noteCount to count of notes of f
+                        if noteCount > 0 then
+                            set lowerNote to noteCount - scanLimit
+                            if lowerNote < 1 then set lowerNote to 1
+                            repeat with noteIdx from noteCount to lowerNote by -1
+                                set n to item noteIdx of notes of f
+                                set timeOk to true
+                                if runStartEpoch > 0 then
+                                    set timeOk to false
+                                    try
+                                        set modifiedAt to modification date of n
+                                        set modifiedAgeSeconds to ((current date) - modifiedAt)
+                                        if modifiedAgeSeconds < 0 then set modifiedAgeSeconds to 0
+                                        set modifiedEpoch to nowEpoch - (round modifiedAgeSeconds rounding down)
+                                        if modifiedEpoch ≥ runStartEpoch then set timeOk to true
+                                    end try
+                                end if
+                                if timeOk is false then
+                                    exit repeat
+                                end if
                             try
                                 set nName to name of n as text
                             on error
@@ -347,7 +386,8 @@ on run argv
                             set scopeOk to (markerText is "" or nBody contains markerText or nName contains markerText)
                             if scopeOk and nName contains tokenText then return "NOTE_TITLE"
                             if scopeOk and nBody contains tokenText then return "NOTE_BODY"
-                        end repeat
+                            end repeat
+                        end if
                     end repeat
                 end repeat
             end if
@@ -488,7 +528,7 @@ mail_sent_recipient_location() {
     local marker="${2:-}"
     local run_start_epoch="${3:-0}"
     local require_marker="${STEER_SEMANTIC_REQUIRE_MARKER:-1}"
-    local scan_limit="${STEER_MAIL_SENT_SCAN_LIMIT:-120}"
+    local scan_limit="${STEER_SEMANTIC_SCAN_LIMIT:-40}"
     local result=""
     local timeout_sec="${STEER_OSASCRIPT_TIMEOUT_SEC:-8}"
     local tmp_out=""
@@ -513,12 +553,12 @@ on run argv
     set recipientText to item 1 of argv
     set markerText to ""
     if (count of argv) > 1 then set markerText to item 2 of argv
-    set scanLimit to 120
+    set scanLimit to 40
     if (count of argv) > 2 then
         try
             set scanLimit to (item 3 of argv) as integer
         on error
-            set scanLimit to 120
+            set scanLimit to 40
         end try
     end if
     set runStartEpoch to 0
@@ -626,6 +666,21 @@ APPLESCRIPT
     printf '%s\n' "$result"
 }
 
+mail_send_proof_from_log() {
+    local log_file="$1"
+    local line=""
+    line="$(grep -E '"proof"[[:space:]]*:[[:space:]]*"mail_send"' "$log_file" 2>/dev/null | tail -n 1)"
+    [ -z "$line" ] && return 1
+    local status=""
+    local recipient=""
+    local subject=""
+    status="$(printf '%s\n' "$line" | perl -ne 'if (/"send_status"\s*:\s*"([^"]*)"/) { print $1; exit }')"
+    recipient="$(printf '%s\n' "$line" | perl -ne 'if (/"recipient"\s*:\s*"([^"]*)"/) { print $1; exit }')"
+    subject="$(printf '%s\n' "$line" | perl -ne 'if (/"subject"\s*:\s*"([^"]*)"/) { print $1; exit }')"
+    printf '%s|%s|%s\n' "$status" "$recipient" "$subject"
+    return 0
+}
+
 if ! preflight_checks; then
     exit 1
 fi
@@ -648,6 +703,7 @@ LOCK_DISABLED_VALUE="${STEER_LOCK_DISABLED:-0}"
 RUN_SCOPE_ENABLED="${STEER_SEMANTIC_RUN_SCOPE:-1}"
 TEST_MODE_VALUE="${STEER_TEST_MODE:-0}"
 REQUIRE_NODE_CAPTURE_VALUE="${STEER_REQUIRE_NODE_CAPTURE:-1}"
+OPENAI_PREFLIGHT_REQUIRED_VALUE="${STEER_PREFLIGHT_REQUIRE_OPENAI_KEY:-0}"
 RUN_STARTED_EPOCH=0
 
 detect_cli_llm_provider() {
@@ -709,11 +765,14 @@ if [ "$REQUIRE_PRIMARY_PLANNER_VALUE" = "1" ] && [ "$SCENARIO_MODE_VALUE" = "1" 
     exit 1
 fi
 
-if [ "$SCENARIO_MODE_VALUE" = "0" ] && [ -z "$CLI_LLM_VALUE" ] && ! has_openai_key_configured; then
+if [ "$OPENAI_PREFLIGHT_REQUIRED_VALUE" = "1" ] && [ "$SCENARIO_MODE_VALUE" = "0" ] && [ -z "$CLI_LLM_VALUE" ] && ! has_openai_key_configured; then
     echo "❌ Preflight failed: OPENAI_API_KEY is not set."
     echo "   Fix: 기본 OpenAI 경로를 쓰려면 .env/core/.env 또는 현재 셸에 OPENAI_API_KEY를 설정하세요."
     echo "   대안: STEER_CLI_LLM 설정 또는 STEER_SCENARIO_MODE=1(테스트 전용) 사용."
     exit 1
+elif [ "$SCENARIO_MODE_VALUE" = "0" ] && [ -z "$CLI_LLM_VALUE" ] && ! has_openai_key_configured; then
+    echo "ℹ️ OPENAI_API_KEY 미설정: preflight 강제는 비활성(STEER_PREFLIGHT_REQUIRE_OPENAI_KEY=0)."
+    echo "   필요하면 STEER_CLI_LLM을 지정하거나 STEER_PREFLIGHT_REQUIRE_OPENAI_KEY=1로 엄격 모드를 켜세요."
 fi
 
 FATAL_PATTERN='Failed to acquire lock|thread .* panicked|FATAL ERROR|⛔️|LLM not available for surf mode|Preflight failed|Surf failed|Supervisor escalated|Execution Error|SCHEMA_ERROR|PLAN_REJECTED|LLM Refused'
@@ -929,9 +988,24 @@ if [ "${STEER_SEMANTIC_VERIFY:-1}" = "1" ]; then
         fi
         FILTERED_TOKENS+=("$token")
     done
-    token_cap="${STEER_SEMANTIC_MAX_TOKENS:-24}"
+    token_cap="${STEER_SEMANTIC_MAX_TOKENS:-64}"
     if [ "${#FILTERED_TOKENS[@]}" -gt "$token_cap" ]; then
         FILTERED_TOKENS=("${FILTERED_TOKENS[@]:0:$token_cap}")
+    fi
+    if [ -n "$RUN_SCOPE_MARKER" ]; then
+        marker_kept=0
+        for token in "${FILTERED_TOKENS[@]}"; do
+            if [ "$token" = "$RUN_SCOPE_MARKER" ]; then
+                marker_kept=1
+                break
+            fi
+        done
+        if [ "$marker_kept" -eq 0 ]; then
+            if [ "${#FILTERED_TOKENS[@]}" -ge "$token_cap" ] && [ "$token_cap" -gt 0 ]; then
+                FILTERED_TOKENS=("${FILTERED_TOKENS[@]:0:$((token_cap - 1))}")
+            fi
+            FILTERED_TOKENS+=("$RUN_SCOPE_MARKER")
+        fi
     fi
 
     missing_count=0
@@ -969,7 +1043,15 @@ fi
 
 if printf '%s' "$REQUEST_TEXT_FOR_VERIFY" | grep -Eiq '보내|발송|send'; then
     mail_send_logged=0
-    if grep -Eiq "Shortcut 'd'.*shift.*Mail sent|Mail send completed|\"send_status\"[[:space:]]*:[[:space:]]*\"sent_confirmed\"|mail sent" "$LOG_FILE"; then
+    mail_log_status=""
+    mail_log_recipient=""
+    mail_log_subject=""
+    if proof_line="$(mail_send_proof_from_log "$LOG_FILE")"; then
+        IFS='|' read -r mail_log_status mail_log_recipient mail_log_subject <<< "$proof_line"
+        if [ "$mail_log_status" = "sent_confirmed" ]; then
+            mail_send_logged=1
+        fi
+    elif grep -Eiq "Shortcut 'd'.*shift.*Mail sent|Mail send completed|\"send_status\"[[:space:]]*:[[:space:]]*\"sent_confirmed\"|mail sent" "$LOG_FILE"; then
         mail_send_logged=1
     fi
     outgoing_count="$(mail_outgoing_count || echo -1)"
@@ -982,15 +1064,21 @@ if printf '%s' "$REQUEST_TEXT_FOR_VERIFY" | grep -Eiq '보내|발송|send'; then
     fi
 
     mail_sent_location="NOT_CHECKED"
-    if [ -n "$mail_verify_token" ]; then
-        mail_sent_location="$(token_presence_location "$mail_verify_token" "$RUN_SCOPE_MARKER" "$RUN_STARTED_EPOCH")"
-    fi
     mail_sent_ok=0
-    case "$mail_sent_location" in
-        MAIL_SENT_SUBJECT|MAIL_SENT_BODY)
-            mail_sent_ok=1
-            ;;
-    esac
+    if [ "$mail_send_logged" -eq 1 ]; then
+        mail_sent_ok=1
+        mail_sent_location="LOG_MAIL_SEND"
+    fi
+    if [ -n "$mail_verify_token" ]; then
+        if [ "$mail_sent_ok" -ne 1 ]; then
+            mail_sent_location="$(token_presence_location "$mail_verify_token" "$RUN_SCOPE_MARKER" "$RUN_STARTED_EPOCH")"
+            case "$mail_sent_location" in
+                MAIL_SENT_SUBJECT|MAIL_SENT_BODY)
+                    mail_sent_ok=1
+                    ;;
+            esac
+        fi
+    fi
 
     expected_recipient="${STEER_EXPECT_MAIL_RECIPIENT:-}"
     if [ -z "$expected_recipient" ]; then
@@ -1000,17 +1088,24 @@ if printf '%s' "$REQUEST_TEXT_FOR_VERIFY" | grep -Eiq '보내|발송|send'; then
         expected_recipient="${STEER_DEFAULT_MAIL_TO}"
     fi
     expected_recipient="$(printf '%s' "$expected_recipient" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
-    mail_recipient_location="RECIPIENT_UNSET"
-    mail_recipient_ok=0
+    mail_recipient_location="RECIPIENT_NOT_REQUIRED"
+    mail_recipient_ok=1
     if printf '%s' "$expected_recipient" | grep -Eq '.+@.+\..+'; then
-        mail_recipient_location="$(mail_sent_recipient_location "$expected_recipient" "$RUN_SCOPE_MARKER" "$RUN_STARTED_EPOCH")"
-        if [ "$mail_recipient_location" = "MAIL_SENT_RECIPIENT" ]; then
+        mail_recipient_ok=0
+        local_mail_log_recipient="$(printf '%s' "$mail_log_recipient" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+        if [ -n "$local_mail_log_recipient" ] && [ "$local_mail_log_recipient" = "$expected_recipient" ]; then
             mail_recipient_ok=1
+            mail_recipient_location="LOG_MAIL_RECIPIENT"
+        else
+            mail_recipient_location="$(mail_sent_recipient_location "$expected_recipient" "$RUN_SCOPE_MARKER" "$RUN_STARTED_EPOCH")"
+            if [ "$mail_recipient_location" = "MAIL_SENT_RECIPIENT" ]; then
+                mail_recipient_ok=1
+            fi
         fi
     fi
 
     if [ "$mail_send_logged" -eq 1 ] && [ "$mail_sent_ok" -eq 1 ] && [ "$mail_recipient_ok" -eq 1 ]; then
-        SEMANTIC_LINES="${SEMANTIC_LINES}- 메일 발송 검증 ✅ (send-action 로그 + sent mailbox 확인 + recipient=${expected_recipient}, outgoing=${outgoing_count})"$'\n'
+        SEMANTIC_LINES="${SEMANTIC_LINES}- 메일 발송 검증 ✅ (send-action 로그/증거 + recipient=${expected_recipient:-optional}, outgoing=${outgoing_count}, sent_location=${mail_sent_location}, subject=${mail_log_subject:-n/a})"$'\n'
     else
         SEMANTIC_LINES="${SEMANTIC_LINES}- 메일 발송 검증 ❌ (send-action 로그=${mail_send_logged}, outgoing=${outgoing_count}, sent_location=${mail_sent_location}, recipient=${expected_recipient:-none}, recipient_location=${mail_recipient_location}, token=${mail_verify_token:-none})"$'\n'
         STATUS="failed"

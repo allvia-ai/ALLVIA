@@ -55,7 +55,18 @@ pub fn snapshot(_scope: Option<String>) -> Value {
         let _system_wrapper = AxElement(system_wide); // Auto-release
 
         // 2. Focused App
-        let focused_app_ref = match resolve_focused_application(system_wide) {
+        let mut focused_app_ref = resolve_focused_application(system_wide);
+        if focused_app_ref.is_none() {
+            let (front_name, front_pid) = frontmost_app_info_via_osascript().unwrap_or_default();
+            if let Some(pid) = front_pid {
+                bring_process_frontmost(pid);
+            } else if !front_name.is_empty() {
+                activate_application_by_name(&front_name);
+            }
+            thread::sleep(Duration::from_millis(120));
+            focused_app_ref = resolve_focused_application(system_wide);
+        }
+        let focused_app_ref = match focused_app_ref {
             Some(v) => v,
             None => {
                 let (front_name, _) = frontmost_app_info_via_osascript().unwrap_or_default();
@@ -158,6 +169,16 @@ fn bring_process_frontmost(pid: i32) {
         "tell application \"System Events\" to set frontmost of first application process whose unix id is {} to true",
         pid
     );
+    let _ = Command::new("osascript").arg("-e").arg(script).output();
+}
+
+fn activate_application_by_name(name: &str) {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let escaped = trimmed.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!("tell application \"{}\" to activate", escaped);
     let _ = Command::new("osascript").arg("-e").arg(script).output();
 }
 

@@ -107,13 +107,22 @@ pub fn init() -> anyhow::Result<()> {
         } else {
             std::path::PathBuf::from(trimmed)
         }
-    } else if let Some(mut path) = dirs::data_local_dir() {
-        path.push("steer");
-        std::fs::create_dir_all(&path)?; // Ensure ~/.local/share/steer exists
-        path.push("steer.db");
-        path
     } else {
-        std::path::PathBuf::from("steer.db") // Fallback
+        #[cfg(test)]
+        {
+            std::env::temp_dir().join("steer_test.db")
+        }
+        #[cfg(not(test))]
+        {
+            if let Some(mut path) = dirs::data_local_dir() {
+                path.push("steer");
+                std::fs::create_dir_all(&path)?; // Ensure ~/.local/share/steer exists
+                path.push("steer.db");
+                path
+            } else {
+                std::path::PathBuf::from("steer.db") // Fallback
+            }
+        }
     };
 
     if let Some(parent) = db_path.parent() {

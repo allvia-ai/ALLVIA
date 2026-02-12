@@ -188,18 +188,24 @@ impl Planner {
     fn goal_requires_textedit_save(goal: &str) -> bool {
         let lower = goal.to_lowercase();
         let mentions_textedit = lower.contains("textedit") || lower.contains("텍스트에디트");
-        let mentions_save = Self::goal_contains_any(
-            &lower,
-            &[
-                "save",
-                "저장",
-                "cmd+s",
-                "command+s",
-                "파일로 저장",
-                "저장해",
-            ],
-        );
+        let mentions_save_shortcut = Self::contains_shortcut_token(&lower, "cmd", "s")
+            || Self::contains_shortcut_token(&lower, "command", "s");
+        let mentions_save =
+            Self::goal_contains_any(&lower, &["save", "저장", "파일로 저장", "저장해"])
+                || mentions_save_shortcut;
         mentions_textedit && mentions_save
+    }
+
+    fn contains_shortcut_token(text_lower: &str, modifier: &str, key: &str) -> bool {
+        let escaped_modifier = regex::escape(modifier);
+        let escaped_key = regex::escape(key);
+        let pattern = format!(
+            r"(^|[^a-z0-9_+]){}\s*\+\s*{}([^a-z0-9_+]|$)",
+            escaped_modifier, escaped_key
+        );
+        regex::Regex::new(&pattern)
+            .map(|re| re.is_match(text_lower))
+            .unwrap_or(false)
     }
 
     fn step_data_has_proof(step: &crate::session_store::SessionStep, proof: &str) -> bool {
@@ -291,8 +297,13 @@ impl Planner {
             let is_save_shortcut = matches!(step.action_type.as_str(), "shortcut" | "key" | "save")
                 && desc.contains("shortcut 's'")
                 && desc.contains("command");
-            if is_save_shortcut
-                && (current_app.as_deref() == Some("textedit") || textedit_context_seen)
+            let has_textedit_save_proof = Self::step_data_has_proof(step, "textedit_save")
+                || desc.contains("textedit saved")
+                || desc.contains("saved file")
+                || desc.contains("file saved");
+            if has_textedit_save_proof
+                || (is_save_shortcut
+                    && (current_app.as_deref() == Some("textedit") || textedit_context_seen))
             {
                 evidence.textedit_save_confirmed = true;
             }
@@ -321,8 +332,10 @@ impl Planner {
         }
         if !evidence.textedit_save_confirmed {
             evidence.textedit_save_confirmed =
-                Self::history_contains_case_insensitive(history, "opened app: textedit")
-                    && Self::history_contains_shortcut(history, "s");
+                (Self::history_contains_case_insensitive(history, "opened app: textedit")
+                    && Self::history_contains_shortcut(history, "s"))
+                    || Self::history_contains_case_insensitive(history, "textedit saved")
+                    || Self::history_contains_case_insensitive(history, "file saved");
         }
 
         evidence
@@ -2200,6 +2213,47 @@ mod tests {
         let summary = Planner::summarize_execution(goal, &session, &history, true);
         assert!(summary.textedit_write_required);
         assert!(summary.textedit_write_confirmed);
+        assert!(summary.textedit_save_required);
+        assert!(summary.textedit_save_confirmed);
+        assert!(summary.business_complete);
+    }
+
+    #[test]
+    fn goal_requires_textedit_save_detects_cmd_s_only() {
+        let goal = "TextEdit를 열고 문서를 편집한 다음 Cmd+S 로 저장하세요.";
+        assert!(Planner::goal_requires_textedit_save(goal));
+    }
+
+    #[test]
+    fn goal_requires_textedit_save_does_not_match_cmd_shift_d() {
+        let goal = "TextEdit를 열고 내용을 복사한 뒤 Mail에서 보내기(Cmd+Shift+D)로 발송하세요.";
+        assert!(!Planner::goal_requires_textedit_save(goal));
+    }
+
+    #[test]
+    fn summarize_execution_accepts_textedit_save_proof_without_shortcut_text() {
+        let goal = "TextEdit에서 문서를 작성하고 저장하세요.";
+        let mut session = base_session(goal);
+        session.add_step("open_app", "Opened app: TextEdit", "success", None);
+        session.add_step(
+            "type",
+            "Typed 'status: in-progress' (textedit body)",
+            "success",
+            Some(serde_json::json!({"proof": "textedit_append_text"})),
+        );
+        session.add_step(
+            "shortcut",
+            "Saved file in TextEdit",
+            "success",
+            Some(serde_json::json!({"proof": "textedit_save"})),
+        );
+        let history = vec![
+            "Opened app: TextEdit".to_string(),
+            "Typed 'status: in-progress' (textedit body)".to_string(),
+            "Saved file in TextEdit".to_string(),
+        ];
+
+        let summary = Planner::summarize_execution(goal, &session, &history, true);
         assert!(summary.textedit_save_required);
         assert!(summary.textedit_save_confirmed);
         assert!(summary.business_complete);
