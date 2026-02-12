@@ -1033,6 +1033,27 @@ impl Planner {
         }
     }
 
+    fn supervisor_safe_bypass_enabled() -> bool {
+        Self::env_truthy_default("STEER_SUPERVISOR_BYPASS_SAFE", true)
+    }
+
+    fn is_low_risk_action_for_supervisor(plan: &serde_json::Value) -> bool {
+        matches!(
+            plan["action"].as_str().unwrap_or(""),
+            "open_app"
+                | "switch_app"
+                | "shortcut"
+                | "key"
+                | "type"
+                | "paste"
+                | "copy"
+                | "select_all"
+                | "read"
+                | "read_clipboard"
+                | "transfer"
+        )
+    }
+
     fn record_fallback_action(history: &mut Vec<String>, reason: &str, plan: &serde_json::Value) {
         println!("   🧯 Fallback action [{}]: {}", reason, plan);
         history.push(format!("FALLBACK_ACTION: {} => {}", reason, plan));
@@ -1513,19 +1534,36 @@ impl Planner {
                     plan = fallback_plan;
                 }
             } else {
-                // 3. Supervisor Check
-                let supervisor_decision =
-                    crate::retry_logic::with_retry(&retry_config, "Supervisor", || async {
-                        Supervisor::consult(&*self.llm, goal, &plan, &history).await
-                    })
-                    .await?;
+                // 3. Supervisor Check (safe actions can bypass to reduce rate-limit stalls)
+                let bypass_supervisor = Self::supervisor_safe_bypass_enabled()
+                    && Self::is_low_risk_action_for_supervisor(&plan);
+                let (mut supervisor_action, supervisor_reason, supervisor_notes) =
+                    if bypass_supervisor {
+                        println!("   🕵️ Supervisor: bypass (safe action)");
+                        (
+                            "accept".to_string(),
+                            "safe_action_bypass".to_string(),
+                            "Low-risk action bypassed supervisor gate".to_string(),
+                        )
+                    } else {
+                        let supervisor_decision =
+                            crate::retry_logic::with_retry(&retry_config, "Supervisor", || async {
+                                Supervisor::consult(&*self.llm, goal, &plan, &history).await
+                            })
+                            .await?;
 
-                println!(
-                    "   🕵️ Supervisor: {} ({})",
-                    supervisor_decision.action, supervisor_decision.reason
-                );
+                        println!(
+                            "   🕵️ Supervisor: {} ({})",
+                            supervisor_decision.action, supervisor_decision.reason
+                        );
 
-                let mut supervisor_action = supervisor_decision.action.clone();
+                        (
+                            supervisor_decision.action,
+                            supervisor_decision.reason,
+                            supervisor_decision.notes,
+                        )
+                    };
+
                 if supervisor_action == "review"
                     && Self::can_force_done_for_simple_goal(goal, &plan, &history)
                 {
@@ -1539,8 +1577,8 @@ impl Planner {
                     && Self::should_accept_text_flow_after_type(
                         &plan,
                         &history,
-                        &supervisor_decision.reason,
-                        &supervisor_decision.notes,
+                        &supervisor_reason,
+                        &supervisor_notes,
                     )
                 {
                     println!(
@@ -1553,8 +1591,8 @@ impl Planner {
                     && Self::should_accept_typing_after_new_item_shortcut(
                         &plan,
                         &history,
-                        &supervisor_decision.reason,
-                        &supervisor_decision.notes,
+                        &supervisor_reason,
+                        &supervisor_notes,
                     )
                 {
                     println!(
@@ -1567,10 +1605,7 @@ impl Planner {
                     && !Self::goal_has_multi_app(goal)
                     && !Self::goal_has_explicit_sequence(goal)
                     && allow_deterministic_fallback
-                    && Self::should_relax_review(
-                        &supervisor_decision.reason,
-                        &supervisor_decision.notes,
-                    )
+                    && Self::should_relax_review(&supervisor_reason, &supervisor_notes)
                 {
                     if let Some(fallback_plan) = Self::fallback_plan_from_goal(goal, &history) {
                         Self::record_fallback_action(
@@ -1593,8 +1628,8 @@ impl Planner {
                     if recent_rejections >= 4 {
                         let review_text = format!(
                             "{} {}",
-                            supervisor_decision.reason.to_lowercase(),
-                            supervisor_decision.notes.to_lowercase()
+                            supervisor_reason.to_lowercase(),
+                            supervisor_notes.to_lowercase()
                         );
                         let hard_blockers = [
                             "danger",
@@ -1674,8 +1709,8 @@ impl Planner {
                         .take(16)
                         .filter(|h| h.starts_with("PLAN_REJECTED:"))
                         .count();
-                    let reason_lc = supervisor_decision.reason.to_lowercase();
-                    let notes_lc = supervisor_decision.notes.to_lowercase();
+                    let reason_lc = supervisor_reason.to_lowercase();
+                    let notes_lc = supervisor_notes.to_lowercase();
                     let repeated_content_escalation = (reason_lc.contains("repeated")
                         || notes_lc.contains("repeated"))
                         && (reason_lc.contains("content")
@@ -1693,11 +1728,11 @@ impl Planner {
                 match supervisor_action.as_str() {
                     "accept" => { /* Proceed */ }
                     "review" => {
-                        history.push(format!("PLAN_REJECTED: {}", supervisor_decision.notes));
+                        history.push(format!("PLAN_REJECTED: {}", supervisor_notes));
                         continue;
                     }
                     "escalate" => {
-                        let msg = format!("Supervisor escalated: {}", supervisor_decision.reason);
+                        let msg = format!("Supervisor escalated: {}", supervisor_reason);
                         println!("      🚨 {}", msg);
                         return Err(anyhow::anyhow!(msg));
                     }
