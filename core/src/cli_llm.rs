@@ -5,6 +5,7 @@
 
 use anyhow::{anyhow, Result};
 use log::{debug, warn};
+use serde_json::Value;
 use std::process::Command; // Added missing imports
 
 // Removed unused imports: Write, Stdio, Duration, FromStr
@@ -136,6 +137,7 @@ impl CLILLMClient {
                 // We must use positional argument with --sandbox.
                 // ARG_MAX is ~1MB on macOS, usually sufficient for resized screenshots (100-400KB).
                 cmd.arg("--sandbox");
+                cmd.args(&["--output-format", "json"]);
                 cmd.arg(prompt);
                 false
             }
@@ -189,17 +191,40 @@ impl CLILLMClient {
         let raw_output = String::from_utf8_lossy(&output.stdout).to_string();
         debug!("Raw Output: {:.200}...", raw_output); // truncated log
 
+        let provider_output = match self.provider {
+            LLMProvider::Gemini => {
+                Self::extract_gemini_response(&raw_output).unwrap_or_else(|| raw_output.clone())
+            }
+            _ => raw_output.clone(),
+        };
+
         // Attempt to extract JSON using Regex (Robustness)
-        match Self::extract_json(&raw_output) {
+        match Self::extract_json(&provider_output) {
             Some(json) => Ok(json),
             None => {
-                warn!("Failed to extract JSON from output: {:.100}...", raw_output);
+                warn!(
+                    "Failed to extract JSON from output: {:.100}...",
+                    provider_output
+                );
                 Err(anyhow::anyhow!(
                     "No valid JSON found in CLI output: {}",
-                    raw_output
+                    provider_output
                 ))
             }
         }
+    }
+
+    fn extract_gemini_response(text: &str) -> Option<String> {
+        let wrapper = Self::extract_json(text)?;
+        let parsed = serde_json::from_str::<Value>(&wrapper).ok()?;
+        let response = parsed.get("response")?;
+        if let Some(s) = response.as_str() {
+            return Some(s.to_string());
+        }
+        if response.is_object() || response.is_array() {
+            return Some(response.to_string());
+        }
+        None
     }
 
     /// Extract the first valid JSON object or array from a string
