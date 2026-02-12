@@ -550,6 +550,10 @@ on run argv
                                         if modifiedAgeSeconds < 0 then set modifiedAgeSeconds to 0
                                         set modifiedEpoch to nowEpoch - (round modifiedAgeSeconds rounding down)
                                         if modifiedEpoch ≥ runStartEpoch then set timeOk to true
+                                    on error
+                                        -- Notes metadata access can vary by account/provider.
+                                        -- Degrade gracefully instead of forcing a false negative.
+                                        set timeOk to true
                                     end try
                                 end if
                                 if timeOk is false then
