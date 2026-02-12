@@ -52,6 +52,14 @@ pub enum FailoverReason {
 pub fn classify_error(message: &str) -> FailoverReason {
     let msg_lower = message.to_lowercase();
 
+    // Account usage cap (not a transient burst limit)
+    if msg_lower.contains("usage limit has been reached")
+        || msg_lower.contains("upgrade to pro")
+        || msg_lower.contains("purchase more credits")
+    {
+        return FailoverReason::Auth;
+    }
+
     // Rate limit detection (from clawdbot)
     if msg_lower.contains("rate limit")
         || msg_lower.contains("429")
@@ -119,6 +127,34 @@ pub fn calculate_delay(config: &RetryConfig, attempt: usize) -> Duration {
     Duration::from_millis(clamped)
 }
 
+/// Parse provider hint: "Please try again in 33.9s."
+fn parse_retry_after_hint_ms(message: &str) -> Option<u64> {
+    let lower = message.to_lowercase();
+    let needle = "try again in ";
+    let start = lower.find(needle)? + needle.len();
+    let tail = &lower[start..];
+
+    let mut token = String::new();
+    for ch in tail.chars() {
+        if ch.is_ascii_digit() || ch == '.' {
+            token.push(ch);
+            continue;
+        }
+        break;
+    }
+    if token.is_empty() {
+        return None;
+    }
+
+    let seconds = token.parse::<f64>().ok()?;
+    if !(seconds.is_finite() && seconds > 0.0) {
+        return None;
+    }
+
+    // 1s safety margin to avoid hitting the same window edge.
+    Some(((seconds + 1.0) * 1000.0).round() as u64)
+}
+
 // =====================================================
 // RETRY EXECUTOR
 // =====================================================
@@ -166,7 +202,18 @@ where
                 }
 
                 // Apply backoff
-                let delay = calculate_delay(config, attempt);
+                let mut delay = calculate_delay(config, attempt);
+                if reason == FailoverReason::RateLimit {
+                    if let Some(retry_after_ms) = parse_retry_after_hint_ms(&error_msg) {
+                        // Respect provider hint for transient TPM/RPM windows,
+                        // but bound to avoid waiting very long in retry loop.
+                        let bounded = retry_after_ms.min(120_000);
+                        let hinted = Duration::from_millis(bounded);
+                        if hinted > delay {
+                            delay = hinted;
+                        }
+                    }
+                }
                 println!("   ⏳ Waiting {}ms before retry...", delay.as_millis());
                 sleep(delay).await;
 
