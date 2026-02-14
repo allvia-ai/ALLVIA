@@ -105,7 +105,7 @@ def load_config(path: str | Path) -> Config:
     if not isinstance(raw, dict):
         raise ValueError("config root must be a mapping")
 
-    db_path = _resolve_db_path(raw.get("db_path", "collector.db"))
+    db_path = _resolve_db_path(raw.get("db_path", "steer.db"))
     migrations_path = _resolve_path(raw.get("migrations_path", "migrations"))
     privacy_rules_path = _resolve_path(
         raw.get("privacy_rules_path", "configs/privacy_rules.yaml")
@@ -215,9 +215,9 @@ def _resolve_path(value: str) -> Path:
 
 
 def _resolve_db_path(value: Any) -> Path:
-    raw_value = str(value).strip() if value is not None else "collector.db"
+    raw_value = str(value).strip() if value is not None else "steer.db"
     if not raw_value:
-        raw_value = "collector.db"
+        raw_value = "steer.db"
 
     def _env_bool(key: str, default: bool) -> bool:
         raw = os.environ.get(key)
@@ -228,7 +228,12 @@ def _resolve_db_path(value: Any) -> Path:
     # Explicit integration mode:
     # Use shared DB only when env override is explicitly provided.
     env_override = os.environ.get("STEER_COLLECTOR_DB_PATH") or os.environ.get("STEER_DB_PATH")
-    if env_override and raw_value in {"collector.db", "./collector.db"}:
+    if env_override and raw_value in {
+        "collector.db",
+        "./collector.db",
+        "steer.db",
+        "./steer.db",
+    }:
         return _resolve_path(env_override)
 
     # Explicit separation mode:
@@ -239,7 +244,12 @@ def _resolve_db_path(value: Any) -> Path:
     # Auto-link mode defaults to ON so collector follows core DB by default.
     # Set STEER_COLLECTOR_AUTO_LINK=0 to disable auto-linking.
     auto_link = _env_bool("STEER_COLLECTOR_AUTO_LINK", True)
-    if auto_link and raw_value in {"collector.db", "./collector.db"}:
+    if auto_link and raw_value in {
+        "collector.db",
+        "./collector.db",
+        "steer.db",
+        "./steer.db",
+    }:
         shared_path = _discover_shared_steer_db()
         if shared_path is not None:
             return shared_path

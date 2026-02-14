@@ -10,11 +10,14 @@ use crate::session_store::{Session, SessionStatus};
 use crate::visual_driver::{SmartStep, VisualDriver};
 use anyhow::Result;
 use chrono::Utc;
+use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use uuid::Uuid;
+
+static GUI_RUN_SERIAL_LOCK: Lazy<AsyncMutex<()>> = Lazy::new(|| AsyncMutex::new(()));
 
 pub struct Planner {
     pub llm: Arc<dyn LLMClient>,
@@ -297,12 +300,15 @@ impl Planner {
             let is_save_shortcut = matches!(step.action_type.as_str(), "shortcut" | "key" | "save")
                 && desc.contains("shortcut 's'")
                 && desc.contains("command");
+            let strict_textedit_save_proof =
+                Self::env_truthy_default("STEER_STRICT_TEXTEDIT_SAVE_PROOF", true);
             let has_textedit_save_proof = Self::step_data_has_proof(step, "textedit_save")
                 || desc.contains("textedit saved")
                 || desc.contains("saved file")
                 || desc.contains("file saved");
             if has_textedit_save_proof
-                || (is_save_shortcut
+                || (!strict_textedit_save_proof
+                    && is_save_shortcut
                     && (current_app.as_deref() == Some("textedit") || textedit_context_seen))
             {
                 evidence.textedit_save_confirmed = true;
@@ -331,11 +337,13 @@ impl Planner {
                         && Self::history_contains_case_insensitive(history, "typed '"));
         }
         if !evidence.textedit_save_confirmed {
-            evidence.textedit_save_confirmed =
-                (Self::history_contains_case_insensitive(history, "opened app: textedit")
-                    && Self::history_contains_shortcut(history, "s"))
-                    || Self::history_contains_case_insensitive(history, "textedit saved")
-                    || Self::history_contains_case_insensitive(history, "file saved");
+            let strict_textedit_save_proof =
+                Self::env_truthy_default("STEER_STRICT_TEXTEDIT_SAVE_PROOF", true);
+            evidence.textedit_save_confirmed = (!strict_textedit_save_proof
+                && Self::history_contains_case_insensitive(history, "opened app: textedit")
+                && Self::history_contains_shortcut(history, "s"))
+                || Self::history_contains_case_insensitive(history, "textedit saved")
+                || Self::history_contains_case_insensitive(history, "file saved");
         }
 
         evidence
@@ -555,7 +563,6 @@ impl Planner {
                         let lower = trimmed.to_lowercase();
                         if trimmed.len() < 2
                             || lower.starts_with("cmd+")
-                            || lower == "done"
                             || lower.starts_with("status:")
                         {
                             continue;
@@ -852,12 +859,38 @@ impl Planner {
 
     fn extract_mail_subject_from_goal(goal: &str) -> Option<String> {
         let lower = goal.to_lowercase();
-        for marker in ["제목", "subject", "title"] {
-            if let Some(idx) = lower.find(marker) {
-                let rest = &goal[idx + marker.len()..];
-                for frag in Self::extract_quoted_fragments(rest) {
-                    let f = frag.trim();
-                    if f.len() >= 2 {
+        let mut scopes: Vec<&str> = Vec::new();
+        let mail_idx = lower
+            .rfind("mail")
+            .or_else(|| lower.rfind("메일"))
+            .or_else(|| lower.rfind("이메일"));
+        if let Some(idx) = mail_idx {
+            scopes.push(&goal[idx..]);
+        }
+        scopes.push(goal);
+
+        let email_re = regex::Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}").ok();
+
+        for scope in scopes {
+            let scope_lower = scope.to_lowercase();
+            for marker in ["제목", "subject", "title"] {
+                if let Some(idx) = scope_lower.find(marker) {
+                    let rest = &scope[idx + marker.len()..];
+                    for frag in Self::extract_quoted_fragments(rest) {
+                        let f = frag.trim();
+                        let lf = f.to_lowercase();
+                        if f.len() < 2 {
+                            continue;
+                        }
+                        if lf.starts_with("cmd+") || lf.starts_with("status:") {
+                            continue;
+                        }
+                        if f.starts_with("RUN_SCOPE_") {
+                            continue;
+                        }
+                        if email_re.as_ref().map(|re| re.is_match(f)).unwrap_or(false) {
+                            continue;
+                        }
                         return Some(f.to_string());
                     }
                 }
@@ -866,12 +899,28 @@ impl Planner {
 
         if lower.contains("mail") || lower.contains("메일") {
             for frag in Self::extract_quoted_fragments(goal) {
+                if frag.contains("S1_")
+                    || frag.contains("S2_")
+                    || frag.contains("S3_")
+                    || frag.contains("S4_")
+                    || frag.contains("S5_")
+                {
+                    return Some(frag.trim().to_string());
+                }
+            }
+            for frag in Self::extract_quoted_fragments(goal) {
                 let f = frag.trim();
                 let lf = f.to_lowercase();
                 if f.len() < 2 {
                     continue;
                 }
-                if lf.contains("cmd+") || lf == "done" || lf.starts_with("status:") {
+                if lf.contains("cmd+") || lf.starts_with("status:") {
+                    continue;
+                }
+                if f.starts_with("RUN_SCOPE_") {
+                    continue;
+                }
+                if email_re.as_ref().map(|re| re.is_match(f)).unwrap_or(false) {
                     continue;
                 }
                 return Some(f.to_string());
@@ -1092,6 +1141,93 @@ impl Planner {
         }
     }
 
+    fn in_mail_context(history: &[String]) -> bool {
+        (match Self::last_opened_app(history) {
+            Some(app) => app.eq_ignore_ascii_case("Mail"),
+            None => false,
+        }) || Self::history_contains_case_insensitive(history, "Opened app: Mail")
+    }
+
+    fn history_has_mail_body(history: &[String]) -> bool {
+        Self::history_contains_case_insensitive(history, "(mail body)")
+            || Self::history_contains_case_insensitive(
+                history,
+                "pasted clipboard contents (mail body)",
+            )
+    }
+
+    fn history_has_mail_send_done(history: &[String]) -> bool {
+        Self::history_contains_case_insensitive(history, "mail send completed")
+            || Self::history_contains_case_insensitive(history, "(mail sent)")
+            || (Self::history_contains_case_insensitive(
+                history,
+                "mail send blocked: sent_pending|",
+            ) && Self::history_contains_case_insensitive(
+                history,
+                "mail send blocked: no_draft|0|0",
+            ))
+    }
+
+    fn maybe_rewrite_click_visual_mail_body(history: &[String], plan: &mut serde_json::Value) {
+        if plan["action"].as_str() != Some("click_visual") {
+            return;
+        }
+        if !Self::in_mail_context(history) {
+            return;
+        }
+
+        let desc = plan["description"].as_str().unwrap_or("");
+        let desc_lc = desc.to_lowercase();
+        let is_mail_body_target = desc_lc.contains("message body")
+            || desc_lc.contains("mail body")
+            || desc_lc.contains("compose body")
+            || desc_lc.contains("본문")
+            || desc_lc.contains("메시지");
+        if !is_mail_body_target {
+            return;
+        }
+
+        *plan = serde_json::json!({ "action": "paste", "app": "Mail" });
+        println!("   🔁 Rewrote Mail body click_visual to deterministic paste.");
+    }
+
+    fn maybe_rewrite_snapshot_to_progress_action(
+        goal: &str,
+        history: &[String],
+        plan: &mut serde_json::Value,
+    ) {
+        if plan["action"].as_str() != Some("snapshot") {
+            return;
+        }
+
+        if Self::in_mail_context(history) && Self::goal_requires_mail_send(goal) {
+            if Self::history_has_mail_send_done(history) {
+                *plan = serde_json::json!({ "action": "done" });
+                println!("   🔁 Rewrote snapshot to done (Mail send already confirmed).");
+                return;
+            }
+            if !Self::history_has_mail_body(history) {
+                *plan = serde_json::json!({ "action": "paste", "app": "Mail" });
+                println!("   🔁 Rewrote snapshot to paste (Mail body pending).");
+            } else {
+                *plan = serde_json::json!({ "action": "mail_send", "app": "Mail" });
+                println!("   🔁 Rewrote snapshot to mail_send (Mail send pending).");
+            }
+            return;
+        }
+
+        if let Some(fallback_plan) = Self::fallback_plan_from_goal(goal, history) {
+            let action = fallback_plan["action"].as_str().unwrap_or("").to_string();
+            if action != "snapshot" {
+                *plan = fallback_plan;
+                println!(
+                    "   🔁 Rewrote snapshot to fallback progress action: {}",
+                    action
+                );
+            }
+        }
+    }
+
     fn maybe_rewrite_open_app_to_pending_text_action(
         goal: &str,
         history: &[String],
@@ -1101,10 +1237,17 @@ impl Planner {
             return;
         }
 
+        let target_app = plan["name"].as_str().unwrap_or("").trim();
+
         let Some(current_app) = Self::last_opened_app_from_history(history) else {
             return;
         };
         if !Self::is_textual_app(&current_app) {
+            return;
+        }
+
+        // Keep explicit cross-app transitions intact.
+        if !target_app.is_empty() && !target_app.eq_ignore_ascii_case(&current_app) {
             return;
         }
 
@@ -1113,11 +1256,7 @@ impl Planner {
             .any(|frag| {
                 let trimmed = frag.trim();
                 let lower = trimmed.to_lowercase();
-                if trimmed.len() < 2
-                    || lower.starts_with("cmd+")
-                    || lower == "done"
-                    || lower.starts_with("status:")
-                {
+                if trimmed.len() < 2 || lower.starts_with("cmd+") || lower.starts_with("status:") {
                     return false;
                 }
                 !Self::history_contains_case_insensitive(history, trimmed)
@@ -1323,6 +1462,11 @@ impl Planner {
         goal: &str,
         session_key: Option<&str>,
     ) -> Result<RunGoalOutcome> {
+        let _serial_guard = if Self::env_truthy_default("STEER_SERIALIZE_GUI_RUNS", true) {
+            Some(GUI_RUN_SERIAL_LOCK.lock().await)
+        } else {
+            None
+        };
         let run_id = format!(
             "surf_{}_{}",
             Utc::now().format("%Y%m%d_%H%M%S"),
@@ -1698,19 +1842,23 @@ impl Planner {
             }
             plan = validation.normalized;
             Self::maybe_rewrite_click_visual_to_app_action(goal, &history, &mut plan);
+            Self::maybe_rewrite_click_visual_mail_body(&history, &mut plan);
             Self::maybe_rewrite_shortcut_to_next_app(goal, &history, &mut plan);
             Self::maybe_rewrite_mail_subject_before_paste(goal, &history, &mut plan);
             Self::maybe_rewrite_open_app_to_pending_text_action(goal, &history, &mut plan);
+            Self::maybe_rewrite_snapshot_to_progress_action(goal, &history, &mut plan);
 
-            if scenario_mode || deterministic_goal_mode {
+            if scenario_mode {
                 if let Some(fallback_plan) = Self::fallback_plan_from_goal(goal, &history) {
-                    let reason = if scenario_mode {
-                        "scenario_mode"
-                    } else {
-                        "deterministic_goal_mode"
-                    };
-                    Self::record_fallback_action(&mut history, reason, &fallback_plan);
+                    Self::record_fallback_action(&mut history, "scenario_mode", &fallback_plan);
                     plan = fallback_plan;
+                }
+            } else if deterministic_goal_mode {
+                if let Some(det_plan) = Self::fallback_plan_from_goal(goal, &history) {
+                    if let Some(action) = det_plan["action"].as_str() {
+                        history.push(format!("DETERMINISTIC_PLAN_ACTION: {}", action));
+                    }
+                    plan = det_plan;
                 }
             } else {
                 // 3. Supervisor Check (safe actions can bypass to reduce rate-limit stalls)
@@ -2203,7 +2351,12 @@ mod tests {
             "success",
             Some(serde_json::json!({"proof": "textedit_append_text"})),
         );
-        session.add_step("shortcut", "Shortcut 's' + [\"command\"]", "success", None);
+        session.add_step(
+            "shortcut",
+            "Shortcut 's' + [\"command\"]",
+            "success",
+            Some(serde_json::json!({"proof": "textedit_save"})),
+        );
         let history = vec![
             "Opened app: TextEdit".to_string(),
             "Typed 'status: in-progress' (textedit body)".to_string(),

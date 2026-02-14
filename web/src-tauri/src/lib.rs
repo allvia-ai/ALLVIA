@@ -4,6 +4,19 @@ use tauri::{
   Manager,
 };
 
+fn position_window_bottom_center(window: &tauri::WebviewWindow) {
+  if let (Ok(Some(monitor)), Ok(window_size)) = (window.current_monitor(), window.outer_size()) {
+    let monitor_size = monitor.size();
+    let x = ((monitor_size.width.saturating_sub(window_size.width)) / 2) as i32;
+    let y = monitor_size
+      .height
+      .saturating_sub(window_size.height)
+      .saturating_sub(36) as i32;
+
+    let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(x, y)));
+  }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
@@ -16,8 +29,8 @@ pub fn run() {
         )?;
       }
 
-      // [QC] Initialize Updater
-      app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
+      // Updater is disabled for local builds unless a proper updater config is provided.
+      // Initializing updater without config can crash at startup.
 
       // System Tray Setup
       let quit_i = MenuItem::with_id(app, "quit", "Quit Antigravity", true, None::<&str>)?;
@@ -34,6 +47,7 @@ pub fn run() {
                 }
                 "show" => {
                     if let Some(window) = app.get_webview_window("main") {
+                        position_window_bottom_center(&window);
                         let _ = window.show();
                         let _ = window.set_focus();
                     }
@@ -48,6 +62,7 @@ pub fn run() {
                       if window.is_visible().unwrap_or(false) {
                            let _ = window.hide();
                       } else {
+                           position_window_bottom_center(&window);
                            let _ = window.show();
                            let _ = window.set_focus();
                       }
@@ -55,6 +70,10 @@ pub fn run() {
              }
         })
         .build(app)?;
+
+      if let Some(window) = app.get_webview_window("main") {
+        position_window_bottom_center(&window);
+      }
 
       Ok(())
     })

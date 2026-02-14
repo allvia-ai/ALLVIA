@@ -22,6 +22,13 @@ struct MailSendResult {
 }
 
 impl ActionRunner {
+    fn bool_env_with_default(key: &str, default: bool) -> bool {
+        match std::env::var(key) {
+            Ok(v) => matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"),
+            Err(_) => default,
+        }
+    }
+
     fn is_test_mode_enabled() -> bool {
         match std::env::var("STEER_TEST_MODE") {
             Ok(v) => matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"),
@@ -269,27 +276,42 @@ impl ActionRunner {
             return None;
         }
 
-        let quoted = Self::extract_quoted_fragments(goal_text);
-        if quoted.is_empty() {
-            return None;
-        }
-
         let lower_goal = goal_text.to_lowercase();
-        for keyword in ["제목", "subject"] {
-            if let Some(idx) = lower_goal.find(keyword) {
-                let goal_tail = &goal_text[idx..];
-                for frag in &quoted {
-                    if goal_tail.contains(frag) {
-                        if Self::normalize_email_candidate(frag).is_some() {
+        let mut scopes: Vec<&str> = Vec::new();
+        let mail_idx = lower_goal
+            .rfind("mail")
+            .or_else(|| lower_goal.rfind("메일"))
+            .or_else(|| lower_goal.rfind("이메일"));
+        if let Some(idx) = mail_idx {
+            scopes.push(&goal_text[idx..]);
+        }
+        scopes.push(goal_text);
+
+        for scope in scopes {
+            let scope_lower = scope.to_lowercase();
+            for keyword in ["제목", "subject", "title"] {
+                if let Some(idx) = scope_lower.find(keyword) {
+                    let tail = &scope[idx..];
+                    for frag in Self::extract_quoted_fragments(tail) {
+                        if Self::normalize_email_candidate(&frag).is_some() {
                             continue;
                         }
                         if frag.starts_with("RUN_SCOPE_") {
                             continue;
                         }
-                        return Some(frag.clone());
+                        let lower_frag = frag.to_lowercase();
+                        if lower_frag.starts_with("cmd+") || lower_frag.starts_with("status:") {
+                            continue;
+                        }
+                        return Some(frag);
                     }
                 }
             }
+        }
+
+        let quoted = Self::extract_quoted_fragments(goal_text);
+        if quoted.is_empty() {
+            return None;
         }
 
         for frag in &quoted {
@@ -469,6 +491,8 @@ impl ActionRunner {
         let subject_hint = Self::preferred_mail_subject(goal).unwrap_or_default();
         let marker_hint = Self::preferred_run_scope_marker(goal).unwrap_or_default();
         let draft_hint = draft_id.unwrap_or_default().to_string();
+        let strict_draft_check = Self::bool_env_with_default("STEER_MAIL_STRICT_DRAFT_CHECK", true);
+        let strict_draft_check_arg = if strict_draft_check { "1" } else { "0" }.to_string();
         let lines = [
             "on sent_message_exists(targetSubject, targetRecipient, targetMarker)",
             "set matched to false",
@@ -600,10 +624,16 @@ impl ActionRunner {
             "set subjectHint to \"\"",
             "set markerHint to \"\"",
             "set draftHint to \"\"",
+            "set strictDraftCheck to true",
             "if (count of argv) >= 1 then set fallbackAddress to item 1 of argv",
             "if (count of argv) >= 2 then set subjectHint to item 2 of argv",
             "if (count of argv) >= 3 then set markerHint to item 3 of argv",
             "if (count of argv) >= 4 then set draftHint to item 4 of argv",
+            "if (count of argv) >= 5 then",
+            "set strictArg to item 5 of argv",
+            "if strictArg is \"0\" then set strictDraftCheck to false",
+            "end if",
+            "end if",
             "tell application \"Mail\" to activate",
             "tell application \"Mail\"",
             "set beforeOutgoing to (count of outgoing messages)",
@@ -674,6 +704,9 @@ impl ActionRunner {
             "set _bodyLen to (length of _bodyText)",
             "end try",
             "if markerHint is not \"\" and (_bodyText does not contain markerHint) then",
+            "if strictDraftCheck then",
+            "return \"missing_marker|\" & beforeOutgoing & \"|\" & beforeOutgoing & \"|\" & _recipient & \"|\" & _subject & \"|\" & _draftId & \"|\" & _bodyLen",
+            "end if",
             "set fallbackMsg to missing value",
             "repeat with idx from beforeOutgoing to 1 by -1",
             "set candidate to item idx of outgoing messages",
@@ -728,6 +761,9 @@ impl ActionRunner {
             "end try",
             "end if",
             "if markerHint is \"\" and subjectHint is not \"\" and _bodyLen <= 2 then",
+            "if strictDraftCheck then",
+            "return \"empty_body|\" & beforeOutgoing & \"|\" & beforeOutgoing & \"|\" & _recipient & \"|\" & _subject & \"|\" & _draftId & \"|\" & _bodyLen",
+            "end if",
             "set fallbackMsg to missing value",
             "repeat with idx from beforeOutgoing to 1 by -1",
             "set candidate to item idx of outgoing messages",
@@ -826,7 +862,13 @@ impl ActionRunner {
         ];
         let out = crate::applescript::run_with_args(
             &lines,
-            &[fallback, subject_hint, marker_hint, draft_hint],
+            &[
+                fallback,
+                subject_hint,
+                marker_hint,
+                draft_hint,
+                strict_draft_check_arg,
+            ],
         )?;
         Ok(out.trim().to_string())
     }
@@ -1136,7 +1178,10 @@ impl ActionRunner {
             "end if",
             "end repeat",
             "end if",
-            "if n is missing value then set n to first note of fd",
+            "if n is missing value then",
+            "if markerText is not \"\" then return \"__STEER_MARKER_NOT_FOUND__\"",
+            "set n to first note of fd",
+            "end if",
             "set nName to \"\"",
             "set nBody to \"\"",
             "try",
@@ -1150,16 +1195,33 @@ impl ActionRunner {
             "end tell",
             "end run",
         ];
-        crate::applescript::run_with_args(&lines, &[marker])
+        let out = crate::applescript::run_with_args(&lines, &[marker])?;
+        if out.trim() == "__STEER_MARKER_NOT_FOUND__" {
+            return Err(anyhow::anyhow!("notes marker not found"));
+        }
+        Ok(out)
     }
 
     fn textedit_append_text(text: &str, goal: Option<&str>) -> Result<()> {
         let marker = Self::preferred_run_scope_marker(goal).unwrap_or_default();
+        let isolate_unscoped = std::env::var("STEER_TEXTEDIT_ISOLATE_UNSCOPED")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(true);
         let lines = [
             "on run argv",
             "set bodyText to item 1 of argv",
             "set markerText to \"\"",
             "if (count of argv) > 1 then set markerText to item 2 of argv",
+            "set isolateUnscoped to true",
+            "if (count of argv) > 2 then",
+            "set isolateArg to item 3 of argv",
+            "set isolateUnscoped to (isolateArg is \"1\" or isolateArg is \"true\" or isolateArg is \"yes\" or isolateArg is \"on\")",
+            "end if",
             "tell application \"TextEdit\"",
             "activate",
             "if (count of documents) = 0 then make new document",
@@ -1179,13 +1241,10 @@ impl ActionRunner {
             "end repeat",
             "end if",
             "if targetDoc is missing value then",
-            "set targetDoc to front document",
-            "set existingFront to \"\"",
-            "try",
-            "set existingFront to text of targetDoc as text",
-            "end try",
-            "if markerText is not \"\" and existingFront is not \"\" and existingFront does not contain markerText then",
+            "if markerText is not \"\" or isolateUnscoped then",
             "make new document",
+            "set targetDoc to front document",
+            "else",
             "set targetDoc to front document",
             "end if",
             "end if",
@@ -1209,7 +1268,11 @@ impl ActionRunner {
             "return \"ok\"",
             "end run",
         ];
-        crate::applescript::run_with_args(&lines, &[text.to_string(), marker])?;
+        let isolate_arg = if isolate_unscoped { "1" } else { "0" };
+        crate::applescript::run_with_args(
+            &lines,
+            &[text.to_string(), marker, isolate_arg.to_string()],
+        )?;
         Ok(())
     }
 
@@ -1222,6 +1285,7 @@ impl ActionRunner {
             "tell application \"TextEdit\"",
             "if (count of documents) = 0 then return \"\"",
             "set targetDoc to front document",
+            "set markerFound to false",
             "if markerText is not \"\" then",
             "set docCount to count of documents",
             "repeat with idx from docCount to 1 by -1",
@@ -1232,10 +1296,12 @@ impl ActionRunner {
             "end try",
             "if candidateText contains markerText then",
             "set targetDoc to candidateDoc",
+            "set markerFound to true",
             "exit repeat",
             "end if",
             "end repeat",
             "end if",
+            "if markerText is not \"\" and markerFound is false then return \"__STEER_MARKER_NOT_FOUND__\"",
             "set outText to \"\"",
             "try",
             "set outText to text of targetDoc as text",
@@ -1244,7 +1310,11 @@ impl ActionRunner {
             "end tell",
             "end run",
         ];
-        crate::applescript::run_with_args(&lines, &[marker])
+        let out = crate::applescript::run_with_args(&lines, &[marker])?;
+        if out.trim() == "__STEER_MARKER_NOT_FOUND__" {
+            return Err(anyhow::anyhow!("textedit marker not found"));
+        }
+        Ok(out)
     }
 
     fn goal_mentions_downloads(goal: &str) -> bool {
@@ -1560,10 +1630,22 @@ impl ActionRunner {
                     description = "click_ref failed: missing ref".to_string();
                     action_status_override = Some("failed");
                 } else {
+                    if let Some(app_name) = plan
+                        .get("app")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| plan.get("name").and_then(|v| v.as_str()))
+                    {
+                        let _ = heuristics::ensure_app_focus(app_name, 1).await;
+                    }
                     let front_app = crate::tool_chaining::CrossAppBridge::get_frontmost_app()
                         .unwrap_or_default();
-                    if front_app.eq_ignore_ascii_case("Finder")
-                        && Self::goal_mentions_downloads(goal)
+                    let finder_download_target = ref_id
+                        .eq_ignore_ascii_case("LeftSidebarDownloads")
+                        || Self::goal_mentions_downloads(goal);
+                    if finder_download_target
+                        && (front_app.eq_ignore_ascii_case("Finder")
+                            || plan["app"].as_str() == Some("Finder")
+                            || plan["name"].as_str() == Some("Finder"))
                     {
                         match Self::finder_open_downloads() {
                             Ok(_) => {
@@ -1607,8 +1689,24 @@ impl ActionRunner {
                 let desc_lc = desc.to_lowercase();
                 let looks_like_downloads_target =
                     desc_lc.contains("download") || desc.contains("다운로드");
+                let looks_like_mail_body_target = desc_lc.contains("message body")
+                    || desc_lc.contains("mail body")
+                    || desc_lc.contains("compose body")
+                    || desc_lc.contains("본문")
+                    || desc_lc.contains("메시지");
 
-                if front_app.eq_ignore_ascii_case("Finder")
+                if front_app.eq_ignore_ascii_case("Mail") && looks_like_mail_body_target {
+                    // Mail body writes are handled by deterministic AppleScript append in paste/type.
+                    // Avoid Vision click hard-fails in compose area.
+                    description =
+                        "Skipped visual click (Mail body target); deterministic body append path will be used"
+                            .to_string();
+                    action_status_override = Some("success");
+                    action_data = Some(json!({
+                        "proof": "mail_body_focus_skipped",
+                        "target": desc
+                    }));
+                } else if front_app.eq_ignore_ascii_case("Finder")
                     && Self::goal_mentions_downloads(goal)
                     && looks_like_downloads_target
                 {
@@ -1665,8 +1763,7 @@ impl ActionRunner {
                 let mut read_text = String::new();
 
                 if let Some(app_name) = plan.get("app").and_then(|v| v.as_str()) {
-                    let _ = crate::tool_chaining::CrossAppBridge::switch_to_app(app_name);
-                    let _ = heuristics::ensure_app_focus(app_name, 3).await;
+                    let _ = heuristics::ensure_app_focus(app_name, 1).await;
                 }
 
                 if let Some(brain) = llm {
@@ -1721,13 +1818,12 @@ impl ActionRunner {
                 let mut text = plan["text"].as_str().unwrap_or("").to_string();
                 let mut forced_app = false;
                 if let Some(app_name) = plan.get("app").and_then(|v| v.as_str()) {
-                    let _ = crate::tool_chaining::CrossAppBridge::switch_to_app(app_name);
-                    let _ = heuristics::ensure_app_focus(app_name, 3).await;
+                    let _ = heuristics::ensure_app_focus(app_name, 1).await;
                     forced_app = true;
                 } else if let Some(target_app) =
                     Self::preferred_target_app_from_history("type", plan, history)
                 {
-                    let _ = heuristics::ensure_app_focus(&target_app, 5).await;
+                    let _ = heuristics::ensure_app_focus(&target_app, 2).await;
                 }
 
                 let looks_like_calc = Self::looks_like_calc_expression(&text);
@@ -2191,7 +2287,11 @@ impl ActionRunner {
                         let mut send_result = Self::parse_mail_send_result(&raw_result);
                         let mut result_raw = raw_result.clone();
                         let mut fresh_recovery_used = false;
-                        if Self::is_test_mode_enabled()
+                        let allow_fresh_recovery =
+                            Self::bool_env_with_default("STEER_MAIL_ALLOW_FRESH_RECOVERY", false)
+                                && (Self::is_test_mode_enabled()
+                                    || Self::preferred_run_scope_marker(Some(goal)).is_some());
+                        if allow_fresh_recovery
                             && send_result.status != "sent_confirmed"
                             && !Self::mail_fresh_recovery_used(history)
                             && matches!(
@@ -2249,8 +2349,7 @@ impl ActionRunner {
                     .and_then(|v| v.as_str())
                     .or_else(|| plan.get("name").and_then(|v| v.as_str()))
                 {
-                    let _ = crate::tool_chaining::CrossAppBridge::switch_to_app(app_name);
-                    let _ = heuristics::ensure_app_focus(app_name, 3).await;
+                    let _ = heuristics::ensure_app_focus(app_name, 1).await;
                 }
                 let front_app =
                     crate::tool_chaining::CrossAppBridge::get_frontmost_app().unwrap_or_default();

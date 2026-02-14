@@ -1,4 +1,4 @@
-db_path: collector.db
+db_path: steer.db
 migrations_path: migrations
 validation_level: lenient
 wal_mode: true

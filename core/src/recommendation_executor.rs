@@ -192,6 +192,15 @@ pub async fn execute_approved_recommendation(
         }
     }
 
+    let provision_op_id = db::create_workflow_provision_op(
+        id,
+        if force_recreate {
+            None
+        } else {
+            Some(claim_token.as_str())
+        },
+    )?;
+
     let workflow_json_str_result: Result<String> = (|| async {
         if should_use_test_mock_workflow() {
             return serde_json::to_string(&mock_workflow_json(&rec.title))
@@ -220,6 +229,10 @@ pub async fn execute_approved_recommendation(
     let workflow_json_str = match workflow_json_str_result {
         Ok(v) => v,
         Err(e) => {
+            let _ = db::mark_workflow_provision_failed(
+                provision_op_id,
+                &format!("workflow json generation failed: {}", e),
+            );
             if !force_recreate {
                 let _ = db::release_recommendation_provisioning_claim(id, &claim_token);
             }
@@ -238,6 +251,10 @@ pub async fn execute_approved_recommendation(
     let workflow_val = match workflow_val_result {
         Ok(v) => v,
         Err(e) => {
+            let _ = db::mark_workflow_provision_failed(
+                provision_op_id,
+                &format!("workflow json parse failed: {}", e),
+            );
             if !force_recreate {
                 let _ = db::release_recommendation_provisioning_claim(id, &claim_token);
             }
@@ -248,6 +265,10 @@ pub async fn execute_approved_recommendation(
     let n8n = match n8n_api::N8nApi::from_env() {
         Ok(v) => v,
         Err(e) => {
+            let _ = db::mark_workflow_provision_failed(
+                provision_op_id,
+                &format!("n8n initialization failed: {}", e),
+            );
             if !force_recreate {
                 let _ = db::release_recommendation_provisioning_claim(id, &claim_token);
             }
@@ -258,10 +279,48 @@ pub async fn execute_approved_recommendation(
 
     match n8n.create_workflow(&rec.title, &workflow_val, active).await {
         Ok(workflow_id) => {
-            db::mark_recommendation_approved(id, &workflow_id, &workflow_json_str)?;
+            if let Err(e) = db::mark_workflow_provision_created(
+                provision_op_id,
+                &workflow_id,
+                Some(&workflow_json_str),
+            ) {
+                let _ = db::mark_workflow_provision_reconcile_needed(
+                    provision_op_id,
+                    &format!("workflow created but op log update failed: {}", e),
+                );
+                return Err(anyhow!(
+                    "workflow created (id={}) but failed to persist operation log: {}",
+                    workflow_id,
+                    e
+                ));
+            }
+            if let Err(e) = db::commit_workflow_provision_success(
+                provision_op_id,
+                id,
+                &workflow_id,
+                Some(&workflow_json_str),
+            ) {
+                let _ = db::mark_workflow_provision_reconcile_needed(
+                    provision_op_id,
+                    &format!("workflow created but recommendation commit failed: {}", e),
+                );
+                let _ = db::mark_recommendation_failed(
+                    id,
+                    &format!("workflow created but commit failed: {}", e),
+                );
+                return Err(anyhow!(
+                    "workflow created (id={}) but local commit failed: {}",
+                    workflow_id,
+                    e
+                ));
+            }
             Ok(workflow_id)
         }
         Err(e) => {
+            let _ = db::mark_workflow_provision_failed(
+                provision_op_id,
+                &format!("workflow creation failed: {}", e),
+            );
             if !force_recreate {
                 let _ = db::release_recommendation_provisioning_claim(id, &claim_token);
             }
@@ -315,6 +374,7 @@ pub async fn approve_and_execute_recommendation(
 mod tests {
     use super::*;
     use crate::recommendation::AutomationProposal;
+    use serial_test::serial;
 
     fn insert_test_recommendation(title: &str) -> Option<i64> {
         let _ = db::init();
@@ -336,6 +396,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_assume_approved_requires_flag() {
         std::env::remove_var("STEER_TEST_ASSUME_APPROVED");
         let result = maybe_assume_approved_for_test(1);
@@ -343,6 +404,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_assume_approved_requires_mock_flag() {
         std::env::set_var("STEER_TEST_ASSUME_APPROVED", "1");
         std::env::remove_var("STEER_N8N_MOCK");
@@ -351,6 +413,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_execute_requires_approved_status() {
         let title = format!(
             "rec-exec-requires-{}",
@@ -366,6 +429,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_approve_assumed_pipeline_with_mock() {
         let title = format!(
             "rec-approve-assumed-{}",
@@ -380,7 +444,7 @@ mod tests {
         assert!(maybe_assume_approved_for_test(id).is_ok());
         let workflow_id = execute_approved_recommendation(id, None)
             .await
-            .unwrap_or_default();
+            .expect("approve-assumed mock path should return workflow_id");
         assert!(!workflow_id.trim().is_empty());
 
         let rec = db::get_recommendation(id).ok().flatten();
@@ -391,6 +455,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_execute_is_idempotent_for_existing_workflow() {
         let title = format!("rec-idempotent-{}", chrono::Utc::now().timestamp_millis());
         let Some(id) = insert_test_recommendation(&title) else {
@@ -403,16 +468,17 @@ mod tests {
         assert!(maybe_assume_approved_for_test(id).is_ok());
         let first = execute_approved_recommendation(id, None)
             .await
-            .unwrap_or_default();
+            .expect("first execution should provision workflow");
         assert!(!first.is_empty());
 
         let second = execute_approved_recommendation(id, None)
             .await
-            .unwrap_or_default();
+            .expect("second execution should reuse existing workflow");
         assert_eq!(first, second);
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_stale_provisioning_claim_is_recovered() {
         let title = format!("rec-stale-claim-{}", chrono::Utc::now().timestamp_millis());
         let Some(id) = insert_test_recommendation(&title) else {
@@ -428,12 +494,13 @@ mod tests {
         let _ = db::claim_recommendation_provisioning(id, &stale_token);
         let workflow_id = execute_approved_recommendation(id, None)
             .await
-            .unwrap_or_default();
+            .expect("stale provisioning claim should be recovered");
         assert!(!workflow_id.trim().is_empty());
         assert!(!workflow_id.starts_with("provisioning:"));
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_approve_and_execute_reports_status() {
         let title = format!("rec-approve-exec-{}", chrono::Utc::now().timestamp_millis());
         let Some(id) = insert_test_recommendation(&title) else {
@@ -445,21 +512,13 @@ mod tests {
 
         let first = approve_and_execute_recommendation(id, None)
             .await
-            .unwrap_or_else(|_| ApprovalExecutionOutcome {
-                workflow_id: String::new(),
-                approved_now: false,
-                reused_existing: false,
-            });
+            .expect("first approve-and-execute should provision workflow");
         assert!(!first.workflow_id.trim().is_empty());
         assert!(first.approved_now);
 
         let second = approve_and_execute_recommendation(id, None)
             .await
-            .unwrap_or_else(|_| ApprovalExecutionOutcome {
-                workflow_id: String::new(),
-                approved_now: true,
-                reused_existing: false,
-            });
+            .expect("second approve-and-execute should reuse workflow");
         assert_eq!(first.workflow_id, second.workflow_id);
         assert!(!second.approved_now);
         assert!(second.reused_existing);

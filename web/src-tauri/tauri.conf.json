@@ -13,14 +13,15 @@
     "windows": [
       {
         "title": "Antigravity",
-        "width": 800,
-        "height": 600,
+        "width": 1220,
+        "height": 200,
         "resizable": false,
         "fullscreen": false,
         "decorations": false,
         "transparent": true,
+        "backgroundColor": "#101420",
         "alwaysOnTop": true,
-        "center": true,
+        "center": false,
         "hiddenTitle": true
       }
     ],

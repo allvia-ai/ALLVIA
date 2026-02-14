@@ -42,10 +42,8 @@ function App() {
   })()
 
   useEffect(() => {
-    // Check if this is the 'widget' window
-    if (isWidget) {
-      document.body.style.backgroundColor = 'transparent'; // Ensure transparency
-    }
+    document.documentElement.style.backgroundColor = 'transparent'
+    document.body.style.backgroundColor = 'transparent'
   }, [isWidget]);
 
   return (
@@ -53,7 +51,7 @@ function App() {
       {isWidget ? (
         <WidgetLayer />
       ) : (
-        <div className="h-screen w-screen bg-transparent overflow-hidden relative flex items-center justify-center">
+        <div className="h-screen w-screen overflow-hidden relative flex items-end justify-center bg-gradient-to-r from-[#0a0e16]/95 via-[#121826]/94 to-[#161022]/95">
           <Launcher />
         </div>
       )}

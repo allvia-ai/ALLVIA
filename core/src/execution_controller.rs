@@ -3,7 +3,36 @@ use crate::nl_automation::{ApprovalContext, ExecutionResult, Plan, StepType};
 
 use crate::browser_automation;
 use crate::visual_driver::{SmartStep, UiAction, VisualDriver};
-use serde_json::Value;
+use serde_json::{json, Value};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn build_resume_token(plan: &Plan, resume_from: Option<usize>, reason: &str) -> Option<String> {
+    let next_step = resume_from?;
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Some(format!(
+        "resume:{}:{}:{}:{}",
+        plan.plan_id, next_step, reason, ts
+    ))
+}
+
+fn push_run_attempt(logs: &mut Vec<String>, phase: &str, status: &str, details: &str) {
+    let ts = chrono::Utc::now().to_rfc3339();
+    logs.push(format!(
+        "RUN_ATTEMPT|phase={}|status={}|details={}|ts={}",
+        phase, status, details, ts
+    ));
+    let payload = json!({
+        "type": "run.attempt",
+        "phase": phase,
+        "status": status,
+        "details": details,
+        "ts": ts
+    });
+    logs.push(format!("RUN_ATTEMPT_JSON|{}", payload));
+}
 
 pub async fn execute_plan(plan: &Plan, start_index: usize) -> ExecutionResult {
     let mut logs = Vec::new();
@@ -20,6 +49,12 @@ pub async fn execute_plan(plan: &Plan, start_index: usize) -> ExecutionResult {
         plan.intent.as_str()
     ));
     logs.push(summary_for_plan(plan));
+    push_run_attempt(
+        &mut logs,
+        "execution_start",
+        "running",
+        &format!("plan_id={},start_index={}", plan.plan_id, start_index),
+    );
 
     for (idx, step) in plan.steps.iter().enumerate().skip(start_index) {
         logs.push(format!(
@@ -41,6 +76,7 @@ pub async fn execute_plan(plan: &Plan, start_index: usize) -> ExecutionResult {
                             approval: approval_context,
                             manual_steps,
                             resume_from,
+                            resume_token: None,
                         };
                     }
                 } else {
@@ -247,12 +283,22 @@ pub async fn execute_plan(plan: &Plan, start_index: usize) -> ExecutionResult {
                     .and_then(|v| v.as_str())
                     .unwrap_or("approve");
                 let decision = approval_gate::evaluate_approval(action, plan);
+                let approval_id = format!("appr:{}:{}:{}", plan.plan_id, step.step_id, idx + 1);
                 logs.push(format!(
                     "Approval check: {} (risk {}, policy {})",
                     decision.status, decision.risk_level, decision.policy
                 ));
+                logs.push(format!(
+                    "APPROVAL_CHECKPOINT|approval_id={}|step_id={}|status={}|risk={}|policy={}",
+                    approval_id,
+                    step.step_id,
+                    decision.status,
+                    decision.risk_level,
+                    decision.policy
+                ));
                 if decision.requires_approval || decision.status == "denied" {
                     approval_context = Some(ApprovalContext {
+                        approval_id: Some(approval_id.clone()),
                         action: action.to_string(),
                         message: decision.message.clone(),
                         risk_level: decision.risk_level.clone(),
@@ -289,41 +335,82 @@ pub async fn execute_plan(plan: &Plan, start_index: usize) -> ExecutionResult {
 
     if blocked {
         logs.push("Execution stopped due to approval policy".to_string());
+        push_run_attempt(&mut logs, "execution_end", "blocked", "policy_blocked");
+        let resume_token = build_resume_token(plan, resume_from, "blocked");
+        if let Some(token) = resume_token.as_ref() {
+            logs.push(format!("RESUME_TOKEN|status=blocked|token={}", token));
+        }
         return ExecutionResult {
             status: "blocked".to_string(),
             logs,
             approval: approval_context,
             manual_steps,
             resume_from,
+            resume_token,
         };
     }
     if approval_required {
         logs.push("Execution paused awaiting approval".to_string());
+        push_run_attempt(
+            &mut logs,
+            "execution_end",
+            "approval_required",
+            "awaiting_approval",
+        );
+        let resume_token = build_resume_token(plan, resume_from, "approval_required");
+        if let Some(token) = resume_token.as_ref() {
+            logs.push(format!(
+                "RESUME_TOKEN|status=approval_required|token={}",
+                token
+            ));
+        }
         return ExecutionResult {
             status: "approval_required".to_string(),
             logs,
             approval: approval_context,
             manual_steps,
             resume_from,
+            resume_token,
         };
     }
     if manual_required {
         logs.push("Execution paused for manual input".to_string());
+        push_run_attempt(
+            &mut logs,
+            "execution_end",
+            "manual_required",
+            "awaiting_manual_input",
+        );
+        let resume_token = build_resume_token(plan, resume_from, "manual_required");
+        if let Some(token) = resume_token.as_ref() {
+            logs.push(format!(
+                "RESUME_TOKEN|status=manual_required|token={}",
+                token
+            ));
+        }
         return ExecutionResult {
             status: "manual_required".to_string(),
             logs,
             approval: approval_context,
             manual_steps,
             resume_from,
+            resume_token,
         };
     }
 
+    push_run_attempt(
+        &mut logs,
+        "execution_end",
+        "completed",
+        "all_steps_completed",
+    );
     ExecutionResult {
         status: "completed".to_string(),
         logs,
         approval: approval_context,
         manual_steps,
         resume_from,
+        resume_token: None,
     }
 }
 

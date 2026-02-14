@@ -757,21 +757,12 @@ fn run_startup_workflow_generation(
 }
 
 fn resolve_db_path() -> PathBuf {
-    if let Ok(override_path) = std::env::var("STEER_DB_PATH") {
-        let trimmed = override_path.trim();
-        if trimmed.is_empty() {
-            PathBuf::from("steer.db")
-        } else {
-            PathBuf::from(trimmed)
-        }
-    } else if let Some(mut path) = dirs::data_local_dir() {
-        path.push("steer");
-        let _ = fs::create_dir_all(&path);
-        path.push("steer.db");
-        path
-    } else {
-        PathBuf::from("steer.db")
-    }
+    let config_override = std::env::var("STEER_COLLECTOR_CONFIG")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    local_os_agent::collector_pipeline::resolve_db_path(config_override.as_deref())
 }
 
 fn floor_to_five_minute_bucket(ts: DateTime<Utc>) -> DateTime<Utc> {

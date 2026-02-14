@@ -15,6 +15,7 @@ const KEY_P1_TYPES: &[&str] = &[
     "excel.refresh_pivot",
 ];
 
+const DEFAULT_COLLECTOR_DB_FILE: &str = "collector.db";
 const DEFAULT_WINDOW_HINT_LIMIT: usize = 64;
 const DEFAULT_MAX_RESOURCES: usize = 20;
 
@@ -79,6 +80,27 @@ pub struct HandoffPayload {
 }
 
 #[derive(Debug, Clone)]
+pub struct PendingHandoffRow {
+    pub id: i64,
+    pub package_id: String,
+    pub created_at: String,
+    pub status: String,
+    pub attempt_count: i64,
+    pub next_retry_at: Option<String>,
+    pub lease_until: Option<String>,
+    pub claimed_by: Option<String>,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct HandoffFailureUpdate {
+    pub attempt_count: i64,
+    pub max_attempts: i64,
+    pub next_retry_at: Option<String>,
+    pub terminal: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct HandoffPrivacyRules {
     pub denylist_apps: HashSet<String>,
     pub redaction_patterns: Vec<Regex>,
@@ -96,25 +118,32 @@ impl Default for HandoffPrivacyRules {
 }
 
 pub fn resolve_db_path(config_path: Option<&Path>) -> PathBuf {
-    if let Ok(value) = std::env::var("STEER_DB_PATH") {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
+    if let Some(path) = env_path("STEER_COLLECTOR_DB_PATH") {
+        return path;
     }
 
     if let Some(path) = config_db_path(config_path) {
         return path;
     }
 
-    if let Some(mut path) = dirs::data_local_dir() {
-        path.push("steer");
-        let _ = fs::create_dir_all(&path);
-        path.push("steer.db");
+    if let Some(path) = env_path("STEER_DB_PATH") {
         return path;
     }
 
-    PathBuf::from("steer.db")
+    if !collector_separate_db_enabled() && collector_auto_link_enabled() {
+        if let Some(path) = discover_shared_steer_db() {
+            return path;
+        }
+    }
+
+    if let Some(mut path) = dirs::data_local_dir() {
+        path.push("steer");
+        let _ = fs::create_dir_all(&path);
+        path.push(DEFAULT_COLLECTOR_DB_FILE);
+        return path;
+    }
+
+    PathBuf::from(DEFAULT_COLLECTOR_DB_FILE)
 }
 
 pub fn resolve_privacy_rules_path(config_path: Option<&Path>) -> PathBuf {
@@ -236,6 +265,26 @@ pub fn ensure_pipeline_tables(conn: &Connection) -> Result<()> {
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_collector_handoff_created
          ON collector_handoff_queue(created_at)",
+        [],
+    )?;
+    ensure_column_exists(
+        conn,
+        "collector_handoff_queue",
+        "attempt_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column_exists(conn, "collector_handoff_queue", "last_attempt_at", "TEXT")?;
+    ensure_column_exists(conn, "collector_handoff_queue", "next_retry_at", "TEXT")?;
+    ensure_column_exists(conn, "collector_handoff_queue", "lease_until", "TEXT")?;
+    ensure_column_exists(conn, "collector_handoff_queue", "claimed_by", "TEXT")?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_collector_handoff_next_retry
+         ON collector_handoff_queue(next_retry_at)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_collector_handoff_lease
+         ON collector_handoff_queue(lease_until)",
         [],
     )?;
 
@@ -717,16 +766,256 @@ pub fn build_handoff_with_size_guard(
     })
 }
 
-pub fn fetch_latest_pending_handoff_payload(conn: &Connection) -> Result<Option<Value>> {
+pub fn fetch_latest_pending_handoff(conn: &Connection) -> Result<Option<PendingHandoffRow>> {
     let row = conn
         .query_row(
-            "SELECT payload_json FROM collector_handoff_queue WHERE status = 'pending' ORDER BY created_at DESC LIMIT 1",
+            "SELECT id, package_id, created_at, status,
+                    COALESCE(attempt_count, 0), next_retry_at, lease_until, claimed_by, payload_json
+             FROM collector_handoff_queue
+             WHERE status = 'pending'
+             ORDER BY created_at DESC
+             LIMIT 1",
             [],
-            |row| row.get::<_, String>(0),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            },
         )
         .optional()?;
 
-    Ok(row.and_then(|text| serde_json::from_str(&text).ok()))
+    let Some((
+        id,
+        package_id,
+        created_at,
+        status,
+        attempt_count,
+        next_retry_at,
+        lease_until,
+        claimed_by,
+        payload_json,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let payload = serde_json::from_str(&payload_json).unwrap_or_else(|_| json!({}));
+    Ok(Some(PendingHandoffRow {
+        id,
+        package_id,
+        created_at,
+        status,
+        attempt_count,
+        next_retry_at,
+        lease_until,
+        claimed_by,
+        payload,
+    }))
+}
+
+pub fn claim_retryable_handoff(
+    conn: &mut Connection,
+    max_attempts: i64,
+    consumer_id: &str,
+    lease_secs: i64,
+) -> Result<Option<PendingHandoffRow>> {
+    let capped_attempts = max_attempts.max(1);
+    let lease_secs = lease_secs.max(10);
+    let tx = conn.transaction()?;
+    let mut stmt = tx.prepare(
+        "SELECT id, package_id, created_at, status,
+                COALESCE(attempt_count, 0), next_retry_at, lease_until, claimed_by, payload_json
+         FROM collector_handoff_queue
+         WHERE status IN ('pending', 'failed', 'processing')
+           AND COALESCE(attempt_count, 0) < ?1
+         ORDER BY created_at DESC
+         LIMIT 100",
+    )?;
+
+    let rows = stmt.query_map([capped_attempts], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, String>(8)?,
+        ))
+    })?;
+
+    let now = Utc::now();
+    let now_iso = format_utc_ts(now);
+    let new_lease_until = format_utc_ts(now + Duration::seconds(lease_secs));
+    let mut claimed: Option<PendingHandoffRow> = None;
+
+    for row in rows {
+        let (
+            id,
+            package_id,
+            created_at,
+            status,
+            attempt_count,
+            next_retry_at,
+            lease_until,
+            _claimed_by,
+            payload_json,
+        ) = row?;
+        let status_norm = status.trim().to_lowercase();
+        let due = if status_norm == "pending" {
+            true
+        } else if status_norm == "failed" {
+            match next_retry_at.as_deref() {
+                Some(ts) => parse_iso_ts(ts).map(|at| at <= now).unwrap_or(true),
+                None => true,
+            }
+        } else if status_norm == "processing" {
+            match lease_until.as_deref() {
+                Some(ts) => parse_iso_ts(ts).map(|at| at <= now).unwrap_or(true),
+                None => true,
+            }
+        } else {
+            false
+        };
+        if !due {
+            continue;
+        }
+
+        let updated = tx.execute(
+            "UPDATE collector_handoff_queue
+             SET status = 'processing',
+                 claimed_by = ?1,
+                 lease_until = ?2,
+                 last_attempt_at = ?3
+             WHERE id = ?4
+               AND COALESCE(attempt_count, 0) < ?5
+               AND (
+                    status = 'pending'
+                    OR (status = 'failed' AND (next_retry_at IS NULL OR next_retry_at <= ?6))
+                    OR (status = 'processing' AND (lease_until IS NULL OR lease_until <= ?6))
+               )",
+            params![
+                consumer_id,
+                new_lease_until,
+                now_iso,
+                id,
+                capped_attempts,
+                now_iso
+            ],
+        )?;
+        if updated == 0 {
+            continue;
+        }
+
+        let payload = serde_json::from_str(&payload_json).unwrap_or_else(|_| json!({}));
+        claimed = Some(PendingHandoffRow {
+            id,
+            package_id,
+            created_at,
+            status: "processing".to_string(),
+            attempt_count,
+            next_retry_at,
+            lease_until: Some(new_lease_until.clone()),
+            claimed_by: Some(consumer_id.to_string()),
+            payload,
+        });
+        break;
+    }
+
+    drop(stmt);
+    tx.commit()?;
+    Ok(claimed)
+}
+
+pub fn fetch_latest_retryable_handoff(
+    conn: &Connection,
+    max_attempts: i64,
+) -> Result<Option<PendingHandoffRow>> {
+    let capped_attempts = max_attempts.max(1);
+    let mut stmt = conn.prepare(
+        "SELECT id, package_id, created_at, status,
+                COALESCE(attempt_count, 0), next_retry_at, lease_until, claimed_by, payload_json
+         FROM collector_handoff_queue
+         WHERE status IN ('pending', 'failed', 'processing')
+           AND COALESCE(attempt_count, 0) < ?1
+         ORDER BY created_at DESC
+         LIMIT 50",
+    )?;
+
+    let rows = stmt.query_map([capped_attempts], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, String>(8)?,
+        ))
+    })?;
+
+    let now = Utc::now();
+    for row in rows {
+        let (
+            id,
+            package_id,
+            created_at,
+            status,
+            attempt_count,
+            next_retry_at,
+            lease_until,
+            claimed_by,
+            payload_json,
+        ) = row?;
+        let status_norm = status.trim().to_lowercase();
+        let due = if status_norm == "pending" {
+            true
+        } else if status_norm == "failed" {
+            match next_retry_at.as_deref() {
+                Some(ts) => parse_iso_ts(ts).map(|at| at <= now).unwrap_or(true),
+                None => true,
+            }
+        } else if status_norm == "processing" {
+            match lease_until.as_deref() {
+                Some(ts) => parse_iso_ts(ts).map(|at| at <= now).unwrap_or(true),
+                None => true,
+            }
+        } else {
+            false
+        };
+        if !due {
+            continue;
+        }
+        let payload = serde_json::from_str(&payload_json).unwrap_or_else(|_| json!({}));
+        return Ok(Some(PendingHandoffRow {
+            id,
+            package_id,
+            created_at,
+            status,
+            attempt_count,
+            next_retry_at,
+            lease_until,
+            claimed_by,
+            payload,
+        }));
+    }
+
+    Ok(None)
+}
+
+pub fn fetch_latest_pending_handoff_payload(conn: &Connection) -> Result<Option<Value>> {
+    Ok(fetch_latest_pending_handoff(conn)?.map(|row| row.payload))
 }
 
 pub fn clear_pending_handoff(conn: &Connection) -> Result<()> {
@@ -735,6 +1024,96 @@ pub fn clear_pending_handoff(conn: &Connection) -> Result<()> {
         [],
     )?;
     Ok(())
+}
+
+pub fn update_handoff_status(
+    conn: &Connection,
+    id: i64,
+    status: &str,
+    error: Option<&str>,
+) -> Result<()> {
+    let now = format_utc_ts(Utc::now());
+    conn.execute(
+        "UPDATE collector_handoff_queue
+         SET status = ?1,
+             error = ?2,
+             last_attempt_at = ?4,
+             next_retry_at = CASE WHEN ?1 = 'pending' THEN next_retry_at ELSE NULL END,
+             lease_until = CASE WHEN ?1 = 'processing' THEN lease_until ELSE NULL END,
+             claimed_by = CASE WHEN ?1 = 'processing' THEN claimed_by ELSE NULL END,
+             expires_at = CASE WHEN ?1 = 'pending' THEN expires_at ELSE ?4 END
+         WHERE id = ?3",
+        params![status, error, id, now],
+    )?;
+    Ok(())
+}
+
+pub fn mark_handoff_consumed(conn: &Connection, id: i64) -> Result<()> {
+    let now = format_utc_ts(Utc::now());
+    conn.execute(
+        "UPDATE collector_handoff_queue
+         SET status = 'consumed',
+             error = NULL,
+             last_attempt_at = ?1,
+             next_retry_at = NULL,
+             lease_until = NULL,
+             claimed_by = NULL,
+             expires_at = ?1
+         WHERE id = ?2",
+        params![now, id],
+    )?;
+    Ok(())
+}
+
+pub fn mark_handoff_failed_with_backoff(
+    conn: &Connection,
+    id: i64,
+    error: &str,
+    max_attempts: i64,
+    backoff_base_secs: u64,
+) -> Result<HandoffFailureUpdate> {
+    let max_attempts = max_attempts.max(1);
+    let current_attempt = conn
+        .query_row(
+            "SELECT COALESCE(attempt_count, 0) FROM collector_handoff_queue WHERE id = ?1",
+            [id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let attempt_count = current_attempt.saturating_add(1);
+    let terminal = attempt_count >= max_attempts;
+    let now = Utc::now();
+    let now_iso = format_utc_ts(now);
+    let next_retry_at = if terminal {
+        None
+    } else {
+        let base = backoff_base_secs.max(1);
+        let shift = (attempt_count.saturating_sub(1) as u32).min(8);
+        let delay = base.saturating_mul(1u64 << shift).min(7_200);
+        Some(format_utc_ts(now + Duration::seconds(delay as i64)))
+    };
+
+    conn.execute(
+        "UPDATE collector_handoff_queue
+         SET status = 'failed',
+             error = ?1,
+             attempt_count = ?2,
+             last_attempt_at = ?3,
+             next_retry_at = ?4,
+             lease_until = NULL,
+             claimed_by = NULL,
+             expires_at = ?3
+         WHERE id = ?5",
+        params![error, attempt_count, now_iso, next_retry_at.as_deref(), id],
+    )?;
+
+    Ok(HandoffFailureUpdate {
+        attempt_count,
+        max_attempts,
+        next_retry_at,
+        terminal,
+    })
 }
 
 pub fn enqueue_handoff(conn: &Connection, payload: &HandoffPayload) -> Result<()> {
@@ -797,15 +1176,141 @@ fn config_db_path(config_path: Option<&Path>) -> Option<PathBuf> {
     if db_raw.is_empty() {
         return None;
     }
+
+    if is_default_collector_db_path(&db_raw) {
+        if let Some(path) =
+            env_path("STEER_COLLECTOR_DB_PATH").or_else(|| env_path("STEER_DB_PATH"))
+        {
+            return Some(path);
+        }
+    }
+
     let candidate = PathBuf::from(&db_raw);
-    if candidate.is_absolute() {
-        Some(candidate)
+    let resolved = if candidate.is_absolute() {
+        candidate
     } else {
         cfg_path
             .parent()
             .map(|p| p.join(&candidate))
             .or(Some(candidate))
+            .unwrap_or_else(|| PathBuf::from(&db_raw))
+    };
+
+    if is_default_collector_db_path(&db_raw) {
+        if collector_separate_db_enabled() {
+            return Some(resolved);
+        }
+        if collector_auto_link_enabled() {
+            if let Some(shared) = discover_shared_steer_db() {
+                return Some(shared);
+            }
+        }
     }
+    Some(resolved)
+}
+
+fn env_path(key: &str) -> Option<PathBuf> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+fn env_bool_with_default(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
+}
+
+fn collector_auto_link_enabled() -> bool {
+    env_bool_with_default("STEER_COLLECTOR_AUTO_LINK", true)
+}
+
+fn collector_separate_db_enabled() -> bool {
+    env_bool_with_default("STEER_COLLECTOR_SEPARATE_DB", false)
+}
+
+fn is_default_collector_db_path(raw: &str) -> bool {
+    let normalized = raw.trim().replace('\\', "/").to_ascii_lowercase();
+    normalized == "collector.db" || normalized == "./collector.db"
+}
+
+fn discover_shared_steer_db() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Some(mut base) = dirs::data_local_dir() {
+        base.push("steer");
+        base.push("steer.db");
+        candidates.push(base);
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.trim().is_empty() {
+            let home_path = PathBuf::from(home);
+            candidates.push(
+                home_path
+                    .join("Library")
+                    .join("Application Support")
+                    .join("steer")
+                    .join("steer.db"),
+            );
+            candidates.push(
+                home_path
+                    .join(".local")
+                    .join("share")
+                    .join("steer")
+                    .join("steer.db"),
+            );
+        }
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("steer.db"));
+        candidates.push(cwd.join("core").join("steer.db"));
+        candidates.push(cwd.join("..").join("steer.db"));
+        candidates.push(cwd.join("..").join("core").join("steer.db"));
+    }
+
+    for path in candidates {
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn ensure_column_exists(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    if table_has_column(conn, table, column)? {
+        return Ok(());
+    }
+    let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
+    conn.execute(&sql, [])?;
+    Ok(())
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&pragma)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name.eq_ignore_ascii_case(column) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn config_privacy_path(config_path: Option<&Path>) -> Option<PathBuf> {
@@ -1428,5 +1933,120 @@ mod tests {
         assert!(candidates
             .iter()
             .any(|c| c.pattern_json.contains("\"a\",\"b\"")));
+    }
+
+    #[test]
+    fn handoff_retry_backoff_stops_at_max_attempts() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        ensure_pipeline_tables(&conn).expect("tables");
+        let now = format_utc_ts(Utc::now());
+        conn.execute(
+            "INSERT INTO collector_handoff_queue (
+                package_id, created_at, status, payload_json, payload_size, expires_at, error
+             ) VALUES (?1, ?2, 'pending', ?3, ?4, NULL, NULL)",
+            params!["pkg-1", now, "{\"routine_candidates\":[{}]}", 24i64],
+        )
+        .expect("insert handoff");
+        let id = conn.last_insert_rowid();
+
+        let first = mark_handoff_failed_with_backoff(&conn, id, "parse failed", 2, 1)
+            .expect("first failure update");
+        assert_eq!(first.attempt_count, 1);
+        assert!(!first.terminal);
+        assert!(first.next_retry_at.is_some());
+
+        let second = mark_handoff_failed_with_backoff(&conn, id, "parse failed", 2, 1)
+            .expect("second failure update");
+        assert_eq!(second.attempt_count, 2);
+        assert!(second.terminal);
+        assert!(second.next_retry_at.is_none());
+    }
+
+    #[test]
+    fn fetch_retryable_handoff_respects_next_retry_at() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        ensure_pipeline_tables(&conn).expect("tables");
+        let now = Utc::now();
+        let created = format_utc_ts(now);
+        let future = format_utc_ts(now + Duration::seconds(60));
+        conn.execute(
+            "INSERT INTO collector_handoff_queue (
+                package_id, created_at, status, payload_json, payload_size, expires_at, error,
+                attempt_count, next_retry_at
+             ) VALUES (?1, ?2, 'failed', ?3, ?4, NULL, ?5, ?6, ?7)",
+            params![
+                "pkg-future",
+                created,
+                "{\"routine_candidates\":[{}]}",
+                24i64,
+                "failed",
+                1i64,
+                future
+            ],
+        )
+        .expect("insert failed row");
+
+        let none = fetch_latest_retryable_handoff(&conn, 3).expect("query");
+        assert!(none.is_none());
+
+        let past = format_utc_ts(now - Duration::seconds(1));
+        conn.execute(
+            "UPDATE collector_handoff_queue SET next_retry_at = ?1 WHERE package_id = 'pkg-future'",
+            params![past],
+        )
+        .expect("update retry ts");
+
+        let row = fetch_latest_retryable_handoff(&conn, 3)
+            .expect("query row")
+            .expect("row exists");
+        assert_eq!(row.package_id, "pkg-future");
+        assert_eq!(row.status.to_lowercase(), "failed");
+    }
+
+    #[test]
+    fn claim_retryable_handoff_skips_live_processing_lease() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        ensure_pipeline_tables(&conn).expect("tables");
+        let now = Utc::now();
+        let created_pending = format_utc_ts(now - Duration::seconds(1));
+        let created_processing = format_utc_ts(now);
+        let lease_future = format_utc_ts(now + Duration::seconds(60));
+
+        conn.execute(
+            "INSERT INTO collector_handoff_queue (
+                package_id, created_at, status, payload_json, payload_size, expires_at, error
+             ) VALUES (?1, ?2, 'pending', ?3, ?4, NULL, NULL)",
+            params![
+                "pkg-pending",
+                created_pending,
+                "{\"routine_candidates\":[{}]}",
+                24i64
+            ],
+        )
+        .expect("insert pending row");
+
+        conn.execute(
+            "INSERT INTO collector_handoff_queue (
+                package_id, created_at, status, payload_json, payload_size, expires_at, error,
+                attempt_count, lease_until, claimed_by
+             ) VALUES (?1, ?2, 'processing', ?3, ?4, NULL, NULL, ?5, ?6, ?7)",
+            params![
+                "pkg-processing",
+                created_processing,
+                "{\"routine_candidates\":[{}]}",
+                24i64,
+                1i64,
+                lease_future,
+                "worker-x"
+            ],
+        )
+        .expect("insert processing row");
+
+        let claimed = claim_retryable_handoff(&mut conn, 5, "worker-a", 120)
+            .expect("claim")
+            .expect("claimed row");
+        assert_eq!(claimed.package_id, "pkg-pending");
+        assert_eq!(claimed.status, "processing");
+        assert_eq!(claimed.claimed_by.as_deref(), Some("worker-a"));
     }
 }

@@ -506,8 +506,10 @@ impl ApprovalGate {
 mod tests {
     use super::*;
     use crate::nl_automation::{IntentType, Plan};
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_blocked_commands() {
         assert_eq!(
             ApprovalGate::check_command("rm -rf /"),
@@ -520,6 +522,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_safe_commands() {
         assert_eq!(
             ApprovalGate::check_command("ls -la"),
@@ -544,6 +547,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_approval_required() {
         assert_eq!(
             ApprovalGate::check_command("sudo apt install git"),
@@ -556,6 +560,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_token_aware_classification_avoids_false_positive_contains() {
         assert_eq!(
             ApprovalGate::check_command("echo sudo is blocked"),
@@ -564,6 +569,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_package_install_requires_approval() {
         assert_eq!(
             ApprovalGate::check_command("npm install -g pnpm"),
@@ -576,6 +582,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_unknown_json_action_requires_approval() {
         reset_decisions();
         let plan = test_plan(&format!("plan-unknown-action-{}", uuid::Uuid::new_v4()));
@@ -586,6 +593,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_json_action_key_is_canonicalized_for_decision_reuse() {
         reset_decisions();
         let plan = test_plan("plan-json-canonical-key");
@@ -600,6 +608,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_safe_bin_with_shell_features_requires_approval() {
         assert_eq!(
             ApprovalGate::check_command("echo hello > /tmp/a.txt"),
@@ -620,6 +629,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_user_approval_overrides_policy() {
         reset_decisions();
         let plan = test_plan(&format!("plan-approval-override-{}", uuid::Uuid::new_v4()));
@@ -637,6 +647,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_user_denial_overrides_policy() {
         reset_decisions();
         let plan = test_plan(&format!("plan-deny-override-{}", uuid::Uuid::new_v4()));
@@ -650,6 +661,35 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn test_evaluate_approval_ask_fallback_deny() {
+        reset_decisions();
+        std::env::set_var("STEER_APPROVAL_ASK_FALLBACK", "deny");
+        let plan = test_plan(&format!("plan-fallback-deny-{}", uuid::Uuid::new_v4()));
+        let action = r#"{"action":"shell","command":"sudo apt install git"}"#;
+        let decision = evaluate_approval(action, &plan);
+        assert_eq!(decision.status, "denied");
+        assert!(decision.requires_approval);
+        assert_eq!(decision.policy, "ask_fallback_deny");
+        std::env::remove_var("STEER_APPROVAL_ASK_FALLBACK");
+    }
+
+    #[test]
+    #[serial]
+    fn test_evaluate_approval_ask_fallback_allow_once() {
+        reset_decisions();
+        std::env::set_var("STEER_APPROVAL_ASK_FALLBACK", "allow-once");
+        let plan = test_plan(&format!("plan-fallback-allow-{}", uuid::Uuid::new_v4()));
+        let action = r#"{"action":"shell","command":"sudo apt install git"}"#;
+        let decision = evaluate_approval(action, &plan);
+        assert_eq!(decision.status, "approved");
+        assert!(!decision.requires_approval);
+        assert_eq!(decision.policy, "ask_fallback_allow_once");
+        std::env::remove_var("STEER_APPROVAL_ASK_FALLBACK");
+    }
+
+    #[test]
+    #[serial]
     fn test_decision_persists_via_db() {
         if let Err(e) = crate::db::init() {
             eprintln!("skip: db init unavailable for persistence test: {}", e);
@@ -852,7 +892,8 @@ pub fn preview_approval(action: &str, plan: &crate::nl_automation::Plan) -> Appr
 
 /// Evaluate approval - legacy API (used by execution_controller)
 pub fn evaluate_approval(action: &str, plan: &crate::nl_automation::Plan) -> ApprovalDecision {
-    preview_approval(action, plan)
+    let preview = preview_approval(action, plan);
+    apply_pending_ask_fallback(preview)
 }
 
 fn normalize_action(action: &str) -> String {
@@ -928,6 +969,37 @@ fn parse_user_decision(decision: &str) -> Option<ApprovalStatus> {
     None
 }
 
+fn approval_ask_fallback_mode() -> String {
+    std::env::var("STEER_APPROVAL_ASK_FALLBACK")
+        .ok()
+        .map(|v| v.trim().to_lowercase())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "ask".to_string())
+}
+
+fn apply_pending_ask_fallback(mut decision: ApprovalDecision) -> ApprovalDecision {
+    if !(decision.requires_approval && decision.status == "pending") {
+        return decision;
+    }
+    match approval_ask_fallback_mode().as_str() {
+        "ask" | "pending" => decision,
+        "allow" | "allow-once" | "allow_once" | "allow-once-only" => {
+            decision.status = "approved".to_string();
+            decision.requires_approval = false;
+            decision.policy = "ask_fallback_allow_once".to_string();
+            decision.message = format!("{} [ask_fallback=allow-once]", decision.message);
+            decision
+        }
+        _ => {
+            decision.status = "denied".to_string();
+            decision.requires_approval = true;
+            decision.policy = "ask_fallback_deny".to_string();
+            decision.message = format!("{} [ask_fallback=deny]", decision.message);
+            decision
+        }
+    }
+}
+
 fn decision_ttl() -> std::time::Duration {
     let ttl_seconds = std::env::var("STEER_APPROVAL_DECISION_TTL_SECONDS")
         .ok()
@@ -992,12 +1064,20 @@ fn get_registered_decision(plan_id: &str, action: &str) -> Option<ApprovalStatus
             }
         }
         if candidate != &key {
+            let ttl_seconds = chrono::DateTime::parse_from_rfc3339(&stored.expires_at)
+                .ok()
+                .map(|expiry| {
+                    let now = chrono::Utc::now();
+                    let expiry_utc = expiry.with_timezone(&chrono::Utc);
+                    (expiry_utc - now).num_seconds().max(1)
+                })
+                .unwrap_or_else(|| decision_ttl().as_secs().min(i64::MAX as u64) as i64);
             let _ = crate::db::upsert_approval_decision(
                 &key,
                 plan_id,
                 action,
                 status_to_storage(status),
-                std::cmp::min(decision_ttl().as_secs(), i64::MAX as u64) as i64,
+                ttl_seconds,
             );
         }
         return Some(status);

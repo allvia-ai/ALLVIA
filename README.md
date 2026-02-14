@@ -183,6 +183,20 @@ bash scripts/run_local.sh
 - `STEER_WORKFLOW_OUTPUT_DIR` (default: `workflows`)
 - `STEER_DB_PATH` (collector/pipeline 공통 DB 경로)
 - `STEER_PRIVACY_RULES_PATH` (handoff privacy rules 경로 override)
+- `STEER_SEMANTIC_REQUIRE_RUST_CONTRACT` (`run_nl_request_with_telegram.sh`에서 의미검증 토큰 추출을 Rust 계약 파서로 강제, 기본 `1`)
+- `STEER_ALLOW_COLLECTOR_DB_MISMATCH` (`workflow_intake`에서 collector/core DB 불일치 허용, 기본 `0`)
+- `STEER_APPROVAL_ASK_FALLBACK` (승인 대기 시 실행 fallback 정책: `ask|deny|allow-once`, 시나리오 스크립트 기본 `deny`)
+
+운영 점검 API:
+
+- `GET /api/system/db-paths` : core DB 경로와 collector DB 경로 및 mismatch 여부 확인
+- `GET /api/workflow/provision-ops` : workflow provisioning 상태 로그 조회
+- `POST /api/agent/execute` 응답에 `resume_token` 포함 (manual/approval/blocked 시 재개 식별 토큰)
+- 동일 `plan_id`에 대한 `/api/agent/execute` 동시 실행은 `409 plan_execution_in_progress`로 직렬화
+
+실행 로그:
+
+- 시나리오 실행 스크립트는 `RUN_ATTEMPT`와 함께 `RUN_ATTEMPT_JSON|{...}` 구조 로그를 기록
 
 Windows 서비스 실행(`scripts/run_core.ps1`)은 기본값이 `-CollectorImpl rust`입니다.
 

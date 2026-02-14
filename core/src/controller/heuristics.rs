@@ -585,9 +585,20 @@ pub fn looks_like_dialog(desc: &str) -> bool {
 }
 
 pub async fn ensure_app_focus(target_app: &str, retries: usize) -> bool {
-    for _ in 0..retries {
+    let effective_retries = std::env::var("STEER_FOCUS_RETRIES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| retries.min(2).max(1));
+
+    if let Ok(front) = crate::tool_chaining::CrossAppBridge::get_frontmost_app() {
+        if front.eq_ignore_ascii_case(target_app) {
+            return true;
+        }
+    }
+
+    for _ in 0..effective_retries {
         let _ = crate::tool_chaining::CrossAppBridge::switch_to_app(target_app);
-        tokio::time::sleep(tokio::time::Duration::from_millis(350)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(220)).await;
         if let Ok(front) = crate::tool_chaining::CrossAppBridge::get_frontmost_app() {
             if front.eq_ignore_ascii_case(target_app) {
                 return true;

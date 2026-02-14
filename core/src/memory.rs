@@ -279,12 +279,26 @@ impl MemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm_gateway::{LLMClient, OpenAILLMClient};
+    use crate::llm_gateway::OpenAILLMClient;
     use serde_json::json;
     use std::sync::Arc;
 
     #[tokio::test]
     async fn test_memory_functionality() {
+        let run_live = std::env::var("STEER_RUN_LIVE_EMBED_TEST")
+            .ok()
+            .map(|v| {
+                matches!(
+                    v.trim().to_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+        if !run_live {
+            // Default deterministic mode: skip live embedding API integration unless explicitly enabled.
+            return;
+        }
+
         if std::env::var("OPENAI_API_KEY").is_err() {
             dotenv::dotenv().ok();
         }

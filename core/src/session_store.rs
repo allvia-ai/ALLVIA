@@ -408,7 +408,7 @@ mod tests {
         store.save(store.get(&id).unwrap())?;
 
         // Reload
-        let mut store2 = SessionStore::new(dir.path())?;
+        let store2 = SessionStore::new(dir.path())?;
         let loaded = store2.get(&id);
         assert!(loaded.is_some());
         assert_eq!(loaded.unwrap().messages.len(), 1);

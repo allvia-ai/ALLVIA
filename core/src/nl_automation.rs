@@ -68,6 +68,8 @@ pub struct Plan {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalContext {
+    #[serde(default)]
+    pub approval_id: Option<String>,
     pub action: String,
     pub message: String,
     pub risk_level: String,
@@ -82,6 +84,8 @@ pub struct ExecutionResult {
     #[serde(default)]
     pub manual_steps: Vec<String>,
     pub resume_from: Option<usize>,
+    #[serde(default)]
+    pub resume_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

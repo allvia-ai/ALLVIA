@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct PeekabooElement {
@@ -23,11 +24,36 @@ pub struct PeekabooPermissions {
 }
 
 pub fn is_available() -> bool {
-    Command::new("peekaboo")
+    let timeout_ms = std::env::var("STEER_PEEKABOO_PROBE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1200);
+
+    let mut child = match Command::new("peekaboo")
         .arg("--version")
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(60));
+            }
+            Err(_) => return false,
+        }
+    }
 }
 
 pub fn check_permissions() -> Result<PeekabooPermissions> {

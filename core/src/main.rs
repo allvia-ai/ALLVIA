@@ -1,7 +1,7 @@
 use local_os_agent::{
     analyzer, api_server, applescript, bash_executor, db, dependency_check, feedback_collector,
     integrations, llm_gateway, mcp_client, monitor, orchestrator, pattern_detector, policy,
-    recommendation, recommendation_executor, scheduler, security,
+    recommendation, recommendation_executor, scheduler, security, workflow_intake,
 };
 
 use local_os_agent::env_flag;
@@ -17,25 +17,6 @@ use std::collections::HashMap;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt};
 use tracing::{error, info, warn};
 use uuid::Uuid;
-
-fn recommendation_fingerprint(title: &str, trigger: &str) -> String {
-    format!(
-        "{}::{}",
-        title.trim().to_lowercase(),
-        trigger.trim().to_lowercase()
-    )
-}
-
-fn find_recommendation_id_by_fingerprint(target: &str) -> anyhow::Result<Option<i64>> {
-    let rows = db::get_recommendations_with_filter(Some("all"))?;
-    for rec in rows {
-        let fp = recommendation_fingerprint(&rec.title, &rec.trigger);
-        if fp == target {
-            return Ok(Some(rec.id));
-        }
-    }
-    Ok(None)
-}
 
 fn summarize_prompt(prompt: &str, max_chars: usize) -> String {
     let trimmed = prompt.trim();
@@ -120,6 +101,117 @@ fn parse_retry_after_seconds(err: &str) -> Option<u64> {
     }
     let secs = numeric.parse::<f64>().ok()?;
     Some(secs.ceil().max(1.0) as u64)
+}
+
+fn notion_text(text: &str, max_chars: usize) -> String {
+    summarize_prompt(text, max_chars).replace('\n', " ")
+}
+
+fn notion_heading_block(text: &str, level: u8) -> serde_json::Value {
+    let rich = json!([{
+        "type": "text",
+        "text": { "content": notion_text(text, 180) }
+    }]);
+    match level {
+        1 => json!({
+            "object": "block",
+            "type": "heading_1",
+            "heading_1": { "rich_text": rich }
+        }),
+        3 => json!({
+            "object": "block",
+            "type": "heading_3",
+            "heading_3": { "rich_text": rich }
+        }),
+        _ => json!({
+            "object": "block",
+            "type": "heading_2",
+            "heading_2": { "rich_text": rich }
+        }),
+    }
+}
+
+fn notion_paragraph_block(text: &str) -> serde_json::Value {
+    json!({
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": {
+            "rich_text": [{
+                "type": "text",
+                "text": { "content": notion_text(text, 1800) }
+            }]
+        }
+    })
+}
+
+fn notion_bulleted_item_block(text: &str) -> serde_json::Value {
+    json!({
+        "object": "block",
+        "type": "bulleted_list_item",
+        "bulleted_list_item": {
+            "rich_text": [{
+                "type": "text",
+                "text": { "content": notion_text(text, 1800) }
+            }]
+        }
+    })
+}
+
+fn notion_numbered_item_block(text: &str) -> serde_json::Value {
+    json!({
+        "object": "block",
+        "type": "numbered_list_item",
+        "numbered_list_item": {
+            "rich_text": [{
+                "type": "text",
+                "text": { "content": notion_text(text, 1800) }
+            }]
+        }
+    })
+}
+
+fn notion_divider_block() -> serde_json::Value {
+    json!({
+        "object": "block",
+        "type": "divider",
+        "divider": {}
+    })
+}
+
+fn build_gmail_digest_blocks(
+    stamp: &str,
+    emails: &[DigestEmail],
+    digest: &DigestSummary,
+) -> Vec<serde_json::Value> {
+    let mut blocks = vec![
+        notion_heading_block("Gmail Digest", 2),
+        notion_paragraph_block(&format!("생성 시각: {}", stamp)),
+        notion_paragraph_block(&format!("수집 건수: {}", emails.len())),
+        notion_heading_block("전체 요약", 3),
+        notion_paragraph_block(&digest.overall_summary),
+        notion_heading_block("메일별 요약", 3),
+    ];
+
+    for line in &digest.per_email_lines {
+        let normalized = line
+            .split_once(". ")
+            .map(|(_, rest)| rest)
+            .unwrap_or(line.as_str());
+        blocks.push(notion_numbered_item_block(normalized));
+    }
+
+    blocks.push(notion_heading_block("원문 인덱스", 3));
+    for email in emails {
+        let line = format!(
+            "{} | {} | {}",
+            summarize_prompt(&email.from, 80),
+            summarize_prompt(&email.subject, 100),
+            summarize_prompt(&email.date, 80)
+        );
+        blocks.push(notion_bulleted_item_block(&line));
+    }
+
+    blocks
 }
 
 async fn summarize_digest_with_llm(
@@ -320,40 +412,35 @@ async fn run_gmail_digest_pipeline(
 
     let now = Utc::now();
     let stamp = now.format("%Y-%m-%d %H:%M:%S UTC").to_string();
-    let mut notion_lines = vec![
-        format!("Gmail Digest ({})", stamp),
-        format!("수집 건수: {}", emails.len()),
-        format!("전체 요약: {}", digest.overall_summary),
-        "메일별 요약".to_string(),
-    ];
-    notion_lines.extend(digest.per_email_lines.iter().cloned());
-    notion_lines.push("원문 인덱스".to_string());
-    for (idx, email) in emails.iter().enumerate() {
-        notion_lines.push(format!(
-            "{}. {} | {} | {}",
-            idx + 1,
-            summarize_prompt(&email.from, 60),
-            summarize_prompt(&email.subject, 80),
-            summarize_prompt(&email.date, 64)
-        ));
-    }
+    let notion_blocks = build_gmail_digest_blocks(&stamp, &emails, &digest);
 
     let notion_client = integrations::notion::NotionClient::from_env()?;
     let page_id = std::env::var("NOTION_PAGE_ID").unwrap_or_default();
     let database_id = std::env::var("NOTION_DATABASE_ID").unwrap_or_default();
+    let append_to_page = env_flag("NOTION_APPEND_TO_PAGE");
     let notion_url;
 
-    if !page_id.trim().is_empty() {
-        notion_client
-            .append_paragraphs(&page_id, &notion_lines)
-            .await?;
-        notion_url = format!("https://www.notion.so/{}", page_id.replace('-', ""));
-    } else if !database_id.trim().is_empty() {
+    if !database_id.trim().is_empty() {
         let title = format!("Gmail Digest {}", now.format("%Y%m%d_%H%M%S"));
         let created_page_id = notion_client
-            .create_page(&database_id, &title, &notion_lines.join("\n"))
+            .create_database_page_with_children(&database_id, &title, &notion_blocks)
             .await?;
         notion_url = format!("https://www.notion.so/{}", created_page_id.replace('-', ""));
+    } else if !page_id.trim().is_empty() {
+        if append_to_page {
+            let mut append_blocks = vec![notion_divider_block()];
+            append_blocks.extend(notion_blocks);
+            notion_client
+                .append_blocks(&page_id, &append_blocks)
+                .await?;
+            notion_url = format!("https://www.notion.so/{}", page_id.replace('-', ""));
+        } else {
+            let title = format!("Gmail Digest {}", now.format("%Y%m%d_%H%M%S"));
+            let created_page_id = notion_client
+                .create_child_page_with_children(&page_id, &title, &notion_blocks)
+                .await?;
+            notion_url = format!("https://www.notion.so/{}", created_page_id.replace('-', ""));
+        }
     } else {
         return Err(anyhow::anyhow!(
             "NOTION_PAGE_ID or NOTION_DATABASE_ID must be set"
@@ -384,36 +471,6 @@ async fn run_gmail_digest_pipeline(
     Ok(())
 }
 
-fn queue_manual_workflow_recommendation(prompt: &str, source: &str) -> anyhow::Result<(i64, bool)> {
-    let prompt_trimmed = prompt.trim();
-    if prompt_trimmed.is_empty() {
-        return Err(anyhow::anyhow!("workflow prompt is empty"));
-    }
-    let short = summarize_prompt(prompt_trimmed, 48);
-    let proposal = recommendation::AutomationProposal {
-        title: format!("Manual Workflow: {}", short),
-        summary: format!(
-            "Manual workflow request captured from {} (approval required before creation).",
-            source
-        ),
-        trigger: "Manual workflow request".to_string(),
-        actions: vec!["n8n Workflow".to_string()],
-        confidence: 0.6,
-        n8n_prompt: prompt_trimmed.to_string(),
-        evidence: vec![
-            format!("source={}", source),
-            format!("prompt={}", summarize_prompt(prompt_trimmed, 160)),
-        ],
-        pattern_id: None,
-    };
-
-    let fp = proposal.fingerprint();
-    let inserted = db::insert_recommendation(&proposal)?;
-    let rec_id = find_recommendation_id_by_fingerprint(&fp)?
-        .ok_or_else(|| anyhow::anyhow!("failed to resolve recommendation id after insert"))?;
-    Ok((rec_id, inserted))
-}
-
 fn load_mock_workflow_proposal() -> anyhow::Result<recommendation::AutomationProposal> {
     let path = std::env::var("STEER_WORKFLOW_MOCK_FILE")
         .unwrap_or_else(|_| "core/mock/workflow_received_mock.json".to_string());
@@ -432,10 +489,7 @@ async fn ingest_mock_workflow_recommendation(
     llm_client: Option<std::sync::Arc<dyn llm_gateway::LLMClient>>,
 ) -> anyhow::Result<()> {
     let proposal = load_mock_workflow_proposal()?;
-    let fp = proposal.fingerprint();
-    let inserted = db::insert_recommendation(&proposal)?;
-    let rec_id = find_recommendation_id_by_fingerprint(&fp)?
-        .ok_or_else(|| anyhow::anyhow!("failed to resolve recommendation id after insert"))?;
+    let (rec_id, inserted) = workflow_intake::insert_or_get_recommendation_id(&proposal)?;
 
     if inserted {
         println!(
@@ -754,6 +808,9 @@ async fn main() -> anyhow::Result<()> {
                 println!("  reject <id>           - Reject recommendation");
                 println!(
                     "  ingest_mock_workflow  - Ingest mock workflow as pending recommendation"
+                );
+                println!(
+                    "  ingest_handoff [cfg]  - Consume collector pending handoff into recommendation"
                 );
                 println!("  analyze_patterns      - Detect behavior patterns and generate recommendations");
                 println!("  quality               - Show workflow quality metrics");
@@ -1171,6 +1228,24 @@ async fn main() -> anyhow::Result<()> {
                     println!("❌ Mock workflow ingest failed: {}", e);
                 }
             }
+            "ingest_handoff" => {
+                let config_override = parts.get(1).copied();
+                match workflow_intake::ingest_latest_collector_handoff(config_override) {
+                    Ok(outcome) => {
+                        println!(
+                            "📥 Handoff ingest status={} detail={}",
+                            outcome.status, outcome.detail
+                        );
+                        if let Some(pkg) = outcome.package_id {
+                            println!("   package_id={}", pkg);
+                        }
+                        if let Some(id) = outcome.recommendation_id {
+                            println!("   recommendation_id={} inserted={}", id, outcome.inserted);
+                        }
+                    }
+                    Err(e) => println!("❌ Handoff ingest failed: {}", e),
+                }
+            }
             "reject" => {
                 if parts.len() < 2 {
                     println!("Usage: reject <id>");
@@ -1212,8 +1287,13 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
                 let prompt = parts[1..].join(" ");
-                match queue_manual_workflow_recommendation(&prompt, "cli.build_workflow") {
-                    Ok((rec_id, inserted)) => {
+                match workflow_intake::queue_manual_workflow_recommendation(
+                    &prompt,
+                    "cli.build_workflow",
+                ) {
+                    Ok(outcome) => {
+                        let rec_id = outcome.recommendation_id;
+                        let inserted = outcome.inserted;
                         if inserted {
                             println!("📝 Recommendation queued [{}] as pending approval.", rec_id);
                         } else {

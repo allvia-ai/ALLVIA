@@ -177,6 +177,13 @@ impl BrowserAutomation {
 
         self.last_snapshot_refs = refs.clone();
         println!("📸 [Browser] Snapshot captured: {} elements", refs.len());
+        if refs.is_empty() && !crate::env_flag("STEER_ALLOW_EMPTY_SNAPSHOT_REFS") {
+            let front_app = CrossAppBridge::get_frontmost_app().unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "snapshot returned zero elements (frontmost='{}'). ensure target window is visible/focused and accessibility permissions are granted",
+                front_app
+            ));
+        }
         Ok(refs)
     }
 

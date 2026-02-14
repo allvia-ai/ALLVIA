@@ -1,6 +1,18 @@
 import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Search, Zap, Activity, Terminal, Pin } from "lucide-react"; // Added Pin icon
+import {
+    Zap,
+    Activity,
+    Terminal,
+    Pin,
+    Plus,
+    Globe,
+    Wand2,
+    AppWindow,
+    Mic,
+    ArrowUp,
+    Circle
+} from "lucide-react";
 import { sendChatMessage, approveRecommendation, agentIntent, agentPlan, agentExecute, agentVerify, agentApprove } from "@/lib/api";
 import { useRecommendations } from "@/lib/hooks";
 import { emit } from "@tauri-apps/api/event"; // Added emit
@@ -26,6 +38,49 @@ type ApprovalContext = {
     policy: string;
 };
 
+type ComposerMode = "nl" | "program";
+
+type QuickProgramAction = {
+    key: string;
+    label: string;
+    prompt: string;
+};
+
+const QUICK_PROGRAM_ACTIONS: QuickProgramAction[] = [
+    {
+        key: "calendar_front",
+        label: "캘린더 열기",
+        prompt: "Calendar를 열고 전면으로 가져오세요."
+    },
+    {
+        key: "notes_new",
+        label: "새 메모",
+        prompt: "Notes를 열고 새 메모를 만든 뒤 오늘 할 일 3줄을 입력하세요."
+    },
+    {
+        key: "mail_draft",
+        label: "메일 초안",
+        prompt: "Mail을 열고 새 이메일 초안을 만들고 제목과 본문을 작성하세요."
+    },
+    {
+        key: "finder_downloads",
+        label: "다운로드 보기",
+        prompt: "Finder를 열고 Downloads 폴더로 이동하세요."
+    },
+    {
+        key: "scenario_1",
+        label: "시나리오 1",
+        prompt: "Calendar를 열고 Notes를 열어 새 메모를 작성하고 Mail로 보낼 초안을 만드세요."
+    }
+];
+
+const QUICK_NL_SUGGESTIONS = [
+    "오늘 받은 메일 5개 요약해줘",
+    "노트에서 최근 TODO 정리해줘",
+    "복잡 시나리오 1번 실행해줘",
+    "텔레그램으로 실행 결과 요약 보내줘",
+];
+
 const markdownComponents: Components = {
     code({ children, ...props }) {
         const inline = 'inline' in props && props.inline;
@@ -43,6 +98,8 @@ const markdownComponents: Components = {
 
 export default function Launcher() {
     const [input, setInput] = useState("");
+    const [composerMode, setComposerMode] = useState<ComposerMode>("nl");
+    const [showDetailPanel, setShowDetailPanel] = useState(false);
     const [results, setResults] = useState<LauncherResult[]>([]);
     const [loading, setLoading] = useState(false);
     const [selectedIndex, setSelectedIndex] = useState(0);
@@ -101,10 +158,21 @@ export default function Launcher() {
 
     // Combine all navigable items
     const pendingRecs = recs?.filter(r => r.status === 'pending') ?? [];
+    const hasDetailContent =
+        results.length > 0 ||
+        pendingRecs.length > 0 ||
+        !!pendingApproval ||
+        (lastStatus === "manual_required" && !!lastPlanId);
     const navigableItems = [
         ...results.map((r, i) => ({ type: 'result', data: r, id: `res-${i}` })),
         ...pendingRecs.map(r => ({ type: 'recommendation', data: r, id: `rec-${r.id}` }))
     ];
+
+    useEffect(() => {
+        if (results.length > 0 || pendingApproval || lastStatus === "manual_required") {
+            setShowDetailPanel(true);
+        }
+    }, [results.length, pendingApproval, lastStatus]);
 
     // Reset selection when items change
     useEffect(() => {
@@ -124,14 +192,16 @@ export default function Launcher() {
         }
     }, [selectedIndex, navigableItems.length]);
 
-    const handleSend = async () => {
-        if (!input.trim()) return;
+    const dispatchPrompt = async (rawPrompt: string) => {
+        const prompt = rawPrompt.trim();
+        if (!prompt) return;
+        setShowDetailPanel(true);
         setLoading(true);
         setResults([]);
         setPendingApproval(null);
 
         // [Phase 6.3] Performance Test Command
-        if (input.trim() === "test_perf") {
+        if (prompt === "test_perf") {
             const start = performance.now();
             const dummyItems: LauncherResult[] = Array.from({ length: 1000 }, (_, i) => ({
                 type: 'response' as const,
@@ -147,7 +217,7 @@ export default function Launcher() {
         }
 
         try {
-            const intentRes = await agentIntent(input);
+            const intentRes = await agentIntent(prompt);
             if (intentRes.missing_slots && intentRes.missing_slots.length > 0) {
                 const followUp = intentRes.follow_up || "추가 정보가 필요합니다.";
                 setResults([{
@@ -215,7 +285,7 @@ export default function Launcher() {
         } catch (error) {
             console.error("Launcher send failed", error);
             try {
-                const res = await sendChatMessage(input);
+                const res = await sendChatMessage(prompt);
                 setResults([{ type: 'response', content: res.response }]);
                 setInput("");
                 triggerSuccess();
@@ -226,6 +296,19 @@ export default function Launcher() {
         } finally {
             setLoading(false);
         }
+    };
+
+    const handleSend = async () => {
+        await dispatchPrompt(input);
+    };
+
+    const handleSuggestionClick = (suggestion: string) => {
+        setInput(suggestion);
+        inputRef.current?.focus();
+    };
+
+    const handleQuickProgramAction = async (action: QuickProgramAction) => {
+        await dispatchPrompt(action.prompt);
     };
 
     const extractErrorMessage = (error: unknown) => {
@@ -406,9 +489,11 @@ export default function Launcher() {
     // Keyboard Handler
     const handleKeyDown = async (e: React.KeyboardEvent) => {
         if (e.key === "ArrowDown") {
+            if (navigableItems.length === 0) return;
             e.preventDefault();
             setSelectedIndex(prev => (prev + 1) % navigableItems.length);
         } else if (e.key === "ArrowUp") {
+            if (navigableItems.length === 0) return;
             e.preventDefault();
             setSelectedIndex(prev => (prev - 1 + navigableItems.length) % navigableItems.length);
         } else if (e.key === "Enter") {
@@ -449,11 +534,11 @@ export default function Launcher() {
 
     return (
         <div
-            className="fixed inset-0 bg-transparent flex items-start justify-center pt-[20vh] p-8"
+            className="w-full bg-transparent flex items-end justify-center pb-3 px-3"
             onMouseDown={handleBackgroundClick}
         >
             <motion.div
-                className={`w-full max-w-2xl bg-[#1e1e1e]/95 backdrop-blur-2xl rounded-2xl shadow-2xl overflow-hidden border transition-colors duration-500
+                className={`w-full max-w-[1160px] bg-[#13161d]/94 backdrop-blur-2xl rounded-[22px] shadow-2xl overflow-hidden border transition-colors duration-500
                     ${successPulse ? 'border-green-500/50 shadow-green-500/20' : 'border-white/10 ring-1 ring-black/5'}
                 `}
                 initial={{ scale: 0.9, opacity: 0 }}
@@ -464,229 +549,334 @@ export default function Launcher() {
                 }}
                 transition={{ type: "spring", duration: 0.3 }}
             >
-                {/* Input Area */}
-                <div className="flex items-center px-4 py-4 border-b border-white/5 bg-[#1e1e1e]">
-                    <Search className="w-5 h-5 text-gray-400 mr-3" />
-                    <input
-                        ref={inputRef}
-                        type="text"
-                        className="flex-1 bg-transparent border-none outline-none text-lg text-white placeholder-gray-500 font-medium"
-                        placeholder="무엇이든 부탁하세요 (Ask anything...)"
-                        value={input}
-                        onChange={(e) => setInput(e.target.value)}
-                        onKeyDown={handleKeyDown}
-                        autoFocus
-                    />
-                    {loading && <Activity className="w-5 h-5 text-blue-500 animate-spin" />}
-                    {!loading && (
+                {/* Composer */}
+                <div className="px-4 py-3.5 bg-[#141820]">
+                    <div className="flex items-center gap-3">
+                        <div className="inline-flex items-center gap-1 rounded-xl bg-white/6 p-1 shrink-0">
+                            <button
+                                onClick={() => setComposerMode("nl")}
+                                className={`px-3 py-1.5 text-xs rounded-lg font-medium transition-colors ${composerMode === "nl"
+                                    ? "bg-white/15 text-white"
+                                    : "text-gray-400 hover:text-gray-200"
+                                    }`}
+                            >
+                                자연어
+                            </button>
+                            <button
+                                onClick={() => setComposerMode("program")}
+                                className={`px-3 py-1.5 text-xs rounded-lg font-medium transition-colors ${composerMode === "program"
+                                    ? "bg-white/15 text-white"
+                                    : "text-gray-400 hover:text-gray-200"
+                                    }`}
+                            >
+                                프로그램
+                            </button>
+                        </div>
+
+                        <div className="relative flex-1">
+                            <input
+                                ref={inputRef}
+                                type="text"
+                                className="w-full h-[52px] bg-white/[0.03] border border-white/15 rounded-xl px-4 text-2xl text-white/95 placeholder-gray-500 outline-none focus:border-white/30 transition-colors"
+                                placeholder={composerMode === "nl" ? "무엇이든 부탁하세요" : "버튼 또는 명령으로 실행"}
+                                value={input}
+                                onChange={(e) => setInput(e.target.value)}
+                                onKeyDown={handleKeyDown}
+                                autoFocus
+                            />
+                        </div>
+
                         <button
                             onClick={handleSend}
-                            disabled={!input.trim()}
-                            className="ml-2 text-xs text-gray-200 bg-white/10 hover:bg-white/20 px-2 py-1 rounded disabled:opacity-50"
+                            disabled={!input.trim() || loading}
+                            className="w-12 h-12 rounded-full bg-white/18 hover:bg-white/30 disabled:opacity-40 text-white flex items-center justify-center transition-colors"
                         >
-                            Send
+                            {loading ? (
+                                <Activity className="w-5 h-5 animate-spin" />
+                            ) : (
+                                <ArrowUp className="w-5 h-5" />
+                            )}
                         </button>
-                    )}
-                </div>
-
-                {pendingApproval && (
-                    <div className="px-4 py-3 border-b border-white/5 bg-[#1b1b1b]">
-                        <div className="text-[11px] uppercase tracking-wider text-amber-400 font-semibold">
-                            Approval Required
-                        </div>
-                        <div className="text-sm text-gray-200 mt-1">
-                            Action: <span className="font-mono">{pendingApproval.action}</span>
-                        </div>
-                        <div className="text-xs text-gray-400">
-                            Risk: {pendingApproval.riskLevel} · Policy: {pendingApproval.policy}
-                        </div>
-                        <div className="text-xs text-gray-500 mt-1">
-                            {pendingApproval.message}
-                        </div>
-                        <div className="mt-3 flex flex-wrap gap-2">
-                            <button
-                                disabled={approvalBusy}
-                                onClick={() => handleApprovalDecision("allow_once")}
-                                className="text-xs px-3 py-1.5 rounded bg-emerald-500/20 text-emerald-200 border border-emerald-500/40 hover:bg-emerald-500/30 disabled:opacity-50"
-                            >
-                                Approve once
-                            </button>
-                            <button
-                                disabled={approvalBusy}
-                                onClick={() => handleApprovalDecision("allow_always")}
-                                className="text-xs px-3 py-1.5 rounded bg-blue-500/20 text-blue-200 border border-blue-500/40 hover:bg-blue-500/30 disabled:opacity-50"
-                            >
-                                Allow always
-                            </button>
-                            <button
-                                disabled={approvalBusy}
-                                onClick={() => handleApprovalDecision("deny")}
-                                className="text-xs px-3 py-1.5 rounded bg-rose-500/20 text-rose-200 border border-rose-500/40 hover:bg-rose-500/30 disabled:opacity-50"
-                            >
-                                Deny
-                            </button>
-                        </div>
                     </div>
-                )}
 
-                {lastStatus === "manual_required" && lastPlanId && !pendingApproval && (
-                    <div className="px-4 py-3 border-b border-white/5 bg-[#171717]">
-                        <div className="text-[11px] uppercase tracking-wider text-sky-400 font-semibold">
-                            Manual Step Needed
-                        </div>
-                        <div className="text-xs text-gray-400 mt-1">
-                            브라우저에서 수동 작업을 완료한 뒤 Resume을 눌러 다음 단계로 진행하세요.
-                        </div>
-                        <div className="mt-3">
-                            <button
-                                disabled={loading}
-                                onClick={handleResume}
-                                className="text-xs px-3 py-1.5 rounded bg-sky-500/20 text-sky-200 border border-sky-500/40 hover:bg-sky-500/30 disabled:opacity-50"
-                            >
-                                Resume
-                            </button>
-                        </div>
-                    </div>
-                )}
-
-                {/* Content Area */}
-                <div ref={scrollRef} className="bg-[#191919] min-h-[300px] max-h-[500px] overflow-y-auto">
-
-                    {/* 1. Response View */}
-                    <AnimatePresence>
-                        {results.map((res, i) => {
-                            const isSelected = navigableItems.findIndex(x => x.id === `res-${i}`) === selectedIndex;
-                            return (
-                                <motion.div
-                                    key={i}
-                                    initial={{ opacity: 0, y: 10 }}
-                                    animate={{ opacity: 1, y: 0 }}
-                                    className={`p-4 rounded-lg mb-2 text-gray-200 text-sm leading-relaxed transition-colors relative group ${isSelected ? 'bg-white/10' : 'bg-[#2a2a2a]'}`}
+                    {composerMode === "nl" && !input.trim() && (
+                        <div className="mt-2.5 rounded-xl border border-white/10 bg-[#1b1b1b]/90 p-2.5 flex flex-nowrap gap-2 overflow-x-auto">
+                            {QUICK_NL_SUGGESTIONS.map((suggestion) => (
+                                <button
+                                    key={suggestion}
+                                    onClick={() => handleSuggestionClick(suggestion)}
+                                    className="text-xs px-3.5 py-1.5 rounded-full bg-white/8 text-gray-200 hover:bg-white/15 border border-white/10 transition-colors whitespace-nowrap"
                                 >
-                                    {/* Content */}
-                                    <ReactMarkdown components={markdownComponents}>
-                                        {res.content}
-                                    </ReactMarkdown>
+                                    {suggestion}
+                                </button>
+                            ))}
+                        </div>
+                    )}
 
-                                    {/* Pin Button */}
-                                    <button
-                                        onClick={() => handlePin(res.content)}
-                                        className="absolute top-2 right-2 p-1.5 rounded-md text-gray-400 hover:text-white hover:bg-white/10 opacity-0 group-hover:opacity-100 transition-all"
-                                        title="Pin to Widget"
-                                    >
-                                        <Pin className="w-4 h-4" />
-                                    </button>
-                                </motion.div>
-                            )
-                        })}
-                    </AnimatePresence>
+                    {composerMode === "program" && (
+                        <div className="mt-2.5 rounded-xl border border-white/10 bg-[#1b1b1b]/90 p-2.5 flex flex-nowrap gap-2 overflow-x-auto">
+                            {QUICK_PROGRAM_ACTIONS.map((action) => (
+                                <button
+                                    key={action.key}
+                                    onClick={() => handleQuickProgramAction(action)}
+                                    disabled={loading}
+                                    className="text-xs px-3.5 py-1.5 rounded-full bg-white/8 text-gray-100 hover:bg-white/15 border border-white/10 disabled:opacity-50 whitespace-nowrap"
+                                >
+                                    {action.label}
+                                </button>
+                            ))}
+                        </div>
+                    )}
 
-                    {/* 2. Pending Approvals */}
-                    {pendingRecs.length > 0 && (
-                        <div className="p-2">
-                            <div className="px-2 py-1 text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1">
-                                Suggestions
-                            </div>
-                            {pendingRecs.map((rec, idx) => {
-                                const isSel = navigableItems[selectedIndex]?.id === `rec-${rec.id}`;
-                                return (
-                                    <div
-                                        key={rec.id}
-                                        className={`group flex items-center justify-between px-3 py-2 rounded-md cursor-pointer transition-all ${isSel ? 'bg-blue-500/20 border border-blue-500/30' : 'hover:bg-white/5 border border-transparent'}`}
-                                        onClick={() => {
-                                            const navIndex = navigableItems.findIndex(x => x.id === `rec-${rec.id}`);
-                                            if (navIndex >= 0) {
-                                                setSelectedIndex(navIndex);
-                                            } else {
-                                                setSelectedIndex(idx);
-                                            }
-                                        }}
-                                    >
-                                        <div className="flex items-center gap-3">
-                                            <div className={`w-8 h-8 rounded flex items-center justify-center ${isSel ? 'bg-blue-500 text-white' : 'bg-white/10 text-gray-400'}`}>
-                                                <Zap className="w-4 h-4" />
-                                            </div>
-                                            <div>
-                                                <div className={`text-sm font-medium ${isSel ? 'text-blue-100' : 'text-gray-200'}`}>
-                                                    {rec.title}
-                                                </div>
-                                                <div className="text-xs text-gray-500 line-clamp-1">
-                                                    {rec.summary}
-                                                </div>
-                                                {approveErrors[rec.id] && (
-                                                    <div className="mt-1 text-[10px] text-rose-300">
-                                                        {approveErrors[rec.id]}
-                                                    </div>
-                                                )}
-                                            </div>
-                                        </div>
+                    <div className="mt-2.5 flex items-center justify-between text-gray-300">
+                        <div className="flex items-center gap-1.5">
+                            <button
+                                onClick={() => setComposerMode(prev => prev === "nl" ? "program" : "nl")}
+                                className="p-2 rounded-full hover:bg-white/10 transition-colors"
+                                title="모드 전환"
+                            >
+                                <Plus className="w-4 h-4" />
+                            </button>
+                            <button
+                                onClick={() => {
+                                    setComposerMode("nl");
+                                    setInput(prev => prev.trim() ? `웹 검색: ${prev}` : "웹 검색: ");
+                                    inputRef.current?.focus();
+                                }}
+                                className="p-2 rounded-full hover:bg-white/10 transition-colors"
+                                title="웹 검색 템플릿"
+                            >
+                                <Globe className="w-4 h-4" />
+                            </button>
+                            <button
+                                onClick={() => {
+                                    setComposerMode("nl");
+                                    setInput(prev => prev.trim() ? `요약해줘: ${prev}` : "요약해줘: ");
+                                    inputRef.current?.focus();
+                                }}
+                                className="p-2 rounded-full hover:bg-white/10 transition-colors"
+                                title="요약 템플릿"
+                            >
+                                <Wand2 className="w-4 h-4" />
+                            </button>
+                            <button
+                                onClick={() => setComposerMode("program")}
+                                className="p-2 rounded-full hover:bg-white/10 transition-colors"
+                                title="프로그램 버튼"
+                            >
+                                <AppWindow className="w-4 h-4" />
+                            </button>
+                            <span className="text-xl font-semibold text-gray-300 ml-1">5.2</span>
+                        </div>
 
-                                        <div className="flex items-center gap-2">
-                                            {/* Pin Button for Recs */}
-                                            <button
-                                                onClick={(e) => {
-                                                    e.stopPropagation();
-                                                    handlePin(rec.summary, rec.title);
-                                                }}
-                                                className="p-1.5 rounded-md text-gray-400 hover:text-white hover:bg-white/10 opacity-0 group-hover:opacity-100 transition-all"
-                                                title="Pin to Widget"
-                                            >
-                                                <Pin className="w-3 h-3" />
-                                            </button>
+                        <div className="flex items-center gap-1.5">
+                            {hasDetailContent && (
+                                <button
+                                    onClick={() => setShowDetailPanel(prev => !prev)}
+                                    className="text-xs px-2.5 py-1.5 rounded-full border border-white/15 bg-white/5 hover:bg-white/10 transition-colors"
+                                >
+                                    {showDetailPanel ? "결과 숨기기" : `결과 보기${pendingRecs.length > 0 ? ` (${pendingRecs.length})` : ""}`}
+                                </button>
+                            )}
+                            <button
+                                className="p-2 rounded-full hover:bg-white/10 text-gray-300 transition-colors"
+                                title="record"
+                            >
+                                <Circle className="w-6 h-6" />
+                            </button>
+                            <button
+                                className="p-2 rounded-full hover:bg-white/10 text-gray-300 transition-colors"
+                                title="voice"
+                            >
+                                <Mic className="w-6 h-6" />
+                            </button>
+                        </div>
+                    </div>
+                </div>
 
-                                            <button
-                                                onClick={(e) => {
-                                                    e.stopPropagation();
-                                                    handleApprove(rec.id);
-                                                }}
-                                                disabled={approvingIds.has(rec.id)}
-                                                className={`text-xs px-3 py-1.5 rounded transition-colors border ${isSel
-                                                    ? 'bg-blue-500 text-white border-blue-400'
-                                                    : 'text-gray-200 bg-white/10 border-white/10 hover:bg-white/20'
-                                                    } ${approvingIds.has(rec.id) ? 'opacity-60 cursor-wait' : ''}`}
-                                            >
-                                                {approvingIds.has(rec.id)
-                                                    ? 'Approving…'
-                                                    : approveErrors[rec.id]
-                                                        ? 'Retry'
-                                                        : 'Approve'}
-                                            </button>
-
-                                            <div className="text-[10px] text-gray-500 bg-white/5 px-2 py-1 rounded">
-                                                Enter
-                                            </div>
-                                        </div>
+                <AnimatePresence>
+                    {showDetailPanel && hasDetailContent && (
+                        <motion.div
+                            initial={{ opacity: 0, height: 0 }}
+                            animate={{ opacity: 1, height: "auto" }}
+                            exit={{ opacity: 0, height: 0 }}
+                            className="border-t border-white/10 bg-[#121212]/96"
+                        >
+                            {pendingApproval && (
+                                <div className="px-4 py-3 border-b border-white/5 bg-[#1b1b1b]">
+                                    <div className="text-[11px] uppercase tracking-wider text-amber-400 font-semibold">
+                                        Approval Required
                                     </div>
-                                )
-                            })}
-                        </div>
-                    )}
+                                    <div className="text-sm text-gray-200 mt-1">
+                                        Action: <span className="font-mono">{pendingApproval.action}</span>
+                                    </div>
+                                    <div className="text-xs text-gray-400">
+                                        Risk: {pendingApproval.riskLevel} · Policy: {pendingApproval.policy}
+                                    </div>
+                                    <div className="text-xs text-gray-500 mt-1">
+                                        {pendingApproval.message}
+                                    </div>
+                                    <div className="mt-3 flex flex-wrap gap-2">
+                                        <button
+                                            disabled={approvalBusy}
+                                            onClick={() => handleApprovalDecision("allow_once")}
+                                            className="text-xs px-3 py-1.5 rounded bg-emerald-500/20 text-emerald-200 border border-emerald-500/40 hover:bg-emerald-500/30 disabled:opacity-50"
+                                        >
+                                            Approve once
+                                        </button>
+                                        <button
+                                            disabled={approvalBusy}
+                                            onClick={() => handleApprovalDecision("allow_always")}
+                                            className="text-xs px-3 py-1.5 rounded bg-blue-500/20 text-blue-200 border border-blue-500/40 hover:bg-blue-500/30 disabled:opacity-50"
+                                        >
+                                            Allow always
+                                        </button>
+                                        <button
+                                            disabled={approvalBusy}
+                                            onClick={() => handleApprovalDecision("deny")}
+                                            className="text-xs px-3 py-1.5 rounded bg-rose-500/20 text-rose-200 border border-rose-500/40 hover:bg-rose-500/30 disabled:opacity-50"
+                                        >
+                                            Deny
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
 
-                    {/* 3. Empty State */}
-                    {results.length === 0 && pendingRecs.length === 0 && (
-                        <div className="p-8 text-center text-gray-500">
-                            <Terminal className="w-12 h-12 mx-auto mb-3 opacity-20" />
-                            <p className="text-sm">Type a command or chat with your agent.</p>
-                            <div className="mt-4 flex flex-wrap justify-center gap-2">
-                                <span className="text-xs bg-white/5 px-2 py-1 rounded hover:bg-white/10 cursor-pointer">매일 아침 뉴스 요약</span>
-                                <span className="text-xs bg-white/5 px-2 py-1 rounded hover:bg-white/10 cursor-pointer">화면 클릭해줘</span>
-                                <span className="text-xs bg-white/5 px-2 py-1 rounded hover:bg-white/10 cursor-pointer">이 프로젝트 분석해줘</span>
+                            {lastStatus === "manual_required" && lastPlanId && !pendingApproval && (
+                                <div className="px-4 py-3 border-b border-white/5 bg-[#171717]">
+                                    <div className="text-[11px] uppercase tracking-wider text-sky-400 font-semibold">
+                                        Manual Step Needed
+                                    </div>
+                                    <div className="text-xs text-gray-400 mt-1">
+                                        브라우저에서 수동 작업을 완료한 뒤 Resume을 눌러 다음 단계로 진행하세요.
+                                    </div>
+                                    <div className="mt-3">
+                                        <button
+                                            disabled={loading}
+                                            onClick={handleResume}
+                                            className="text-xs px-3 py-1.5 rounded bg-sky-500/20 text-sky-200 border border-sky-500/40 hover:bg-sky-500/30 disabled:opacity-50"
+                                        >
+                                            Resume
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
+
+                            <div ref={scrollRef} className="max-h-[240px] overflow-y-auto p-3 space-y-2">
+                                <AnimatePresence>
+                                    {results.map((res, i) => {
+                                        const isSelected = navigableItems.findIndex(x => x.id === `res-${i}`) === selectedIndex;
+                                        return (
+                                            <motion.div
+                                                key={i}
+                                                initial={{ opacity: 0, y: 10 }}
+                                                animate={{ opacity: 1, y: 0 }}
+                                                className={`p-3 rounded-lg text-gray-200 text-sm leading-relaxed transition-colors relative group ${isSelected ? 'bg-white/10' : 'bg-[#232323]'}`}
+                                            >
+                                                <ReactMarkdown components={markdownComponents}>
+                                                    {res.content}
+                                                </ReactMarkdown>
+                                                <button
+                                                    onClick={() => handlePin(res.content)}
+                                                    className="absolute top-2 right-2 p-1.5 rounded-md text-gray-400 hover:text-white hover:bg-white/10 opacity-0 group-hover:opacity-100 transition-all"
+                                                    title="Pin to Widget"
+                                                >
+                                                    <Pin className="w-4 h-4" />
+                                                </button>
+                                            </motion.div>
+                                        )
+                                    })}
+                                </AnimatePresence>
+
+                                {pendingRecs.length > 0 && (
+                                    <div className="pt-1">
+                                        <div className="px-1 py-1 text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-1">
+                                            Suggestions
+                                        </div>
+                                        {pendingRecs.map((rec, idx) => {
+                                            const isSel = navigableItems[selectedIndex]?.id === `rec-${rec.id}`;
+                                            return (
+                                                <div
+                                                    key={rec.id}
+                                                    className={`group flex items-center justify-between px-3 py-2 rounded-md cursor-pointer transition-all mb-1 ${isSel ? 'bg-blue-500/20 border border-blue-500/30' : 'hover:bg-white/5 border border-transparent'}`}
+                                                    onClick={() => {
+                                                        const navIndex = navigableItems.findIndex(x => x.id === `rec-${rec.id}`);
+                                                        if (navIndex >= 0) {
+                                                            setSelectedIndex(navIndex);
+                                                        } else {
+                                                            setSelectedIndex(idx);
+                                                        }
+                                                    }}
+                                                >
+                                                    <div className="flex items-center gap-3">
+                                                        <div className={`w-8 h-8 rounded flex items-center justify-center ${isSel ? 'bg-blue-500 text-white' : 'bg-white/10 text-gray-400'}`}>
+                                                            <Zap className="w-4 h-4" />
+                                                        </div>
+                                                        <div>
+                                                            <div className={`text-sm font-medium ${isSel ? 'text-blue-100' : 'text-gray-200'}`}>
+                                                                {rec.title}
+                                                            </div>
+                                                            <div className="text-xs text-gray-500 line-clamp-1">
+                                                                {rec.summary}
+                                                            </div>
+                                                            {approveErrors[rec.id] && (
+                                                                <div className="mt-1 text-[10px] text-rose-300">
+                                                                    {approveErrors[rec.id]}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    </div>
+
+                                                    <div className="flex items-center gap-2">
+                                                        <button
+                                                            onClick={(e) => {
+                                                                e.stopPropagation();
+                                                                handlePin(rec.summary, rec.title);
+                                                            }}
+                                                            className="p-1.5 rounded-md text-gray-400 hover:text-white hover:bg-white/10 opacity-0 group-hover:opacity-100 transition-all"
+                                                            title="Pin to Widget"
+                                                        >
+                                                            <Pin className="w-3 h-3" />
+                                                        </button>
+
+                                                        <button
+                                                            onClick={(e) => {
+                                                                e.stopPropagation();
+                                                                handleApprove(rec.id);
+                                                            }}
+                                                            disabled={approvingIds.has(rec.id)}
+                                                            className={`text-xs px-3 py-1.5 rounded transition-colors border ${isSel
+                                                                ? 'bg-blue-500 text-white border-blue-400'
+                                                                : 'text-gray-200 bg-white/10 border-white/10 hover:bg-white/20'
+                                                                } ${approvingIds.has(rec.id) ? 'opacity-60 cursor-wait' : ''}`}
+                                                        >
+                                                            {approvingIds.has(rec.id)
+                                                                ? 'Approving…'
+                                                                : approveErrors[rec.id]
+                                                                    ? 'Retry'
+                                                                    : 'Approve'}
+                                                        </button>
+
+                                                        <div className="text-[10px] text-gray-500 bg-white/5 px-2 py-1 rounded">
+                                                            Enter
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            )
+                                        })}
+                                    </div>
+                                )}
+
+                                {results.length === 0 && pendingRecs.length === 0 && !pendingApproval && (
+                                    <div className="p-6 text-center text-gray-500">
+                                        <Terminal className="w-10 h-10 mx-auto mb-2 opacity-20" />
+                                        <p className="text-sm">결과가 준비되면 여기에 표시됩니다.</p>
+                                    </div>
+                                )}
                             </div>
-                        </div>
+                        </motion.div>
                     )}
-                </div>
-
-                {/* Footer Status */}
-                <div className="px-4 py-2 border-t border-white/5 bg-[#1e1e1e] flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                        <div className="w-2 h-2 rounded-full bg-green-500 shadow-lg shadow-green-500/50"></div>
-                        <span className="text-xs text-gray-500">Engine Active</span>
-                    </div>
-                    <div className="flex gap-4 text-xs text-gray-600">
-                        <span className="hover:text-gray-400 cursor-pointer">Settings</span>
-                        <span className="hover:text-gray-400 cursor-pointer">Help</span>
-                    </div>
-                </div>
+                </AnimatePresence>
             </motion.div>
         </div>
     );

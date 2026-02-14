@@ -43,10 +43,12 @@ pub fn activate_app(app: &str) -> Result<String> {
         r#"
     tell application "{}"
         activate
-        repeat until frontmost
+        set _tries to 0
+        repeat while (not frontmost) and _tries < 40
             delay 0.1
+            set _tries to _tries + 1
         end repeat
-        delay 0.5
+        delay 0.2
     end tell
     "#,
         app

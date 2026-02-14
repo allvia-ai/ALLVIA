@@ -257,33 +257,88 @@ impl CrossAppBridge {
         println!("      🚀 [Bridge] Opening '{}' via CLI...", app_name);
 
         // Prefer Peekaboo app launch if available (stronger focus + permissions)
-        if crate::peekaboo_cli::is_available() {
-            let status = std::process::Command::new("peekaboo")
+        let peekaboo_enabled = std::env::var("STEER_ENABLE_PEEKABOO_LAUNCH")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
+        if peekaboo_enabled && crate::peekaboo_cli::is_available() {
+            let timeout_ms = std::env::var("STEER_PEEKABOO_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(4000);
+
+            let launch = std::process::Command::new("peekaboo")
                 .arg("app")
                 .arg("launch")
                 .arg(app_name)
-                .status();
-            if let Ok(status) = status {
-                if status.success() {
-                    if Self::wait_for_frontmost(app_name, 8, 200) {
-                        println!("🔀 [Bridge] Switched to: {}", app_name);
-                        return Ok(());
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+
+            if let Ok(mut child) = launch {
+                let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+                let mut launch_ok = false;
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            launch_ok = status.success();
+                            break;
+                        }
+                        Ok(None) => {
+                            if Instant::now() >= deadline {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(80));
+                        }
+                        Err(_) => break,
                     }
+                }
+
+                if launch_ok && Self::wait_for_frontmost(app_name, 8, 200) {
+                    println!("🔀 [Bridge] Switched to: {}", app_name);
+                    return Ok(());
                 }
             }
         }
 
-        let status = std::process::Command::new("open")
+        let open_timeout_ms = std::env::var("STEER_OPEN_APP_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(5000);
+        let mut open_ok = false;
+        if let Ok(mut child) = std::process::Command::new("open")
             .arg("-a")
             .arg(app_name)
-            .status()?;
-
-        if !status.success() {
-            return Err(anyhow::anyhow!(
-                "Failed to open app '{}' (Exit code: {:?})",
-                app_name,
-                status.code()
-            ));
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            let deadline = Instant::now() + Duration::from_millis(open_timeout_ms);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        open_ok = status.success();
+                        break;
+                    }
+                    Ok(None) => {
+                        if Instant::now() >= deadline {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(80));
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        if !open_ok {
+            println!(
+                "      ⚠️ [Bridge] 'open -a {}' timeout/failure; falling back to AppleScript activation.",
+                app_name
+            );
         }
 
         if !Self::wait_for_frontmost(app_name, 8, 200) {

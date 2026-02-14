@@ -1,7 +1,7 @@
 use anyhow::Result;
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct NotionPage {
@@ -30,31 +30,112 @@ impl NotionClient {
         Ok(Self::new(&token))
     }
 
-    /// Create a new page in a database
+    async fn database_title_property_name(&self, database_id: &str) -> Result<String> {
+        let url = format!("https://api.notion.com/v1/databases/{}", database_id);
+        let resp = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Notion-Version", "2022-06-28")
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await?;
+            return Err(anyhow::anyhow!("Notion Database Error: {}", err));
+        }
+
+        let db_json: Value = resp.json().await?;
+        if let Some(properties) = db_json.get("properties").and_then(|v| v.as_object()) {
+            for (name, prop) in properties {
+                if prop.get("type").and_then(|v| v.as_str()) == Some("title") {
+                    return Ok(name.clone());
+                }
+            }
+        }
+        Err(anyhow::anyhow!(
+            "Notion Database Error: title property not found in database {}",
+            database_id
+        ))
+    }
+
+    fn extract_title_from_property(prop: &Value) -> Option<String> {
+        let title_arr = prop.get("title").and_then(|v| v.as_array())?;
+        let mut parts: Vec<String> = Vec::new();
+        for seg in title_arr {
+            if let Some(text) = seg.get("plain_text").and_then(|v| v.as_str()).or_else(|| {
+                seg.get("text")
+                    .and_then(|v| v.get("content"))
+                    .and_then(|v| v.as_str())
+            }) {
+                let t = text.trim();
+                if !t.is_empty() {
+                    parts.push(t.to_string());
+                }
+            }
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(""))
+        }
+    }
+
+    fn extract_title_from_properties(properties: &Value) -> String {
+        if let Some(props) = properties.as_object() {
+            for prop in props.values() {
+                if prop.get("type").and_then(|v| v.as_str()) == Some("title") {
+                    if let Some(title) = Self::extract_title_from_property(prop) {
+                        return title;
+                    }
+                }
+            }
+        }
+        "Untitled".to_string()
+    }
+
+    /// Create a new page in a database using paragraph content.
     pub async fn create_page(
         &self,
         database_id: &str,
         title: &str,
         content: &str,
     ) -> Result<String> {
+        let children = vec![json!({
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {
+                "rich_text": [{ "type": "text", "text": { "content": content } }]
+            }
+        })];
+        self.create_database_page_with_children(database_id, title, &children)
+            .await
+    }
+
+    /// Create a new page in a database using explicit block children.
+    pub async fn create_database_page_with_children(
+        &self,
+        database_id: &str,
+        title: &str,
+        children: &[Value],
+    ) -> Result<String> {
         let url = "https://api.notion.com/v1/pages";
+        let title_prop = self
+            .database_title_property_name(database_id)
+            .await
+            .unwrap_or_else(|_| "Name".to_string());
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            title_prop,
+            json!({
+                "title": [{ "text": { "content": title } }]
+            }),
+        );
 
         let body = json!({
             "parent": { "database_id": database_id },
-            "properties": {
-                "이름": {
-                    "title": [{ "text": { "content": title } }]
-                }
-            },
-            "children": [
-                {
-                    "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {
-                        "rich_text": [{ "type": "text", "text": { "content": content } }]
-                    }
-                }
-            ]
+            "properties": Value::Object(properties),
+            "children": children
         });
 
         let resp = self
@@ -70,6 +151,44 @@ impl NotionClient {
         if !resp.status().is_success() {
             let err = resp.text().await?;
             return Err(anyhow::anyhow!("Notion API Error: {}", err));
+        }
+
+        let resp_json: serde_json::Value = resp.json().await?;
+        let page_id = resp_json["id"].as_str().unwrap_or("unknown").to_string();
+        Ok(page_id)
+    }
+
+    /// Create a child page under a parent page using explicit block children.
+    pub async fn create_child_page_with_children(
+        &self,
+        parent_page_id: &str,
+        title: &str,
+        children: &[Value],
+    ) -> Result<String> {
+        let url = "https://api.notion.com/v1/pages";
+        let body = json!({
+            "parent": { "page_id": parent_page_id },
+            "properties": {
+                "title": {
+                    "title": [{ "text": { "content": title } }]
+                }
+            },
+            "children": children
+        });
+
+        let resp = self
+            .client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Notion-Version", "2022-06-28")
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await?;
+            return Err(anyhow::anyhow!("Notion Child Page Error: {}", err));
         }
 
         let resp_json: serde_json::Value = resp.json().await?;
@@ -97,12 +216,7 @@ impl NotionClient {
         let page_json: serde_json::Value = page_resp.json().await?;
 
         // Extract title from properties
-        let title = page_json["properties"]["이름"]["title"]
-            .as_array()
-            .and_then(|arr| arr.first())
-            .and_then(|t| t["text"]["content"].as_str())
-            .unwrap_or("Untitled")
-            .to_string();
+        let title = Self::extract_title_from_properties(&page_json["properties"]);
 
         // 2. Get page blocks (content)
         let blocks_url = format!("https://api.notion.com/v1/blocks/{}/children", page_id);
@@ -141,6 +255,10 @@ impl NotionClient {
     /// [Phase 28] Query a database for pages
     pub async fn query_database(&self, database_id: &str, limit: u32) -> Result<Vec<NotionPage>> {
         let url = format!("https://api.notion.com/v1/databases/{}/query", database_id);
+        let title_prop = self
+            .database_title_property_name(database_id)
+            .await
+            .unwrap_or_else(|_| "Name".to_string());
 
         let body = json!({
             "page_size": limit
@@ -166,12 +284,15 @@ impl NotionClient {
         if let Some(results) = resp_json["results"].as_array() {
             for page in results {
                 let id = page["id"].as_str().unwrap_or("").to_string();
-                let title = page["properties"]["이름"]["title"]
-                    .as_array()
-                    .and_then(|arr| arr.first())
-                    .and_then(|t| t["text"]["content"].as_str())
-                    .unwrap_or("Untitled")
-                    .to_string();
+                let title = page
+                    .get("properties")
+                    .and_then(|props| props.get(&title_prop))
+                    .and_then(Self::extract_title_from_property)
+                    .unwrap_or_else(|| {
+                        page.get("properties")
+                            .map(Self::extract_title_from_properties)
+                            .unwrap_or_else(|| "Untitled".to_string())
+                    });
 
                 pages.push(NotionPage {
                     id,
@@ -190,7 +311,6 @@ impl NotionClient {
             return Ok(());
         }
 
-        let url = format!("https://api.notion.com/v1/blocks/{}/children", page_id);
         let children: Vec<serde_json::Value> = paragraphs
             .iter()
             .filter_map(|p| {
@@ -217,7 +337,17 @@ impl NotionClient {
             return Ok(());
         }
 
-        let body = json!({ "children": children });
+        self.append_blocks(page_id, &children).await
+    }
+
+    /// Append arbitrary blocks to an existing page.
+    pub async fn append_blocks(&self, page_id: &str, blocks: &[Value]) -> Result<()> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
+        let url = format!("https://api.notion.com/v1/blocks/{}/children", page_id);
+        let body = json!({ "children": blocks });
         let resp = self
             .client
             .patch(&url)

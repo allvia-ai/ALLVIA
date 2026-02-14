@@ -40,6 +40,7 @@ pub mod send_policy;
 pub mod shell_actions;
 pub mod shell_analysis;
 pub mod visual_driver;
+pub mod workflow_intake;
 pub mod workflow_schema;
 
 pub mod collector_pipeline;
@@ -55,6 +56,7 @@ pub mod judgment;
 pub mod performance_verification;
 pub mod quality_scorer;
 pub mod release_gate;
+pub mod semantic_contract;
 pub mod semantic_verification;
 pub mod singleton_lock;
 pub mod static_checks;

@@ -796,9 +796,22 @@ impl N8nApi {
             parse_bool_env_with_default("STEER_N8N_ALLOW_NAME_ID_FALLBACK", false);
         if allow_name_fallback {
             if let Some(id) = name_matches.first() {
+                if name_matches.len() > 1
+                    && !parse_bool_env_with_default(
+                        "STEER_N8N_ALLOW_AMBIGUOUS_NAME_ID_FALLBACK",
+                        false,
+                    )
+                {
+                    return Err(anyhow::anyhow!(
+                        "Ambiguous name-based fallback for '{}': {} matches. \
+Set STEER_N8N_ALLOW_AMBIGUOUS_NAME_ID_FALLBACK=1 only for controlled test environments.",
+                        name,
+                        name_matches.len()
+                    ));
+                }
                 if name_matches.len() > 1 {
                     eprintln!(
-                        "⚠️ Multiple workflows matched by name '{}' after CLI import; using first exported id={}",
+                        "⚠️ Ambiguous name fallback explicitly allowed for '{}'; using first exported id={}",
                         name, id
                     );
                 }
@@ -1044,8 +1057,10 @@ Set STEER_N8N_ALLOW_NAME_ID_FALLBACK=1 to allow name-based fallback.",
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[tokio::test]
+    #[serial]
     async fn create_workflow_uses_mock_path_when_enabled() {
         unsafe {
             std::env::set_var("STEER_N8N_MOCK", "1");
