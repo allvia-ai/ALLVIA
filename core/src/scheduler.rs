@@ -1,9 +1,21 @@
-use crate::db;
 use crate::llm_gateway::LLMClient;
+use crate::{db, workflow_intake};
 use cron::Schedule;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
+
+struct RoutineClaimGuard {
+    routine_id: i64,
+    owner: String,
+}
+
+impl Drop for RoutineClaimGuard {
+    fn drop(&mut self) {
+        let _ = db::release_routine_execution(self.routine_id, Some(self.owner.as_str()));
+    }
+}
 
 pub struct Scheduler {
     llm: Arc<dyn LLMClient>,
@@ -16,6 +28,12 @@ impl Scheduler {
 
     pub fn start(&self) {
         let llm = self.llm.clone();
+        let active_routines = Arc::new(tokio::sync::Mutex::new(HashSet::<i64>::new()));
+        let claim_owner = format!(
+            "scheduler:{}:{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_millis()
+        );
 
         tokio::spawn(async move {
             println!("⏰ Routine Scheduler started (Tick: 60s)");
@@ -27,10 +45,69 @@ impl Scheduler {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30);
+            let collector_handoff_auto_consume =
+                std::env::var("STEER_COLLECTOR_HANDOFF_AUTOCONSUME")
+                    .ok()
+                    .map(|v| {
+                        matches!(
+                            v.trim().to_lowercase().as_str(),
+                            "1" | "true" | "yes" | "on"
+                        )
+                    })
+                    .unwrap_or(true);
+            let workflow_reconcile_enabled = std::env::var("STEER_WORKFLOW_RECONCILE_ENABLED")
+                .ok()
+                .map(|v| {
+                    matches!(
+                        v.trim().to_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(true);
+            let workflow_reconcile_limit = std::env::var("STEER_WORKFLOW_RECONCILE_LIMIT")
+                .ok()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .filter(|v| *v >= 1)
+                .unwrap_or(20);
 
             loop {
                 // Check every 60 seconds
                 time::sleep(Duration::from_secs(60)).await;
+
+                if collector_handoff_auto_consume {
+                    match workflow_intake::ingest_latest_collector_handoff(None) {
+                        Ok(outcome) => {
+                            if outcome.status != "noop" {
+                                println!(
+                                    "📥 Collector handoff ingest: status={} detail={}",
+                                    outcome.status, outcome.detail
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("⚠️ Collector handoff ingest error: {}", e);
+                        }
+                    }
+                }
+
+                if workflow_reconcile_enabled {
+                    match db::reconcile_workflow_provision_ops(workflow_reconcile_limit) {
+                        Ok(outcomes) => {
+                            if !outcomes.is_empty() {
+                                println!(
+                                    "🧩 Workflow provision reconcile processed {} op(s)",
+                                    outcomes.len()
+                                );
+                                for line in outcomes.iter().take(5) {
+                                    println!("   - {}", line);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("⚠️ Workflow provision reconcile error: {}", e);
+                        }
+                    }
+                }
 
                 // --- Proactive Pattern Check (Every 10 mins approx) ---
                 // Ideally use a timestamp check, but for MVP checking random chance or counter
@@ -53,14 +130,52 @@ impl Scheduler {
                 let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(5));
 
                 for routine in due {
+                    {
+                        let mut active = active_routines.lock().await;
+                        if active.contains(&routine.id) {
+                            println!(
+                                "⏭️ Skipping Routine #{} (already running): {}",
+                                routine.id, routine.name
+                            );
+                            continue;
+                        }
+                        active.insert(routine.id);
+                    }
+
+                    match db::claim_routine_execution(routine.id, &claim_owner) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            println!(
+                                "⏭️ Skipping Routine #{} (claimed by another runner): {}",
+                                routine.id, routine.name
+                            );
+                            let mut active = active_routines.lock().await;
+                            active.remove(&routine.id);
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "⚠️ Failed to claim Routine #{} before execution: {}",
+                                routine.id, e
+                            );
+                            let mut active = active_routines.lock().await;
+                            active.remove(&routine.id);
+                            continue;
+                        }
+                    }
+
                     let permit = match semaphore.clone().acquire_owned().await {
                         Ok(p) => p,
                         Err(e) => {
                             eprintln!("⚠️ Semaphore acquire failed: {}", e);
+                            let _ = db::release_routine_execution(routine.id, Some(&claim_owner));
+                            let mut active = active_routines.lock().await;
+                            active.remove(&routine.id);
                             continue;
                         }
                     };
                     println!("⏰ Executing Routine #{}: {}", routine.id, routine.name);
+                    let routine_id = routine.id;
                     let run_id = db::create_routine_run(routine.id).ok();
 
                     // Calculate next run FIRST... (omitted lines 43-53 remain same, but inside loop)
@@ -73,8 +188,14 @@ impl Scheduler {
 
                     let prompt = routine.prompt.clone();
                     let llm_clone = llm.clone();
+                    let active_routines_for_task = active_routines.clone();
+                    let claim_owner_for_task = claim_owner.clone();
 
                     tokio::spawn(async move {
+                        let _claim_guard = RoutineClaimGuard {
+                            routine_id,
+                            owner: claim_owner_for_task,
+                        };
                         let _permit = permit; // Drop permit when task finishes
                         println!("   ▶️ running routine logic: '{}'...", prompt);
 
@@ -131,6 +252,8 @@ impl Scheduler {
                                 }
                             }
                         }
+                        let mut active = active_routines_for_task.lock().await;
+                        active.remove(&routine_id);
                     });
                 }
             }

@@ -26,6 +26,23 @@ fn get_db_lock() -> std::sync::MutexGuard<'static, Option<Connection>> {
     }
 }
 
+pub fn current_db_path() -> Option<String> {
+    let mut lock = get_db_lock();
+    let conn = lock.as_mut()?;
+    let mut stmt = conn.prepare("PRAGMA database_list").ok()?;
+    let mut rows = stmt.query([]).ok()?;
+    while let Ok(Some(row)) = rows.next() {
+        let name: String = row.get(1).ok()?;
+        if name == "main" {
+            let path: String = row.get(2).ok()?;
+            if !path.trim().is_empty() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
     let sql = format!("PRAGMA table_info({})", table);
     let mut stmt = match conn.prepare(&sql) {
@@ -193,6 +210,8 @@ pub fn init() -> anyhow::Result<()> {
             enabled BOOLEAN NOT NULL DEFAULT 1,
             last_run TEXT,
             next_run TEXT,
+            run_claimed_at TEXT,
+            run_claim_owner TEXT,
             created_at TEXT NOT NULL
         )",
         [],
@@ -354,6 +373,7 @@ pub fn init() -> anyhow::Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS task_runs (
             run_id TEXT PRIMARY KEY,
+            plan_id TEXT,
             created_at TEXT NOT NULL,
             finished_at TEXT,
             intent TEXT NOT NULL,
@@ -395,6 +415,32 @@ pub fn init() -> anyhow::Result<()> {
         [],
     )?;
     conn.execute(
+        "CREATE TABLE IF NOT EXISTS collector_handoff_receipts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            received_at TEXT NOT NULL,
+            package_id TEXT NOT NULL,
+            collector_row_id INTEGER,
+            status TEXT NOT NULL,
+            recommendation_id INTEGER,
+            detail TEXT
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS workflow_provision_ops (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recommendation_id INTEGER NOT NULL,
+            claim_token TEXT,
+            status TEXT NOT NULL,
+            workflow_id TEXT,
+            workflow_json TEXT,
+            error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )",
+        [],
+    )?;
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_task_stage_runs_run_id
          ON task_stage_runs(run_id, stage_order)",
         [],
@@ -402,6 +448,26 @@ pub fn init() -> anyhow::Result<()> {
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_task_stage_assertions_run_id
          ON task_stage_assertions(run_id, stage_name)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_collector_handoff_receipts_package
+         ON collector_handoff_receipts(package_id, received_at)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_collector_handoff_receipts_status
+         ON collector_handoff_receipts(status, received_at)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_workflow_provision_ops_status
+         ON workflow_provision_ops(status, updated_at)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_workflow_provision_ops_recommendation
+         ON workflow_provision_ops(recommendation_id, updated_at)",
         [],
     )?;
 
@@ -445,6 +511,19 @@ pub fn init() -> anyhow::Result<()> {
         ensure_column(conn, "recommendations", "pattern_id", "TEXT");
         ensure_column(conn, "recommendations", "last_error", "TEXT");
         ensure_column(conn, "exec_approvals", "decision", "TEXT");
+        ensure_column(conn, "task_runs", "plan_id", "TEXT");
+        ensure_column(conn, "routines", "run_claimed_at", "TEXT");
+        ensure_column(conn, "routines", "run_claim_owner", "TEXT");
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_runs_plan_status
+             ON task_runs(plan_id, status, created_at)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_routines_due_claim
+             ON routines(enabled, next_run, run_claimed_at)",
+            [],
+        );
         // Keep recommendation status model strict: pending/approved/rejected only.
         let _ = conn.execute(
             "UPDATE recommendations
@@ -543,6 +622,100 @@ pub fn get_due_routines() -> Result<Vec<Routine>> {
     } else {
         Ok(Vec::new())
     }
+}
+
+fn parse_routine_claim_stale_minutes() -> i64 {
+    std::env::var("STEER_ROUTINE_CLAIM_STALE_MINUTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(120)
+}
+
+fn parse_ts_utc(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+pub fn claim_routine_execution(routine_id: i64, owner: &str) -> Result<bool> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        let now_dt = chrono::Utc::now();
+        let now = now_dt.to_rfc3339();
+        let stale_before = now_dt - chrono::Duration::minutes(parse_routine_claim_stale_minutes());
+
+        let tx = conn.transaction()?;
+        let mut found = false;
+        let mut enabled_raw: i64 = 0;
+        let mut next_run: Option<String> = None;
+        let mut claimed_at: Option<String> = None;
+        {
+            let mut stmt = tx.prepare(
+                "SELECT enabled, next_run, run_claimed_at
+                 FROM routines
+                 WHERE id = ?1",
+            )?;
+            let mut rows = stmt.query(params![routine_id])?;
+            if let Some(row) = rows.next()? {
+                found = true;
+                enabled_raw = row.get(0)?;
+                next_run = row.get(1)?;
+                claimed_at = row.get(2)?;
+            }
+        }
+        if !found {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        if enabled_raw == 0 {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        if let Some(next) = next_run.as_deref().and_then(parse_ts_utc) {
+            if next > now_dt {
+                tx.rollback()?;
+                return Ok(false);
+            }
+        }
+        if let Some(claimed) = claimed_at.as_deref().and_then(parse_ts_utc) {
+            if claimed > stale_before {
+                tx.rollback()?;
+                return Ok(false);
+            }
+        }
+        tx.execute(
+            "UPDATE routines
+             SET run_claimed_at = ?1, run_claim_owner = ?2
+             WHERE id = ?3",
+            params![now, owner, routine_id],
+        )?;
+        tx.commit()?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+pub fn release_routine_execution(routine_id: i64, owner: Option<&str>) -> Result<()> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        if let Some(owner_value) = owner {
+            conn.execute(
+                "UPDATE routines
+                 SET run_claimed_at = NULL, run_claim_owner = NULL
+                 WHERE id = ?1 AND (run_claim_owner = ?2 OR run_claim_owner IS NULL)",
+                params![routine_id, owner_value],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE routines
+                 SET run_claimed_at = NULL, run_claim_owner = NULL
+                 WHERE id = ?1",
+                params![routine_id],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 pub fn update_routine_execution(id: i64, next: Option<String>) -> Result<()> {
@@ -804,6 +977,30 @@ pub struct NLRunMetrics {
     pub blocked: i64,
     pub error: i64,
     pub success_rate: f64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CollectorHandoffReceiptRecord {
+    pub id: i64,
+    pub received_at: String,
+    pub package_id: String,
+    pub collector_row_id: Option<i64>,
+    pub status: String,
+    pub recommendation_id: Option<i64>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WorkflowProvisionOpRecord {
+    pub id: i64,
+    pub recommendation_id: i64,
+    pub claim_token: Option<String>,
+    pub status: String,
+    pub workflow_id: Option<String>,
+    pub workflow_json: Option<String>,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RoutineRun {
@@ -1168,7 +1365,12 @@ pub fn upsert_approval_decision(
     if let Some(conn) = lock.as_mut() {
         ensure_approval_decisions_table(conn);
         let now = chrono::Utc::now();
-        let bounded_ttl = ttl_seconds.clamp(1, 86_400);
+        let max_ttl_seconds = std::env::var("STEER_APPROVAL_DECISION_MAX_TTL_SECONDS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .map(|v| v.max(60))
+            .unwrap_or(60 * 60 * 24 * 365);
+        let bounded_ttl = ttl_seconds.clamp(1, max_ttl_seconds);
         let created_at = now.to_rfc3339();
         let expires_at = (now + chrono::Duration::seconds(bounded_ttl)).to_rfc3339();
         conn.execute(
@@ -1221,6 +1423,7 @@ pub fn get_active_approval_decision(decision_key: &str) -> Result<Option<ActiveA
 }
 
 pub fn add_exec_allowlist(pattern: &str, cwd: Option<&str>) -> Result<i64> {
+    validate_exec_allowlist_pattern(pattern)?;
     let mut lock = get_db_lock();
     if let Some(conn) = lock.as_mut() {
         let created_at = chrono::Utc::now().to_rfc3339();
@@ -1600,14 +1803,63 @@ pub fn create_task_run(run_id: &str, intent: &str, prompt: &str, status: &str) -
         let created_at = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "INSERT OR REPLACE INTO task_runs (
-                run_id, created_at, finished_at, intent, prompt,
+                run_id, plan_id, created_at, finished_at, intent, prompt,
                 planner_complete, execution_complete, business_complete,
                 status, summary, details
-             ) VALUES (?1, ?2, NULL, ?3, ?4, 0, 0, 0, ?5, NULL, NULL)",
+             ) VALUES (?1, NULL, ?2, NULL, ?3, ?4, 0, 0, 0, ?5, NULL, NULL)",
             params![run_id, created_at, intent, prompt, status],
         )?;
     }
     Ok(())
+}
+
+fn parse_task_run_stale_minutes() -> i64 {
+    std::env::var("STEER_TASK_RUN_STALE_MINUTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(120)
+}
+
+pub fn claim_task_run(
+    plan_id: &str,
+    run_id: &str,
+    intent: &str,
+    prompt: &str,
+    status: &str,
+) -> Result<bool> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let stale_window = format!("-{} minutes", parse_task_run_stale_minutes());
+        let tx = conn.transaction()?;
+        let inflight_count: i64 = tx.query_row(
+            "SELECT COUNT(1)
+             FROM task_runs
+             WHERE plan_id = ?1
+               AND status = 'running'
+               AND (
+                 finished_at IS NULL
+                 OR julianday(created_at) >= julianday('now', ?2)
+               )",
+            params![plan_id, stale_window],
+            |row| row.get(0),
+        )?;
+        if inflight_count > 0 {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO task_runs (
+                run_id, plan_id, created_at, finished_at, intent, prompt,
+                planner_complete, execution_complete, business_complete,
+                status, summary, details
+             ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, 0, 0, 0, ?6, NULL, NULL)",
+            params![run_id, plan_id, created_at, intent, prompt, status],
+        )?;
+        tx.commit()?;
+    }
+    Ok(true)
 }
 
 pub fn record_task_stage_run(
@@ -1897,6 +2149,141 @@ pub fn list_nl_runs(limit: i64) -> Result<Vec<NLRun>> {
     Ok(Vec::new())
 }
 
+pub fn record_collector_handoff_receipt(
+    package_id: &str,
+    collector_row_id: Option<i64>,
+    status: &str,
+    recommendation_id: Option<i64>,
+    detail: Option<&str>,
+) -> Result<()> {
+    let package_id = package_id.trim();
+    if package_id.is_empty() {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "package_id must not be empty".to_string(),
+        ));
+    }
+    let status = status.trim().to_lowercase();
+    if status.is_empty() {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "status must not be empty".to_string(),
+        ));
+    }
+
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        let received_at = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO collector_handoff_receipts (
+                received_at, package_id, collector_row_id, status, recommendation_id, detail
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                received_at,
+                package_id,
+                collector_row_id,
+                status,
+                recommendation_id,
+                detail
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn list_collector_handoff_receipts(limit: i64) -> Result<Vec<CollectorHandoffReceiptRecord>> {
+    let bounded_limit = limit.clamp(1, 500);
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        let mut stmt = conn.prepare(
+            "SELECT id, received_at, package_id, collector_row_id, status, recommendation_id, detail
+             FROM collector_handoff_receipts
+             ORDER BY id DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![bounded_limit], |row| {
+            Ok(CollectorHandoffReceiptRecord {
+                id: row.get(0)?,
+                received_at: row.get(1)?,
+                package_id: row.get(2)?,
+                collector_row_id: row.get(3).ok(),
+                status: row.get(4)?,
+                recommendation_id: row.get(5).ok(),
+                detail: row.get(6).ok(),
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        return Ok(out);
+    }
+    Ok(Vec::new())
+}
+
+pub fn list_workflow_provision_ops(
+    limit: i64,
+    status: Option<&str>,
+) -> Result<Vec<WorkflowProvisionOpRecord>> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        let capped = limit.clamp(1, 500);
+        let mut rows_out = Vec::new();
+        match status.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(status_filter) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, recommendation_id, claim_token, status, workflow_id, workflow_json, error, created_at, updated_at
+                     FROM workflow_provision_ops
+                     WHERE status = ?1
+                     ORDER BY updated_at DESC
+                     LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![status_filter, capped], |row| {
+                    Ok(WorkflowProvisionOpRecord {
+                        id: row.get(0)?,
+                        recommendation_id: row.get(1)?,
+                        claim_token: row.get(2)?,
+                        status: row.get(3)?,
+                        workflow_id: row.get(4)?,
+                        workflow_json: row.get(5)?,
+                        error: row.get(6)?,
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
+                    })
+                })?;
+                for row in rows {
+                    rows_out.push(row?);
+                }
+            }
+            None => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, recommendation_id, claim_token, status, workflow_id, workflow_json, error, created_at, updated_at
+                     FROM workflow_provision_ops
+                     ORDER BY updated_at DESC
+                     LIMIT ?1",
+                )?;
+                let rows = stmt.query_map(params![capped], |row| {
+                    Ok(WorkflowProvisionOpRecord {
+                        id: row.get(0)?,
+                        recommendation_id: row.get(1)?,
+                        claim_token: row.get(2)?,
+                        status: row.get(3)?,
+                        workflow_id: row.get(4)?,
+                        workflow_json: row.get(5)?,
+                        error: row.get(6)?,
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
+                    })
+                })?;
+                for row in rows {
+                    rows_out.push(row?);
+                }
+            }
+        }
+        return Ok(rows_out);
+    }
+    Ok(Vec::new())
+}
+
 pub fn get_nl_run_metrics(limit: i64) -> Result<NLRunMetrics> {
     let mut lock = get_db_lock();
     if let Some(conn) = lock.as_mut() {
@@ -1983,20 +2370,34 @@ pub fn is_exec_allowlisted(command: &str, cwd: Option<&str>) -> Result<bool> {
     Ok(false)
 }
 
-fn exec_pattern_match(pattern: &str, command: &str) -> bool {
+fn exec_pattern_match_with_flags(
+    pattern: &str,
+    command: &str,
+    allow_global: bool,
+    allow_regex: bool,
+) -> bool {
     let trimmed = pattern.trim();
     if trimmed.is_empty() {
         return false;
     }
     if trimmed == "*" || trimmed.eq_ignore_ascii_case("all") {
+        if !allow_global {
+            return false;
+        }
         return true;
     }
     if let Some(rest) = trimmed.strip_prefix("re:") {
+        if !allow_regex {
+            return false;
+        }
         if let Ok(re) = regex::Regex::new(rest) {
             return re.is_match(command);
         }
     }
     if trimmed.starts_with('/') && trimmed.ends_with('/') && trimmed.len() > 2 {
+        if !allow_regex {
+            return false;
+        }
         let body = &trimmed[1..trimmed.len() - 1];
         if let Ok(re) = regex::Regex::new(body) {
             return re.is_match(command);
@@ -2007,6 +2408,60 @@ fn exec_pattern_match(pattern: &str, command: &str) -> bool {
         return command.starts_with(prefix);
     }
     command == trimmed
+}
+
+fn exec_pattern_match(pattern: &str, command: &str) -> bool {
+    exec_pattern_match_with_flags(
+        pattern,
+        command,
+        crate::env_flag("STEER_EXEC_ALLOWLIST_ALLOW_GLOBAL"),
+        crate::env_flag("STEER_EXEC_ALLOWLIST_ALLOW_REGEX"),
+    )
+}
+
+fn validate_exec_allowlist_pattern_with_flags(
+    pattern: &str,
+    allow_global: bool,
+    allow_regex: bool,
+) -> Result<()> {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "exec allowlist pattern rejected: empty pattern".to_string(),
+        ));
+    }
+    if trimmed.contains('\n') || trimmed.contains('\r') {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "exec allowlist pattern rejected: multiline pattern is not allowed".to_string(),
+        ));
+    }
+    if trimmed == "*" || trimmed.eq_ignore_ascii_case("all") {
+        if !allow_global {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "exec allowlist pattern rejected: global wildcard requires STEER_EXEC_ALLOWLIST_ALLOW_GLOBAL=1".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    if trimmed.starts_with("re:")
+        || (trimmed.starts_with('/') && trimmed.ends_with('/') && trimmed.len() > 2)
+    {
+        if !allow_regex {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "exec allowlist pattern rejected: regex requires STEER_EXEC_ALLOWLIST_ALLOW_REGEX=1".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    Ok(())
+}
+
+fn validate_exec_allowlist_pattern(pattern: &str) -> Result<()> {
+    validate_exec_allowlist_pattern_with_flags(
+        pattern,
+        crate::env_flag("STEER_EXEC_ALLOWLIST_ALLOW_GLOBAL"),
+        crate::env_flag("STEER_EXEC_ALLOWLIST_ALLOW_REGEX"),
+    )
 }
 
 pub fn has_recent_pattern_recommendation(pattern_id: &str, hours: i64) -> Result<bool> {
@@ -2447,6 +2902,288 @@ pub fn mark_recommendation_approved(id: i64, workflow_id: &str, workflow_json: &
         )?;
     }
     Ok(())
+}
+
+fn update_workflow_provision_op_status_with_conn(
+    conn: &Connection,
+    op_id: i64,
+    status: &str,
+    error: Option<&str>,
+) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE workflow_provision_ops
+         SET status = ?1,
+             error = ?2,
+             updated_at = ?3
+         WHERE id = ?4",
+        params![status, error, now, op_id],
+    )?;
+    Ok(())
+}
+
+fn commit_workflow_provision_success_with_conn(
+    conn: &mut Connection,
+    op_id: i64,
+    recommendation_id: i64,
+    workflow_id: &str,
+    workflow_json: Option<&str>,
+) -> Result<()> {
+    let approved_at = chrono::Utc::now().to_rfc3339();
+    let tx = conn.transaction()?;
+    let rec_changed = tx.execute(
+        "UPDATE recommendations
+         SET status = 'approved',
+             workflow_id = ?1,
+             workflow_json = CASE
+                WHEN ?2 IS NULL OR TRIM(?2) = '' THEN workflow_json
+                ELSE ?2
+             END,
+             approved_at = ?3,
+             last_error = NULL
+         WHERE id = ?4",
+        params![workflow_id, workflow_json, approved_at, recommendation_id],
+    )?;
+    if rec_changed == 0 {
+        return Err(rusqlite::Error::InvalidParameterName(format!(
+            "recommendation {} not found while committing workflow provision op {}",
+            recommendation_id, op_id
+        )));
+    }
+
+    let op_changed = tx.execute(
+        "UPDATE workflow_provision_ops
+         SET status = 'committed',
+             workflow_id = ?1,
+             workflow_json = CASE
+                WHEN ?2 IS NULL OR TRIM(?2) = '' THEN workflow_json
+                ELSE ?2
+             END,
+             error = NULL,
+             updated_at = ?3
+         WHERE id = ?4",
+        params![workflow_id, workflow_json, approved_at, op_id],
+    )?;
+    if op_changed == 0 {
+        return Err(rusqlite::Error::InvalidParameterName(format!(
+            "workflow provision op {} not found during commit",
+            op_id
+        )));
+    }
+
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn create_workflow_provision_op(
+    recommendation_id: i64,
+    claim_token: Option<&str>,
+) -> Result<i64> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO workflow_provision_ops (
+                recommendation_id, claim_token, status, workflow_id, workflow_json, error, created_at, updated_at
+            ) VALUES (?1, ?2, 'requested', NULL, NULL, NULL, ?3, ?3)",
+            params![recommendation_id, claim_token, now],
+        )?;
+        return Ok(conn.last_insert_rowid());
+    }
+    Err(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(1),
+        Some("DB not initialized".to_string()),
+    ))
+}
+
+pub fn mark_workflow_provision_created(
+    op_id: i64,
+    workflow_id: &str,
+    workflow_json: Option<&str>,
+) -> Result<()> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE workflow_provision_ops
+             SET status = 'created',
+                 workflow_id = ?1,
+                 workflow_json = CASE
+                    WHEN ?2 IS NULL OR TRIM(?2) = '' THEN workflow_json
+                    ELSE ?2
+                 END,
+                 error = NULL,
+                 updated_at = ?3
+             WHERE id = ?4",
+            params![workflow_id, workflow_json, now, op_id],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn mark_workflow_provision_failed(op_id: i64, error: &str) -> Result<()> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        update_workflow_provision_op_status_with_conn(conn, op_id, "failed", Some(error))?;
+    }
+    Ok(())
+}
+
+pub fn mark_workflow_provision_reconcile_needed(op_id: i64, error: &str) -> Result<()> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        update_workflow_provision_op_status_with_conn(
+            conn,
+            op_id,
+            "reconcile_needed",
+            Some(error),
+        )?;
+    }
+    Ok(())
+}
+
+pub fn commit_workflow_provision_success(
+    op_id: i64,
+    recommendation_id: i64,
+    workflow_id: &str,
+    workflow_json: Option<&str>,
+) -> Result<()> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        return commit_workflow_provision_success_with_conn(
+            conn,
+            op_id,
+            recommendation_id,
+            workflow_id,
+            workflow_json,
+        );
+    }
+    Err(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(1),
+        Some("DB not initialized".to_string()),
+    ))
+}
+
+pub fn reconcile_workflow_provision_ops(limit: i64) -> Result<Vec<String>> {
+    let capped = limit.clamp(1, 200);
+    let mut lock = get_db_lock();
+    let mut outcomes = Vec::new();
+    if let Some(conn) = lock.as_mut() {
+        let mut stmt = conn.prepare(
+            "SELECT id, recommendation_id, claim_token, status, workflow_id, workflow_json, error, created_at, updated_at
+             FROM workflow_provision_ops
+             WHERE status IN ('created', 'reconcile_needed')
+             ORDER BY updated_at ASC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![capped], |row| {
+            Ok(WorkflowProvisionOpRecord {
+                id: row.get(0)?,
+                recommendation_id: row.get(1)?,
+                claim_token: row.get(2)?,
+                status: row.get(3)?,
+                workflow_id: row.get(4)?,
+                workflow_json: row.get(5)?,
+                error: row.get(6)?,
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
+            })
+        })?;
+
+        let mut candidates = Vec::new();
+        for row in rows {
+            candidates.push(row?);
+        }
+        drop(stmt);
+
+        for op in candidates {
+            let workflow_id = match op
+                .workflow_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(v) => v.to_string(),
+                None => {
+                    let msg = format!("op {} has no workflow_id", op.id);
+                    let _ = update_workflow_provision_op_status_with_conn(
+                        conn,
+                        op.id,
+                        "failed",
+                        Some(&msg),
+                    );
+                    outcomes.push(msg);
+                    continue;
+                }
+            };
+
+            let current_workflow_id = {
+                let mut rec_stmt =
+                    conn.prepare("SELECT workflow_id FROM recommendations WHERE id = ?1")?;
+                let mut rec_rows = rec_stmt.query(params![op.recommendation_id])?;
+                let Some(rec_row) = rec_rows.next()? else {
+                    let msg = format!(
+                        "op {} recommendation {} not found",
+                        op.id, op.recommendation_id
+                    );
+                    let _ = update_workflow_provision_op_status_with_conn(
+                        conn,
+                        op.id,
+                        "failed",
+                        Some(&msg),
+                    );
+                    outcomes.push(msg);
+                    continue;
+                };
+                rec_row.get::<_, Option<String>>(0)?
+            };
+
+            if let Some(existing) = current_workflow_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if existing != workflow_id && !existing.starts_with("provisioning:") {
+                    let msg = format!(
+                        "op {} skipped due workflow mismatch recommendation={} existing={} op={}",
+                        op.id, op.recommendation_id, existing, workflow_id
+                    );
+                    let _ = update_workflow_provision_op_status_with_conn(
+                        conn,
+                        op.id,
+                        "failed",
+                        Some(&msg),
+                    );
+                    outcomes.push(msg);
+                    continue;
+                }
+            }
+
+            match commit_workflow_provision_success_with_conn(
+                conn,
+                op.id,
+                op.recommendation_id,
+                &workflow_id,
+                op.workflow_json.as_deref(),
+            ) {
+                Ok(()) => outcomes.push(format!(
+                    "op {} committed recommendation {}",
+                    op.id, op.recommendation_id
+                )),
+                Err(e) => {
+                    let msg = format!("op {} reconcile failed: {}", op.id, e);
+                    let _ = update_workflow_provision_op_status_with_conn(
+                        conn,
+                        op.id,
+                        "reconcile_needed",
+                        Some(&msg),
+                    );
+                    outcomes.push(msg);
+                }
+            }
+        }
+    }
+    Ok(outcomes)
 }
 
 // --- V2 Event Ingestion (Matches Python Schema) ---
@@ -3046,5 +3783,73 @@ mod tests {
         assert!(update_recommendation_review_status(rec.id, "pending").is_err());
         assert!(update_recommendation_review_status(rec.id, "rejected").is_ok());
         assert!(update_recommendation_review_status(rec.id, "later").is_err());
+    }
+
+    #[test]
+    fn test_collector_handoff_receipt_roundtrip() {
+        init().ok();
+        let package_id = format!("pkg-{}", uuid::Uuid::new_v4());
+        let status = "consumed";
+        assert!(record_collector_handoff_receipt(
+            &package_id,
+            Some(42),
+            status,
+            Some(7),
+            Some("unit-test")
+        )
+        .is_ok());
+
+        let receipts = list_collector_handoff_receipts(50).unwrap_or_default();
+        let found = receipts
+            .into_iter()
+            .find(|r| r.package_id == package_id)
+            .expect("expected inserted collector handoff receipt");
+        assert_eq!(found.collector_row_id, Some(42));
+        assert_eq!(found.status, status);
+        assert_eq!(found.recommendation_id, Some(7));
+    }
+
+    #[test]
+    fn test_exec_allowlist_pattern_validation_defaults_secure() {
+        assert!(validate_exec_allowlist_pattern_with_flags("*", false, false).is_err());
+        assert!(validate_exec_allowlist_pattern_with_flags("all", false, false).is_err());
+        assert!(validate_exec_allowlist_pattern_with_flags("re:^ls", false, false).is_err());
+        assert!(validate_exec_allowlist_pattern_with_flags("/^ls/", false, false).is_err());
+        assert!(validate_exec_allowlist_pattern_with_flags("ls -la", false, false).is_ok());
+        assert!(validate_exec_allowlist_pattern_with_flags("git*", false, false).is_ok());
+    }
+
+    #[test]
+    fn test_exec_allowlist_pattern_match_with_flags() {
+        assert!(!exec_pattern_match_with_flags(
+            "*", "rm -rf /", false, false
+        ));
+        assert!(exec_pattern_match_with_flags(
+            "*",
+            "echo hello",
+            true,
+            false
+        ));
+        assert!(!exec_pattern_match_with_flags(
+            "re:^ls\\b",
+            "ls -la",
+            false,
+            false
+        ));
+        assert!(exec_pattern_match_with_flags(
+            "re:^ls\\b",
+            "ls -la",
+            false,
+            true
+        ));
+        assert!(exec_pattern_match_with_flags(
+            "git*",
+            "git status",
+            false,
+            false
+        ));
+        assert!(!exec_pattern_match_with_flags(
+            "git*", "ls -la", false, false
+        ));
     }
 }

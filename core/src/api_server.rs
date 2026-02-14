@@ -10,20 +10,52 @@ use serde_json::json;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::{
-    approval_gate, chat_sanitize, consistency_check, context_pruning, db, execution_controller,
-    feedback_collector, integrations, intent_router, judgment, llm_gateway, monitor, nl_store,
-    pattern_detector, performance_verification, plan_builder, project_scanner, quality_scorer,
-    recommendation_executor, release_gate, runtime_verification, semantic_verification,
-    slot_filler, tool_result_guard, verification_engine, visual_verification,
+    approval_gate, chat_sanitize, collector_pipeline, consistency_check, context_pruning, db,
+    execution_controller, feedback_collector, integrations, intent_router, judgment, llm_gateway,
+    monitor, nl_store, pattern_detector, performance_verification, plan_builder, project_scanner,
+    quality_scorer, recommendation_executor, release_gate, runtime_verification,
+    semantic_verification, slot_filler, tool_result_guard, verification_engine,
+    visual_verification, workflow_intake,
 };
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 use sysinfo::System;
 
 #[derive(Clone)]
 pub struct AppState {
     pub llm_client: Option<std::sync::Arc<dyn llm_gateway::LLMClient>>,
     pub current_goal: Arc<Mutex<Option<String>>>,
+}
+
+static INFLIGHT_AGENT_EXECUTIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn inflight_agent_executions() -> &'static Mutex<HashSet<String>> {
+    INFLIGHT_AGENT_EXECUTIONS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+struct AgentExecutionGuard {
+    plan_id: String,
+}
+
+impl Drop for AgentExecutionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = inflight_agent_executions().lock() {
+            set.remove(&self.plan_id);
+        }
+    }
+}
+
+fn acquire_agent_execution(plan_id: &str) -> Option<AgentExecutionGuard> {
+    if let Ok(mut set) = inflight_agent_executions().lock() {
+        if set.contains(plan_id) {
+            return None;
+        }
+        set.insert(plan_id.to_string());
+        return Some(AgentExecutionGuard {
+            plan_id: plan_id.to_string(),
+        });
+    }
+    None
 }
 
 // Request/Response types
@@ -92,6 +124,8 @@ pub struct AgentExecuteResponse {
     #[serde(default)]
     pub manual_steps: Vec<String>,
     pub resume_from: Option<usize>,
+    #[serde(default)]
+    pub resume_token: Option<String>,
     pub run_id: Option<String>,
     #[serde(default)]
     pub planner_complete: bool,
@@ -202,6 +236,17 @@ pub struct TaskRunsQuery {
 }
 
 #[derive(Deserialize)]
+pub struct CollectorHandoffReceiptsQuery {
+    pub limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub struct WorkflowProvisionOpsQuery {
+    pub limit: Option<i64>,
+    pub status: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct ProjectScanQuery {
     pub max_files: Option<usize>,
     pub workdir: Option<String>,
@@ -212,6 +257,14 @@ pub struct ProjectScanResponse {
     pub project_type: String,
     pub files: Vec<String>,
     pub key_files: std::collections::HashMap<String, String>,
+}
+
+#[derive(Serialize)]
+pub struct RuntimeDbPathsResponse {
+    pub core_db_path: Option<String>,
+    pub collector_db_path: String,
+    pub mismatch: bool,
+    pub allow_mismatch: bool,
 }
 
 #[derive(Deserialize)]
@@ -367,64 +420,6 @@ async fn auth_middleware(
     }
 }
 
-fn recommendation_fingerprint(title: &str, trigger: &str) -> String {
-    format!(
-        "{}::{}",
-        title.trim().to_lowercase(),
-        trigger.trim().to_lowercase()
-    )
-}
-
-fn find_recommendation_id_by_fingerprint(target: &str) -> anyhow::Result<Option<i64>> {
-    let rows = db::get_recommendations_with_filter(Some("all"))?;
-    for rec in rows {
-        let fp = recommendation_fingerprint(&rec.title, &rec.trigger);
-        if fp == target {
-            return Ok(Some(rec.id));
-        }
-    }
-    Ok(None)
-}
-
-fn summarize_prompt(prompt: &str, max_chars: usize) -> String {
-    let trimmed = prompt.trim();
-    if trimmed.chars().count() <= max_chars {
-        return trimmed.to_string();
-    }
-    let short = trimmed.chars().take(max_chars).collect::<String>();
-    format!("{}...", short)
-}
-
-fn queue_manual_workflow_recommendation(prompt: &str, source: &str) -> anyhow::Result<(i64, bool)> {
-    let prompt_trimmed = prompt.trim();
-    if prompt_trimmed.is_empty() {
-        return Err(anyhow::anyhow!("workflow prompt is empty"));
-    }
-    let short = summarize_prompt(prompt_trimmed, 48);
-    let proposal = crate::recommendation::AutomationProposal {
-        title: format!("Manual Workflow: {}", short),
-        summary: format!(
-            "Manual workflow request captured from {} (approval required before creation).",
-            source
-        ),
-        trigger: "Manual workflow request".to_string(),
-        actions: vec!["n8n Workflow".to_string()],
-        confidence: 0.6,
-        n8n_prompt: prompt_trimmed.to_string(),
-        evidence: vec![
-            format!("source={}", source),
-            format!("prompt={}", summarize_prompt(prompt_trimmed, 160)),
-        ],
-        pattern_id: None,
-    };
-
-    let fp = proposal.fingerprint();
-    let inserted = db::insert_recommendation(&proposal)?;
-    let rec_id = find_recommendation_id_by_fingerprint(&fp)?
-        .ok_or_else(|| anyhow::anyhow!("failed to resolve recommendation id after insert"))?;
-    Ok((rec_id, inserted))
-}
-
 /// Start the HTTP API server for desktop GUI
 pub async fn start_api_server(
     llm_client: Option<std::sync::Arc<dyn llm_gateway::LLMClient>>,
@@ -537,6 +532,19 @@ pub async fn start_api_server(
         .route(
             "/api/routines",
             get(list_routines).post(create_routine_handler),
+        )
+        .route(
+            "/api/collector/handoff/ingest",
+            post(ingest_collector_handoff_handler),
+        )
+        .route(
+            "/api/collector/handoff/receipts",
+            get(list_collector_handoff_receipts_handler),
+        )
+        .route("/api/system/db-paths", get(runtime_db_paths_handler))
+        .route(
+            "/api/workflow/provision-ops",
+            get(list_workflow_provision_ops_handler),
         )
         .route(
             "/api/routines/:id",
@@ -1216,8 +1224,13 @@ async fn handle_chat(
                         let prompt_str = intent["params"]["prompt"].as_str()
                             .or_else(|| intent["params"]["description"].as_str())
                             .unwrap_or(&message);
-                        match queue_manual_workflow_recommendation(prompt_str, "api.chat.build_workflow") {
-                            Ok((rec_id, inserted)) => {
+                        match workflow_intake::queue_manual_workflow_recommendation(
+                            prompt_str,
+                            "api.chat.build_workflow",
+                        ) {
+                            Ok(outcome) => {
+                                let rec_id = outcome.recommendation_id;
+                                let inserted = outcome.inserted;
                                 let queued = if inserted { "생성" } else { "재사용" };
                                 format!(
                                     "📝 워크플로우 제안을 {}했습니다 (ID: {}).\n승인 게이트 정책상 즉시 생성은 차단되며, `/api/recommendations/{}/approve` 또는 CLI `approve {}`로 승인 후 생성됩니다.",
@@ -1278,6 +1291,47 @@ async fn handle_chat(
 }
 
 // --- Routine Handlers ---
+
+#[derive(serde::Deserialize)]
+struct IngestCollectorHandoffRequest {
+    config_path: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct IngestCollectorHandoffResponse {
+    status: String,
+    detail: String,
+    package_id: Option<String>,
+    recommendation_id: Option<i64>,
+    inserted: bool,
+}
+
+async fn ingest_collector_handoff_handler(
+    Json(payload): Json<IngestCollectorHandoffRequest>,
+) -> impl IntoResponse {
+    match workflow_intake::ingest_latest_collector_handoff(payload.config_path.as_deref()) {
+        Ok(outcome) => (
+            StatusCode::OK,
+            Json(IngestCollectorHandoffResponse {
+                status: outcome.status,
+                detail: outcome.detail,
+                package_id: outcome.package_id,
+                recommendation_id: outcome.recommendation_id,
+                inserted: outcome.inserted,
+            }),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(IngestCollectorHandoffResponse {
+                status: "error".to_string(),
+                detail: e.to_string(),
+                package_id: None,
+                recommendation_id: None,
+                inserted: false,
+            }),
+        ),
+    }
+}
 
 async fn list_routines() -> Json<Vec<crate::db::Routine>> {
     match crate::db::get_all_routines() {
@@ -1527,6 +1581,70 @@ async fn list_task_runs_handler(
     Json(runs)
 }
 
+async fn list_collector_handoff_receipts_handler(
+    Query(query): Query<CollectorHandoffReceiptsQuery>,
+) -> Json<Vec<db::CollectorHandoffReceiptRecord>> {
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let rows = db::list_collector_handoff_receipts(limit).unwrap_or_default();
+    Json(rows)
+}
+
+async fn runtime_db_paths_handler() -> Json<RuntimeDbPathsResponse> {
+    let cfg_path = std::env::var("STEER_COLLECTOR_CONFIG")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "configs/config.yaml".to_string());
+    let collector = collector_pipeline::resolve_db_path(Some(std::path::Path::new(&cfg_path)));
+    let collector_norm = collector
+        .canonicalize()
+        .unwrap_or_else(|_| collector.clone())
+        .to_string_lossy()
+        .to_string();
+
+    let core_opt = db::current_db_path();
+    let core_norm_opt = core_opt.as_ref().map(|p| {
+        let path = std::path::Path::new(p);
+        path.canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .to_string()
+    });
+
+    let mismatch = match core_norm_opt.as_deref() {
+        Some(core) => core != collector_norm,
+        None => false,
+    };
+    let allow_mismatch = std::env::var("STEER_ALLOW_COLLECTOR_DB_MISMATCH")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+
+    Json(RuntimeDbPathsResponse {
+        core_db_path: core_norm_opt,
+        collector_db_path: collector_norm,
+        mismatch,
+        allow_mismatch,
+    })
+}
+
+async fn list_workflow_provision_ops_handler(
+    Query(query): Query<WorkflowProvisionOpsQuery>,
+) -> Json<Vec<db::WorkflowProvisionOpRecord>> {
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let status = query
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let rows = db::list_workflow_provision_ops(limit, status).unwrap_or_default();
+    Json(rows)
+}
+
 async fn get_task_run_handler(Path(run_id): Path<String>) -> impl IntoResponse {
     match db::get_task_run(&run_id) {
         Ok(Some(run)) => (StatusCode::OK, Json(json!(run))).into_response(),
@@ -1636,7 +1754,14 @@ async fn add_exec_allowlist(Json(payload): Json<ExecAllowlistRequest>) -> Status
     }
     match db::add_exec_allowlist(&payload.pattern, payload.cwd.as_deref()) {
         Ok(_) => StatusCode::CREATED,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("exec allowlist pattern rejected") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }
     }
 }
 
@@ -1866,6 +1991,19 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
         )
             .into_response();
     };
+    let _exec_guard = match acquire_agent_execution(&payload.plan_id) {
+        Some(g) => g,
+        None => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "plan_execution_in_progress",
+                    "plan_id": payload.plan_id
+                })),
+            )
+                .into_response();
+        }
+    };
     let session = nl_store::find_session_by_plan(&payload.plan_id);
     let run_intent = session
         .as_ref()
@@ -1880,7 +2018,29 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
         payload.plan_id,
         chrono::Utc::now().timestamp_millis()
     );
-    let _ = db::create_task_run(&run_id, &run_intent, &run_prompt, "running");
+    match db::claim_task_run(&plan.plan_id, &run_id, &run_intent, &run_prompt, "running") {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "plan_execution_in_progress_db",
+                    "plan_id": payload.plan_id
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "task_run_claim_failed",
+                    "detail": e.to_string()
+                })),
+            )
+                .into_response();
+        }
+    }
 
     let mut resume_from = nl_store::get_plan_progress(&plan.plan_id).unwrap_or(0);
     if resume_from >= plan.steps.len() {
@@ -1927,6 +2087,7 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
         result.approval = retry.approval;
         result.manual_steps = retry.manual_steps;
         result.resume_from = retry.resume_from;
+        result.resume_token = retry.resume_token;
         verify = verification_engine::verify_execution(&plan, &result.logs);
         if !verify.ok {
             result
@@ -2123,6 +2284,7 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
         approval: result.approval,
         manual_steps: result.manual_steps,
         resume_from: result.resume_from,
+        resume_token: result.resume_token,
         run_id: Some(run_id),
         planner_complete,
         execution_complete,
