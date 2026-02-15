@@ -222,6 +222,8 @@ export const AgentPlanResponseSchema = z.object({
     missing_slots: z.array(z.string()),
 });
 
+export const ExecutionProfileSchema = z.enum(["strict", "test", "fast"]);
+
 export const AgentExecuteResponseSchema = z.object({
     status: z.string(),
     logs: z.array(z.string()),
@@ -240,6 +242,30 @@ export const AgentExecuteResponseSchema = z.object({
     planner_complete: z.boolean().optional().default(false),
     execution_complete: z.boolean().optional().default(false),
     business_complete: z.boolean().optional().default(false),
+    completion_score: z
+        .object({
+            score: z.number(),
+            label: z.string(),
+            pass: z.boolean(),
+            reasons: z.array(z.string()),
+        })
+        .nullable()
+        .optional(),
+    profile: ExecutionProfileSchema.optional().nullable(),
+    collision_policy: z.string().optional().nullable(),
+    stage_dod: z
+        .array(
+            z.object({
+                stage: z.string(),
+                key: z.string(),
+                expected: z.string(),
+                actual: z.string(),
+                passed: z.boolean(),
+                evidence: z.string().nullable().optional(),
+            })
+        )
+        .optional()
+        .default([]),
 });
 
 export const AgentVerifyResponseSchema = z.object({
@@ -304,6 +330,9 @@ export const TaskStageRunSchema = z.object({
     started_at: z.string(),
     finished_at: z.string(),
     details: z.string().nullable().optional(),
+    retry_count: z.number().optional(),
+    max_retries: z.number().optional(),
+    next_retry_at: z.string().nullable().optional(),
 });
 
 export const TaskStageAssertionSchema = z.object({
@@ -316,6 +345,54 @@ export const TaskStageAssertionSchema = z.object({
     passed: z.boolean(),
     evidence: z.string().nullable().optional(),
     created_at: z.string(),
+});
+
+export const TaskRunArtifactSchema = z.object({
+    id: z.number(),
+    run_id: z.string(),
+    artifact_type: z.string(),
+    artifact_key: z.string(),
+    value: z.string(),
+    metadata: z.string().nullable().optional(),
+    created_at: z.string(),
+});
+
+export const AgentPreflightCheckSchema = z.object({
+    key: z.string(),
+    label: z.string(),
+    ok: z.boolean(),
+    expected: z.string().nullable().optional(),
+    actual: z.string().nullable().optional(),
+    message: z.string(),
+});
+
+export const AgentPreflightResponseSchema = z.object({
+    ok: z.boolean(),
+    checks: z.array(AgentPreflightCheckSchema),
+    active_app: z.string().nullable().optional(),
+    checked_at: z.string(),
+});
+
+export const AgentPreflightFixResponseSchema = z.object({
+    ok: z.boolean(),
+    action: z.string(),
+    message: z.string(),
+    active_app: z.string().nullable().optional(),
+    fixed_at: z.string(),
+    recorded: z.boolean().optional().default(false),
+    run_id: z.string().nullable().optional(),
+    stage_name: z.string().nullable().optional(),
+});
+
+export const AgentRecoveryEventResponseSchema = z.object({
+    ok: z.boolean(),
+    recorded: z.boolean(),
+    run_id: z.string(),
+    stage_name: z.string(),
+    action_key: z.string(),
+    status: z.string(),
+    recorded_at: z.string(),
+    reason: z.string().nullable().optional(),
 });
 
 export const ContextSelectionSchema = z.object({
@@ -359,6 +436,7 @@ export type ReleaseGate = z.infer<typeof ReleaseGateSchema>;
 export type VerificationRun = z.infer<typeof VerificationRunSchema>;
 export type AgentIntentResponse = z.infer<typeof AgentIntentResponseSchema>;
 export type AgentPlanResponse = z.infer<typeof AgentPlanResponseSchema>;
+export type ExecutionProfile = z.infer<typeof ExecutionProfileSchema>;
 export type AgentExecuteResponse = z.infer<typeof AgentExecuteResponseSchema>;
 export type AgentVerifyResponse = z.infer<typeof AgentVerifyResponseSchema>;
 export type AgentApproveResponse = z.infer<typeof AgentApproveResponseSchema>;
@@ -368,6 +446,11 @@ export type NLRun = z.infer<typeof NLRunSchema>;
 export type TaskRun = z.infer<typeof TaskRunSchema>;
 export type TaskStageRun = z.infer<typeof TaskStageRunSchema>;
 export type TaskStageAssertion = z.infer<typeof TaskStageAssertionSchema>;
+export type TaskRunArtifact = z.infer<typeof TaskRunArtifactSchema>;
+export type AgentPreflightCheck = z.infer<typeof AgentPreflightCheckSchema>;
+export type AgentPreflightResponse = z.infer<typeof AgentPreflightResponseSchema>;
+export type AgentPreflightFixResponse = z.infer<typeof AgentPreflightFixResponseSchema>;
+export type AgentRecoveryEventResponse = z.infer<typeof AgentRecoveryEventResponseSchema>;
 export type ContextSelection = z.infer<typeof ContextSelectionSchema>;
 export type ProjectScan = z.infer<typeof ProjectScanSchema>;
 export type Judgment = z.infer<typeof JudgmentSchema>;

@@ -80,6 +80,7 @@ pub mod macos;
 pub mod reality_check;
 pub mod screen_recorder;
 pub mod telegram;
+pub mod telegram_transport;
 
 pub fn load_env_with_fallback() {
     use std::sync::Once;

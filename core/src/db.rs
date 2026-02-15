@@ -396,7 +396,10 @@ pub fn init() -> anyhow::Result<()> {
             status TEXT NOT NULL,
             started_at TEXT NOT NULL,
             finished_at TEXT NOT NULL,
-            details TEXT
+            details TEXT,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            max_retries INTEGER NOT NULL DEFAULT 0,
+            next_retry_at TEXT
         )",
         [],
     )?;
@@ -410,6 +413,18 @@ pub fn init() -> anyhow::Result<()> {
             actual TEXT NOT NULL,
             passed INTEGER NOT NULL,
             evidence TEXT,
+            created_at TEXT NOT NULL
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS task_run_artifacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            artifact_type TEXT NOT NULL,
+            artifact_key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            metadata TEXT,
             created_at TEXT NOT NULL
         )",
         [],
@@ -448,6 +463,16 @@ pub fn init() -> anyhow::Result<()> {
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_task_stage_assertions_run_id
          ON task_stage_assertions(run_id, stage_name)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_task_run_artifacts_unique
+         ON task_run_artifacts(run_id, artifact_type, artifact_key)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_task_run_artifacts_run_id
+         ON task_run_artifacts(run_id, created_at)",
         [],
     )?;
     conn.execute(
@@ -514,6 +539,19 @@ pub fn init() -> anyhow::Result<()> {
         ensure_column(conn, "task_runs", "plan_id", "TEXT");
         ensure_column(conn, "routines", "run_claimed_at", "TEXT");
         ensure_column(conn, "routines", "run_claim_owner", "TEXT");
+        ensure_column(
+            conn,
+            "task_stage_runs",
+            "retry_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        );
+        ensure_column(
+            conn,
+            "task_stage_runs",
+            "max_retries",
+            "INTEGER NOT NULL DEFAULT 0",
+        );
+        ensure_column(conn, "task_stage_runs", "next_retry_at", "TEXT");
         let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_task_runs_plan_status
              ON task_runs(plan_id, status, created_at)",
@@ -953,6 +991,9 @@ pub struct TaskStageRunRecord {
     pub started_at: String,
     pub finished_at: String,
     pub details: Option<String>,
+    pub retry_count: i64,
+    pub max_retries: i64,
+    pub next_retry_at: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -965,6 +1006,17 @@ pub struct TaskStageAssertionRecord {
     pub actual: String,
     pub passed: bool,
     pub evidence: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskRunArtifactRecord {
+    pub id: i64,
+    pub run_id: String,
+    pub artifact_type: String,
+    pub artifact_key: String,
+    pub value: String,
+    pub metadata: Option<String>,
     pub created_at: String,
 }
 
@@ -1821,6 +1873,22 @@ fn parse_task_run_stale_minutes() -> i64 {
         .unwrap_or(120)
 }
 
+fn parse_stage_max_retries() -> i64 {
+    std::env::var("STEER_STAGE_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .map(|v| v.clamp(0, 16))
+        .unwrap_or(2)
+}
+
+fn parse_stage_retry_backoff_base_seconds() -> i64 {
+    std::env::var("STEER_STAGE_RETRY_BACKOFF_BASE_SECONDS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .map(|v| v.clamp(1, 120))
+        .unwrap_or(5)
+}
+
 pub fn claim_task_run(
     plan_id: &str,
     run_id: &str,
@@ -1862,6 +1930,56 @@ pub fn claim_task_run(
     Ok(true)
 }
 
+fn canonical_stage_status(raw: &str) -> String {
+    let normalized = raw.trim().to_lowercase();
+    match normalized.as_str() {
+        "" | "queued" => "pending".to_string(),
+        "pending" => "pending".to_string(),
+        "running" | "in_progress" | "in-progress" | "started" => "running".to_string(),
+        "retry" | "retrying" => "retrying".to_string(),
+        "completed" | "success" | "ok" | "done" => "completed".to_string(),
+        "failed" | "error" => "failed".to_string(),
+        "blocked" | "manual_required" | "approval_required" => "blocked".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn is_known_stage_status(status: &str) -> bool {
+    matches!(
+        status,
+        "pending" | "running" | "retrying" | "completed" | "failed" | "blocked"
+    )
+}
+
+fn stage_transition_allowed(prev: &str, next: &str) -> bool {
+    if prev == next {
+        return true;
+    }
+    if !is_known_stage_status(prev) || !is_known_stage_status(next) {
+        return true;
+    }
+    matches!(
+        (prev, next),
+        ("pending", "running")
+            | ("pending", "retrying")
+            | ("pending", "completed")
+            | ("pending", "failed")
+            | ("pending", "blocked")
+            | ("running", "retrying")
+            | ("running", "completed")
+            | ("running", "failed")
+            | ("running", "blocked")
+            | ("retrying", "running")
+            | ("retrying", "completed")
+            | ("retrying", "failed")
+            | ("retrying", "blocked")
+            | ("failed", "retrying")
+            | ("failed", "running")
+            | ("blocked", "retrying")
+            | ("blocked", "running")
+    )
+}
+
 pub fn record_task_stage_run(
     run_id: &str,
     stage_name: &str,
@@ -1872,11 +1990,100 @@ pub fn record_task_stage_run(
     let mut lock = get_db_lock();
     if let Some(conn) = lock.as_mut() {
         let now = chrono::Utc::now().to_rfc3339();
+        let status = canonical_stage_status(status);
+        let details_clean = details.map(str::trim).filter(|v| !v.is_empty());
+        let stage_max_retries_default = parse_stage_max_retries();
+        let stage_backoff_base = parse_stage_retry_backoff_base_seconds();
+
+        let mut stmt = conn.prepare(
+            "SELECT status, started_at, details, retry_count, max_retries
+             FROM task_stage_runs
+             WHERE run_id = ?1
+               AND stage_name = ?2
+               AND stage_order = ?3
+             ORDER BY id DESC
+             LIMIT 1",
+        )?;
+        let previous = stmt.query_row(params![run_id, stage_name, stage_order], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2).ok().flatten(),
+                row.get::<_, i64>(3).unwrap_or(0),
+                row.get::<_, i64>(4).unwrap_or(0),
+            ))
+        });
+
+        let mut started_at = now.clone();
+        let mut retry_count: i64 = 0;
+        let mut max_retries: i64 = stage_max_retries_default;
+        let mut next_retry_at: Option<String> = None;
+        if let Ok((
+            prev_status_raw,
+            prev_started_at,
+            prev_details,
+            prev_retry_count,
+            prev_max_retries,
+        )) = previous
+        {
+            let prev_status = canonical_stage_status(&prev_status_raw);
+            let prev_detail_text = prev_details.unwrap_or_default();
+            let next_detail_text = details_clean.unwrap_or("");
+            retry_count = prev_retry_count.max(0);
+            if prev_max_retries > 0 {
+                max_retries = prev_max_retries;
+            }
+            if prev_status == status && prev_detail_text.trim() == next_detail_text {
+                // Idempotent duplicate; keep history clean by skipping extra row.
+                return Ok(());
+            }
+            if !stage_transition_allowed(prev_status.as_str(), status.as_str()) {
+                eprintln!(
+                    "⚠️ Invalid stage transition ignored: run_id={} stage={} order={} {} -> {}",
+                    run_id, stage_name, stage_order, prev_status, status
+                );
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            let restart_attempt = matches!(
+                (prev_status.as_str(), status.as_str()),
+                ("failed", "running")
+                    | ("failed", "retrying")
+                    | ("blocked", "running")
+                    | ("blocked", "retrying")
+            );
+            started_at = if restart_attempt {
+                now.clone()
+            } else {
+                prev_started_at
+            };
+        }
+
+        if status == "retrying" {
+            retry_count += 1;
+            let shift = (retry_count.saturating_sub(1)).clamp(0, 6) as u32;
+            let multiplier = 1_i64.checked_shl(shift).unwrap_or(64);
+            let backoff_secs = (stage_backoff_base * multiplier).clamp(1, 600);
+            next_retry_at =
+                Some((chrono::Utc::now() + chrono::Duration::seconds(backoff_secs)).to_rfc3339());
+        }
+
         conn.execute(
             "INSERT INTO task_stage_runs (
-                run_id, stage_name, stage_order, status, started_at, finished_at, details
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![run_id, stage_name, stage_order, status, now, now, details],
+                run_id, stage_name, stage_order, status, started_at, finished_at, details,
+                retry_count, max_retries, next_retry_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                run_id,
+                stage_name,
+                stage_order,
+                status,
+                started_at,
+                now,
+                details_clean,
+                retry_count,
+                max_retries,
+                next_retry_at
+            ],
         )?;
     }
     Ok(())
@@ -1906,6 +2113,46 @@ pub fn record_task_stage_assertion(
                 actual,
                 passed as i64,
                 evidence,
+                created_at
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn upsert_task_run_artifact(
+    run_id: &str,
+    artifact_type: &str,
+    artifact_key: &str,
+    value: &str,
+    metadata: Option<&str>,
+) -> Result<()> {
+    let run_id = run_id.trim();
+    let artifact_type = artifact_type.trim();
+    let artifact_key = artifact_key.trim();
+    if run_id.is_empty() || artifact_type.is_empty() || artifact_key.is_empty() {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "run_id/artifact_type/artifact_key must not be empty".to_string(),
+        ));
+    }
+
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        let created_at = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO task_run_artifacts (
+                run_id, artifact_type, artifact_key, value, metadata, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(run_id, artifact_type, artifact_key) DO UPDATE SET
+                value = excluded.value,
+                metadata = excluded.metadata,
+                created_at = excluded.created_at",
+            params![
+                run_id,
+                artifact_type,
+                artifact_key,
+                value,
+                metadata,
                 created_at
             ],
         )?;
@@ -2059,7 +2306,8 @@ pub fn list_task_stage_runs(run_id: &str) -> Result<Vec<TaskStageRunRecord>> {
     let mut lock = get_db_lock();
     if let Some(conn) = lock.as_mut() {
         let mut stmt = conn.prepare(
-            "SELECT id, run_id, stage_name, stage_order, status, started_at, finished_at, details
+            "SELECT id, run_id, stage_name, stage_order, status, started_at, finished_at, details,
+                    retry_count, max_retries, next_retry_at
              FROM task_stage_runs
              WHERE run_id = ?1
              ORDER BY stage_order ASC, id ASC",
@@ -2075,6 +2323,9 @@ pub fn list_task_stage_runs(run_id: &str) -> Result<Vec<TaskStageRunRecord>> {
                 started_at: row.get(5)?,
                 finished_at: row.get(6)?,
                 details: row.get(7).ok(),
+                retry_count: row.get::<_, i64>(8).unwrap_or(0),
+                max_retries: row.get::<_, i64>(9).unwrap_or(0),
+                next_retry_at: row.get(10).ok(),
             })
         })?;
 
@@ -2108,6 +2359,37 @@ pub fn list_task_stage_assertions(run_id: &str) -> Result<Vec<TaskStageAssertion
                 passed: row.get::<_, i64>(6)? != 0,
                 evidence: row.get(7).ok(),
                 created_at: row.get(8)?,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        return Ok(out);
+    }
+    Ok(Vec::new())
+}
+
+pub fn list_task_run_artifacts(run_id: &str) -> Result<Vec<TaskRunArtifactRecord>> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        let mut stmt = conn.prepare(
+            "SELECT id, run_id, artifact_type, artifact_key, value, metadata, created_at
+             FROM task_run_artifacts
+             WHERE run_id = ?1
+             ORDER BY artifact_type ASC, artifact_key ASC, id ASC",
+        )?;
+
+        let rows = stmt.query_map(params![run_id], |row| {
+            Ok(TaskRunArtifactRecord {
+                id: row.get(0)?,
+                run_id: row.get(1)?,
+                artifact_type: row.get(2)?,
+                artifact_key: row.get(3)?,
+                value: row.get(4)?,
+                metadata: row.get(5).ok(),
+                created_at: row.get(6)?,
             })
         })?;
 
@@ -3851,5 +4133,75 @@ mod tests {
         assert!(!exec_pattern_match_with_flags(
             "git*", "ls -la", false, false
         ));
+    }
+
+    #[test]
+    fn test_task_stage_retry_metadata_recorded() {
+        init().ok();
+        let run_id = format!("run-{}", uuid::Uuid::new_v4());
+        create_task_run(&run_id, "test", "retry metadata", "running").expect("create run");
+        record_task_stage_run(&run_id, "execution", 2, "running", Some("start"))
+            .expect("running stage");
+        record_task_stage_run(&run_id, "execution", 2, "retrying", Some("retry attempt"))
+            .expect("retrying stage");
+        let stages = list_task_stage_runs(&run_id).expect("list stages");
+        let latest = stages
+            .into_iter()
+            .filter(|s| s.stage_name == "execution")
+            .last()
+            .expect("latest execution stage");
+        assert_eq!(latest.status, "retrying");
+        assert!(latest.retry_count >= 1);
+        assert!(latest.max_retries >= 0);
+        assert!(latest.next_retry_at.is_some());
+    }
+
+    #[test]
+    fn test_task_stage_invalid_transition_rejected() {
+        init().ok();
+        let run_id = format!("run-{}", uuid::Uuid::new_v4());
+        create_task_run(&run_id, "test", "invalid transition", "running").expect("create run");
+        record_task_stage_run(&run_id, "planner", 1, "running", Some("start"))
+            .expect("planner running");
+        record_task_stage_run(&run_id, "planner", 1, "completed", Some("done"))
+            .expect("planner done");
+        let invalid = record_task_stage_run(&run_id, "planner", 1, "running", Some("should fail"));
+        assert!(invalid.is_err());
+    }
+
+    #[test]
+    fn test_task_run_artifact_upsert_roundtrip() {
+        init().ok();
+        let run_id = format!("run-{}", uuid::Uuid::new_v4());
+        create_task_run(&run_id, "test", "artifact upsert", "running").expect("create run");
+
+        upsert_task_run_artifact(
+            &run_id,
+            "artifact_assertion",
+            "artifact.mail_sent_confirmed",
+            "false",
+            Some("{\"passed\":false}"),
+        )
+        .expect("insert artifact");
+        upsert_task_run_artifact(
+            &run_id,
+            "artifact_assertion",
+            "artifact.mail_sent_confirmed",
+            "true",
+            Some("{\"passed\":true}"),
+        )
+        .expect("update artifact");
+
+        let artifacts = list_task_run_artifacts(&run_id).expect("list artifacts");
+        let item = artifacts
+            .into_iter()
+            .find(|a| a.artifact_key == "artifact.mail_sent_confirmed")
+            .expect("artifact row");
+        assert_eq!(item.value, "true");
+        assert_eq!(item.artifact_type, "artifact_assertion");
+        assert!(item
+            .metadata
+            .unwrap_or_default()
+            .contains("\"passed\":true"));
     }
 }

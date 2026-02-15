@@ -2,9 +2,65 @@ use crate::approval_gate;
 use crate::nl_automation::{ApprovalContext, ExecutionResult, Plan, StepType};
 
 use crate::browser_automation;
+use crate::tool_chaining::CrossAppBridge;
 use crate::visual_driver::{SmartStep, UiAction, VisualDriver};
 use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputCollisionPolicy {
+    Ignore,
+    Pause,
+    Abort,
+}
+
+impl InputCollisionPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ignore => "ignore",
+            Self::Pause => "pause",
+            Self::Abort => "abort",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ExecutionOptions {
+    pub enforce_browser_focus: bool,
+    pub input_collision_policy: InputCollisionPolicy,
+}
+
+impl Default for ExecutionOptions {
+    fn default() -> Self {
+        Self {
+            enforce_browser_focus: false,
+            input_collision_policy: InputCollisionPolicy::Ignore,
+        }
+    }
+}
+
+impl ExecutionOptions {
+    pub fn strict() -> Self {
+        Self {
+            enforce_browser_focus: true,
+            input_collision_policy: InputCollisionPolicy::Abort,
+        }
+    }
+
+    pub fn test() -> Self {
+        Self {
+            enforce_browser_focus: true,
+            input_collision_policy: InputCollisionPolicy::Pause,
+        }
+    }
+
+    pub fn fast() -> Self {
+        Self {
+            enforce_browser_focus: false,
+            input_collision_policy: InputCollisionPolicy::Ignore,
+        }
+    }
+}
 
 fn build_resume_token(plan: &Plan, resume_from: Option<usize>, reason: &str) -> Option<String> {
     let next_step = resume_from?;
@@ -34,12 +90,63 @@ fn push_run_attempt(logs: &mut Vec<String>, phase: &str, status: &str, details: 
     logs.push(format!("RUN_ATTEMPT_JSON|{}", payload));
 }
 
-pub async fn execute_plan(plan: &Plan, start_index: usize) -> ExecutionResult {
+fn step_requires_browser_focus(step_type: &StepType) -> bool {
+    matches!(
+        step_type,
+        StepType::Fill | StepType::Click | StepType::Select | StepType::Extract
+    )
+}
+
+fn is_browser_app(app_name: &str) -> bool {
+    let lower = app_name.to_lowercase();
+    lower.contains("safari")
+        || lower.contains("chrome")
+        || lower.contains("firefox")
+        || lower.contains("brave")
+        || lower.contains("edge")
+        || lower.contains("arc")
+        || lower.contains("opera")
+}
+
+fn interrupt_guard_enabled() -> bool {
+    std::env::var("STEER_INTERRUPT_GUARD")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(true)
+}
+
+fn should_guard_interrupt_for_step(step_type: &StepType) -> bool {
+    matches!(
+        step_type,
+        StepType::Fill | StepType::Click | StepType::Select | StepType::Extract
+    )
+}
+
+fn expected_front_app_for_step(step_data: &Value) -> Option<String> {
+    step_data
+        .get("app")
+        .and_then(|v| v.as_str())
+        .or_else(|| step_data.get("name").and_then(|v| v.as_str()))
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+}
+
+pub async fn execute_plan(
+    plan: &Plan,
+    start_index: usize,
+    options: ExecutionOptions,
+) -> ExecutionResult {
     let mut logs = Vec::new();
     let mut manual_required = false;
     let mut manual_steps: Vec<String> = Vec::new();
     let mut approval_required = false;
     let mut blocked = false;
+    let mut blocked_reason = "policy_blocked".to_string();
     let mut approval_context: Option<ApprovalContext> = None;
     let mut resume_from: Option<usize> = None;
 
@@ -49,6 +156,11 @@ pub async fn execute_plan(plan: &Plan, start_index: usize) -> ExecutionResult {
         plan.intent.as_str()
     ));
     logs.push(summary_for_plan(plan));
+    logs.push(format!(
+        "Execution options: enforce_browser_focus={}, input_collision_policy={}",
+        options.enforce_browser_focus,
+        options.input_collision_policy.as_str()
+    ));
     push_run_attempt(
         &mut logs,
         "execution_start",
@@ -63,6 +175,90 @@ pub async fn execute_plan(plan: &Plan, start_index: usize) -> ExecutionResult {
             step.description,
             step.step_type
         ));
+
+        if interrupt_guard_enabled()
+            && options.input_collision_policy != InputCollisionPolicy::Ignore
+            && should_guard_interrupt_for_step(&step.step_type)
+        {
+            if let Some(expected_app) = expected_front_app_for_step(&step.data) {
+                let front_app = CrossAppBridge::get_frontmost_app().unwrap_or_default();
+                let front_trimmed = front_app.trim().to_string();
+                if !front_trimmed.is_empty() && !front_trimmed.eq_ignore_ascii_case(&expected_app) {
+                    manual_required = true;
+                    resume_from = Some(idx);
+                    manual_steps.push(format!(
+                        "Step {} 전면 앱 충돌: expected={} actual={} (수동 복구 후 Resume)",
+                        idx + 1,
+                        expected_app,
+                        front_trimmed
+                    ));
+                    logs.push(format!(
+                        "INTERRUPT_DETECTED: step={} expected_app={} frontmost={} policy={}",
+                        idx + 1,
+                        expected_app,
+                        front_trimmed,
+                        options.input_collision_policy.as_str()
+                    ));
+                    push_run_attempt(
+                        &mut logs,
+                        "user_interrupt",
+                        "manual_required",
+                        &format!(
+                            "step={} expected_app={} frontmost={}",
+                            idx + 1,
+                            expected_app,
+                            front_trimmed
+                        ),
+                    );
+                    break;
+                }
+            }
+        }
+
+        if options.enforce_browser_focus && step_requires_browser_focus(&step.step_type) {
+            let front_app = CrossAppBridge::get_frontmost_app().unwrap_or_default();
+            if !is_browser_app(&front_app) {
+                let collision_details = format!(
+                    "step={} expected=browser frontmost={} policy={}",
+                    idx + 1,
+                    front_app,
+                    options.input_collision_policy.as_str()
+                );
+                logs.push(format!(
+                    "INPUT_COLLISION: UI step requires browser focus but frontmost app is '{}'",
+                    front_app
+                ));
+                push_run_attempt(&mut logs, "input_collision", "detected", &collision_details);
+                match options.input_collision_policy {
+                    InputCollisionPolicy::Ignore => {
+                        logs.push("Input collision ignored by execution profile".to_string());
+                    }
+                    InputCollisionPolicy::Pause => {
+                        manual_required = true;
+                        resume_from = Some(idx);
+                        manual_steps.push(format!(
+                            "Step {} 실행 전 브라우저를 전면으로 복구하고 Resume 하세요",
+                            idx + 1
+                        ));
+                        logs.push(
+                            "Execution paused due to input collision (manual intervention required)"
+                                .to_string(),
+                        );
+                        break;
+                    }
+                    InputCollisionPolicy::Abort => {
+                        blocked = true;
+                        blocked_reason = "input_collision_abort".to_string();
+                        resume_from = Some(idx);
+                        logs.push(
+                            "Execution aborted due to input collision policy (strict)".to_string(),
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
         match step.step_type {
             StepType::Navigate => {
                 if let Some(url) = step.data.get("url").and_then(|v| v.as_str()) {
@@ -308,6 +504,7 @@ pub async fn execute_plan(plan: &Plan, start_index: usize) -> ExecutionResult {
                 if decision.status == "denied" {
                     logs.push("Execution blocked by policy".to_string());
                     blocked = true;
+                    blocked_reason = "approval_policy_blocked".to_string();
                     break;
                 }
                 if decision.requires_approval {
@@ -334,9 +531,12 @@ pub async fn execute_plan(plan: &Plan, start_index: usize) -> ExecutionResult {
     }
 
     if blocked {
-        logs.push("Execution stopped due to approval policy".to_string());
-        push_run_attempt(&mut logs, "execution_end", "blocked", "policy_blocked");
-        let resume_token = build_resume_token(plan, resume_from, "blocked");
+        logs.push(format!(
+            "Execution stopped with blocked status (reason={})",
+            blocked_reason
+        ));
+        push_run_attempt(&mut logs, "execution_end", "blocked", &blocked_reason);
+        let resume_token = build_resume_token(plan, resume_from, &blocked_reason);
         if let Some(token) = resume_token.as_ref() {
             logs.push(format!("RESUME_TOKEN|status=blocked|token={}", token));
         }

@@ -21,7 +21,112 @@ struct MailSendResult {
     body_len: Option<i64>,
 }
 
+struct NotesWriteResult {
+    note_id: String,
+    note_name: String,
+    body_len: i64,
+}
+
+struct TextEditWriteResult {
+    doc_id: String,
+    doc_name: String,
+    body_len: i64,
+}
+
 impl ActionRunner {
+    fn focus_recovery_max_retries() -> usize {
+        std::env::var("STEER_FOCUS_RECOVERY_MAX_RETRIES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|v| v.min(10))
+            .unwrap_or(2)
+    }
+
+    fn focus_recovery_profile() -> &'static str {
+        let raw = std::env::var("STEER_FOCUS_RECOVERY_PROFILE")
+            .ok()
+            .unwrap_or_else(|| "standard".to_string());
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "aggressive" => "aggressive",
+            _ => "standard",
+        }
+    }
+
+    fn put_action_data_field(
+        action_data: &mut Option<serde_json::Value>,
+        key: &str,
+        value: serde_json::Value,
+    ) {
+        if action_data.is_none() {
+            *action_data = Some(json!({}));
+        }
+        if let Some(obj) = action_data.as_mut().and_then(|v| v.as_object_mut()) {
+            obj.insert(key.to_string(), value);
+        }
+    }
+
+    async fn recover_focus_and_verify(
+        target_app: &str,
+        retries: usize,
+    ) -> (bool, String, usize, Vec<String>) {
+        let mut recovery_trace: Vec<String> = Vec::new();
+        let mut attempts = 0usize;
+        let mut front = crate::tool_chaining::CrossAppBridge::get_frontmost_app()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+
+        while !front.eq_ignore_ascii_case(target_app) && attempts < retries {
+            attempts += 1;
+            let _ = heuristics::ensure_app_focus(target_app, 3).await;
+            front = crate::tool_chaining::CrossAppBridge::get_frontmost_app()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            recovery_trace.push(format!("retry#{} front={}", attempts, front));
+        }
+
+        if !front.eq_ignore_ascii_case(target_app) && Self::focus_recovery_profile() == "aggressive"
+        {
+            if heuristics::try_close_front_dialog() {
+                recovery_trace.push("dialog_closed".to_string());
+            }
+            let _ = heuristics::ensure_app_focus("Finder", 2).await;
+            attempts += 1;
+            let finder_front = crate::tool_chaining::CrossAppBridge::get_frontmost_app()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            recovery_trace.push(format!("handoff_finder front={}", finder_front));
+
+            let _ = heuristics::ensure_app_focus(target_app, 4).await;
+            attempts += 1;
+            front = crate::tool_chaining::CrossAppBridge::get_frontmost_app()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            recovery_trace.push(format!("handoff_target front={}", front));
+
+            if !front.eq_ignore_ascii_case(target_app) {
+                let _ = applescript::activate_app(target_app);
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(260));
+                front = crate::tool_chaining::CrossAppBridge::get_frontmost_app()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                recovery_trace.push(format!("activate_app front={}", front));
+            }
+        }
+
+        (
+            front.eq_ignore_ascii_case(target_app),
+            front,
+            attempts,
+            recovery_trace,
+        )
+    }
+
     fn bool_env_with_default(key: &str, default: bool) -> bool {
         match std::env::var(key) {
             Ok(v) => matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"),
@@ -79,6 +184,90 @@ impl ActionRunner {
             }
         }
         None
+    }
+
+    fn history_has_recent_open_for_app(history: &[String], app_name: &str) -> bool {
+        let target = app_name.trim().to_lowercase();
+        if target.is_empty() {
+            return false;
+        }
+        for entry in history.iter().rev().take(12) {
+            if let Some(rest) = entry.strip_prefix("Opened app: ") {
+                let opened = rest.trim().to_lowercase();
+                return opened == target;
+            }
+        }
+        false
+    }
+
+    fn history_has_recent_created_new_item_for_app(history: &[String], app_name: &str) -> bool {
+        let target = app_name.to_lowercase();
+        let mut in_target_context = Self::last_opened_app_from_history(history)
+            .map(|app| app.eq_ignore_ascii_case(app_name))
+            .unwrap_or(false);
+
+        for entry in history.iter().rev().take(24) {
+            let lower = entry.to_lowercase();
+            if let Some(rest) = lower.strip_prefix("opened app: ") {
+                let opened = rest.trim();
+                if opened.eq_ignore_ascii_case(&target) {
+                    in_target_context = true;
+                    continue;
+                }
+                if in_target_context {
+                    break;
+                }
+                continue;
+            }
+            if !in_target_context {
+                continue;
+            }
+            if lower.contains("shortcut 'n'") && lower.contains("created new item") {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn should_skip_redundant_cmd_n(history: &[String], app_name: &str) -> bool {
+        if !Self::bool_env_with_default("STEER_BLOCK_REDUNDANT_CMD_N", true) {
+            return false;
+        }
+        Self::history_has_recent_created_new_item_for_app(history, app_name)
+    }
+
+    fn session_has_single_fire_new_item(
+        session: &crate::session_store::Session,
+        key: &str,
+    ) -> bool {
+        for step in session.steps.iter().rev().take(96) {
+            let same_key = step
+                .data
+                .as_ref()
+                .and_then(|v| v.get("idempotency_key"))
+                .and_then(|v| v.as_str())
+                .map(|v| v == key)
+                .unwrap_or(false);
+            if !same_key {
+                continue;
+            }
+
+            let proof = step
+                .data
+                .as_ref()
+                .and_then(|v| v.get("proof"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let desc_lower = step.description.to_lowercase();
+
+            if matches!(proof, "mail_draft_ready" | "redundant_new_item_skip")
+                || desc_lower.contains("created new item")
+                || step.status == "success"
+            {
+                return true;
+            }
+        }
+        false
     }
 
     fn is_focus_noise_app(app: &str) -> bool {
@@ -184,14 +373,22 @@ impl ActionRunner {
     fn mail_ensure_draft(goal: Option<&str>, history: &mut Vec<String>) -> Result<String> {
         let preferred_id = Self::mail_current_draft_id(history).unwrap_or_default();
         let recipient_hint = Self::preferred_mail_recipient(goal).unwrap_or_default();
+        let marker_hint = Self::preferred_run_scope_marker(goal).unwrap_or_default();
         let lines = [
             "on run argv",
             "set preferredId to \"\"",
             "set recipientHint to \"\"",
+            "set markerHint to \"\"",
             "if (count of argv) >= 1 then set preferredId to item 1 of argv",
             "if (count of argv) >= 2 then set recipientHint to item 2 of argv",
+            "if (count of argv) >= 3 then set markerHint to item 3 of argv",
             "tell application \"Mail\"",
             "activate",
+            "repeat with candidate in outgoing messages",
+            "try",
+            "set visible of candidate to false",
+            "end try",
+            "end repeat",
             "set _msg to missing value",
             "if preferredId is not \"\" then",
             "repeat with candidate in outgoing messages",
@@ -203,8 +400,30 @@ impl ActionRunner {
             "end try",
             "end repeat",
             "end if",
+            "if _msg is missing value and markerHint is not \"\" then",
+            "repeat with candidate in outgoing messages",
+            "try",
+            "set candidateSubject to \"\"",
+            "set candidateBody to \"\"",
+            "try",
+            "set candidateSubject to subject of candidate as text",
+            "end try",
+            "try",
+            "set candidateBody to content of candidate as text",
+            "end try",
+            "if candidateSubject contains markerHint or candidateBody contains markerHint then",
+            "set _msg to candidate",
+            "exit repeat",
+            "end if",
+            "end try",
+            "end repeat",
+            "end if",
             "if _msg is missing value then",
+            "if (count of outgoing messages) > 0 then",
+            "set _msg to (last outgoing message)",
+            "else",
             "set _msg to make new outgoing message with properties {visible:false}",
+            "end if",
             "end if",
             "set visible of _msg to false",
             "if recipientHint is not \"\" then",
@@ -226,7 +445,10 @@ impl ActionRunner {
             "return draftId",
             "end run",
         ];
-        let draft_id = crate::applescript::run_with_args(&lines, &[preferred_id, recipient_hint])?;
+        let draft_id = crate::applescript::run_with_args(
+            &lines,
+            &[preferred_id, recipient_hint, marker_hint],
+        )?;
         let trimmed = draft_id.trim().to_string();
         Self::remember_mail_draft_id(history, &trimmed);
         Ok(trimmed)
@@ -443,7 +665,12 @@ impl ActionRunner {
             "end repeat",
             "end if",
             "if _msg is missing value then",
-            "set _msg to make new outgoing message with properties {visible:false}",
+            "if draftHint is not \"\" then return \"draft_not_found|\" & draftHint",
+            "if (count of outgoing messages) > 0 then",
+            "set _msg to (last outgoing message)",
+            "else",
+            "return \"no_draft|\"",
+            "end if",
             "end if",
             "set visible of _msg to false",
             "set hasTarget to false",
@@ -455,11 +682,23 @@ impl ActionRunner {
             "if hasTarget is false then",
             "make new to recipient at end of to recipients of _msg with properties {address:toAddress}",
             "end if",
+            "set draftId to \"\"",
+            "try",
+            "set draftId to (id of _msg as text)",
+            "end try",
             "end tell",
-            "return \"ok\"",
+            "return \"ok|\" & draftId",
             "end run",
         ];
-        crate::applescript::run_with_args(&lines, &[address, draft_hint])?;
+        let out = crate::applescript::run_with_args(&lines, &[address, draft_hint])?;
+        let mut parts = out.trim().split('|');
+        let status = parts.next().unwrap_or("").trim();
+        if status != "ok" {
+            return Err(anyhow::anyhow!(
+                "mail recipient target unavailable: {}",
+                out.trim()
+            ));
+        }
         Ok(())
     }
 
@@ -894,7 +1133,12 @@ impl ActionRunner {
             "end repeat",
             "end if",
             "if _msg is missing value then",
-            "set _msg to make new outgoing message with properties {visible:false}",
+            "if draftHint is not \"\" then return \"draft_not_found|\" & draftHint",
+            "if (count of outgoing messages) > 0 then",
+            "set _msg to (last outgoing message)",
+            "else",
+            "return \"no_draft|\"",
+            "end if",
             "end if",
             "set visible of _msg to false",
             "set subject of _msg to subjectText",
@@ -903,11 +1147,20 @@ impl ActionRunner {
             "set draftId to (id of _msg as text)",
             "end try",
             "end tell",
-            "return draftId",
+            "return \"ok|\" & draftId",
             "end run",
         ];
         let out = crate::applescript::run_with_args(&lines, &[subject.to_string(), draft_hint])?;
-        Ok(out.trim().to_string())
+        let trimmed = out.trim();
+        let mut parts = trimmed.split('|');
+        let status = parts.next().unwrap_or("").trim();
+        if status != "ok" {
+            return Err(anyhow::anyhow!(
+                "mail subject target unavailable: {}",
+                trimmed
+            ));
+        }
+        Ok(parts.next().unwrap_or("").trim().to_string())
     }
 
     fn mail_append_body(text: &str, draft_id: Option<&str>) -> Result<(String, i64)> {
@@ -931,7 +1184,12 @@ impl ActionRunner {
             "end repeat",
             "end if",
             "if _msg is missing value then",
-            "set _msg to make new outgoing message with properties {visible:false}",
+            "if draftHint is not \"\" then return \"draft_not_found|\" & draftHint & \"|0\"",
+            "if (count of outgoing messages) > 0 then",
+            "set _msg to (last outgoing message)",
+            "else",
+            "return \"no_draft||0\"",
+            "end if",
             "end if",
             "set visible of _msg to false",
             "set existingContent to content of _msg",
@@ -950,12 +1208,16 @@ impl ActionRunner {
             "set bodyLen to (length of (content of _msg as text))",
             "end try",
             "end tell",
-            "return draftId & \"|\" & bodyLen",
+            "return \"ok|\" & draftId & \"|\" & bodyLen",
             "end run",
         ];
         let out = crate::applescript::run_with_args(&lines, &[text.to_string(), draft_hint])?;
         let trimmed = out.trim();
         let mut parts = trimmed.split('|');
+        let status = parts.next().unwrap_or("").trim().to_string();
+        if status != "ok" {
+            return Err(anyhow::anyhow!("mail body target unavailable: {}", trimmed));
+        }
         let id = parts.next().unwrap_or("").trim().to_string();
         let body_len = parts
             .next()
@@ -1063,7 +1325,20 @@ impl ActionRunner {
         Ok(raw)
     }
 
-    fn notes_write_text(text: &str, goal: Option<&str>) -> Result<()> {
+    fn parse_notes_write_result(raw: &str) -> NotesWriteResult {
+        let mut parts = raw.trim().split('|');
+        let _status = parts.next().unwrap_or("").trim().to_string();
+        NotesWriteResult {
+            note_id: parts.next().unwrap_or("").trim().to_string(),
+            note_name: parts.next().unwrap_or("").trim().to_string(),
+            body_len: parts
+                .next()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .unwrap_or(0),
+        }
+    }
+
+    fn notes_write_text(text: &str, goal: Option<&str>) -> Result<NotesWriteResult> {
         let marker = Self::preferred_run_scope_marker(goal).unwrap_or_default();
         let lines = [
             "on run argv",
@@ -1139,12 +1414,24 @@ impl ActionRunner {
             "end if",
             "if mergedBody is not \"\" then set body of targetNote to mergedBody",
             "end if",
+            "set noteId to \"\"",
+            "set noteNameOut to \"\"",
+            "set noteBodyLen to 0",
+            "try",
+            "set noteId to id of targetNote as text",
+            "end try",
+            "try",
+            "set noteNameOut to name of targetNote as text",
+            "end try",
+            "try",
+            "set noteBodyLen to length of (body of targetNote as text)",
+            "end try",
             "end tell",
-            "return \"ok\"",
+            "return \"ok|\" & noteId & \"|\" & noteNameOut & \"|\" & noteBodyLen",
             "end run",
         ];
-        crate::applescript::run_with_args(&lines, &[text.to_string(), marker])?;
-        Ok(())
+        let out = crate::applescript::run_with_args(&lines, &[text.to_string(), marker])?;
+        Ok(Self::parse_notes_write_result(&out))
     }
 
     fn notes_read_text(goal: Option<&str>) -> Result<String> {
@@ -1202,7 +1489,20 @@ impl ActionRunner {
         Ok(out)
     }
 
-    fn textedit_append_text(text: &str, goal: Option<&str>) -> Result<()> {
+    fn parse_textedit_write_result(raw: &str) -> TextEditWriteResult {
+        let mut parts = raw.trim().split('|');
+        let _status = parts.next().unwrap_or("").trim().to_string();
+        TextEditWriteResult {
+            doc_id: parts.next().unwrap_or("").trim().to_string(),
+            doc_name: parts.next().unwrap_or("").trim().to_string(),
+            body_len: parts
+                .next()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .unwrap_or(0),
+        }
+    }
+
+    fn textedit_append_text(text: &str, goal: Option<&str>) -> Result<TextEditWriteResult> {
         let marker = Self::preferred_run_scope_marker(goal).unwrap_or_default();
         let isolate_unscoped = std::env::var("STEER_TEXTEDIT_ISOLATE_UNSCOPED")
             .map(|v| {
@@ -1264,16 +1564,28 @@ impl ActionRunner {
             "else",
             "set text of targetDoc to existingText & return & bodyText",
             "end if",
+            "set docId to \"\"",
+            "set docName to \"\"",
+            "set bodyLen to 0",
+            "try",
+            "set docId to id of targetDoc as text",
+            "end try",
+            "try",
+            "set docName to name of targetDoc as text",
+            "end try",
+            "try",
+            "set bodyLen to length of (text of targetDoc as text)",
+            "end try",
             "end tell",
-            "return \"ok\"",
+            "return \"ok|\" & docId & \"|\" & docName & \"|\" & bodyLen",
             "end run",
         ];
         let isolate_arg = if isolate_unscoped { "1" } else { "0" };
-        crate::applescript::run_with_args(
+        let out = crate::applescript::run_with_args(
             &lines,
             &[text.to_string(), marker, isolate_arg.to_string()],
         )?;
-        Ok(())
+        Ok(Self::parse_textedit_write_result(&out))
     }
 
     fn textedit_read_text(goal: Option<&str>) -> Result<String> {
@@ -1403,6 +1715,206 @@ impl ActionRunner {
         }
 
         (key, modifiers)
+    }
+
+    fn sanitize_evidence_value(value: &str) -> String {
+        value
+            .replace('\n', " ")
+            .replace('\r', " ")
+            .replace('|', "/")
+            .trim()
+            .to_string()
+    }
+
+    fn log_evidence(target: &str, event: &str, fields: &[(&str, String)]) {
+        let mut line = format!(
+            "EVIDENCE|target={}|event={}",
+            Self::sanitize_evidence_value(target),
+            Self::sanitize_evidence_value(event)
+        );
+        for (key, value) in fields {
+            line.push('|');
+            line.push_str(key);
+            line.push('=');
+            line.push_str(&Self::sanitize_evidence_value(value));
+        }
+        println!("{}", line);
+    }
+
+    fn idempotency_recent_hit(
+        session: &crate::session_store::Session,
+        key: &str,
+        recent_window: usize,
+    ) -> bool {
+        Self::idempotency_success_hit(session, key, Some(recent_window))
+    }
+
+    fn idempotency_success_hit(
+        session: &crate::session_store::Session,
+        key: &str,
+        recent_window: Option<usize>,
+    ) -> bool {
+        let iter = session.steps.iter().rev();
+        let mut inspected = 0usize;
+        for step in iter {
+            if let Some(limit) = recent_window {
+                if inspected >= limit {
+                    break;
+                }
+            }
+            inspected += 1;
+            if step.status != "success" {
+                continue;
+            }
+            let hit = step
+                .data
+                .as_ref()
+                .and_then(|v| v.get("idempotency_key"))
+                .and_then(|v| v.as_str())
+                .map(|v| v == key)
+                .unwrap_or(false);
+            if hit {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn idempotency_recent_window() -> usize {
+        std::env::var("STEER_ACTION_IDEMPOTENCY_WINDOW")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|v| v.clamp(4, 256))
+            .unwrap_or(16)
+    }
+
+    fn max_cmd_n_attempts_per_app() -> usize {
+        std::env::var("STEER_CMD_N_MAX_ATTEMPTS_PER_APP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|v| v.clamp(1, 6))
+            .unwrap_or(2)
+    }
+
+    fn session_cmd_n_stats(
+        session: &crate::session_store::Session,
+        app_name: &str,
+    ) -> (usize, usize) {
+        let app_lower = app_name.trim().to_lowercase();
+        if app_lower.is_empty() {
+            return (0, 0);
+        }
+        let key = format!("shortcut:{}:command+n:new_item", app_lower);
+        let mut attempts = 0usize;
+        let mut successes = 0usize;
+
+        for step in &session.steps {
+            let matches_key = step
+                .data
+                .as_ref()
+                .and_then(|v| v.get("idempotency_key"))
+                .and_then(|v| v.as_str())
+                .map(|v| v == key)
+                .unwrap_or(false);
+            if !matches_key {
+                continue;
+            }
+            attempts += 1;
+            if step.status == "success" {
+                successes += 1;
+            }
+        }
+
+        (attempts, successes)
+    }
+
+    fn is_single_fire_idempotency_key(key: &str) -> bool {
+        // New-item creation must not repeat in one run once it has succeeded.
+        key.contains(":command+n:new_item")
+    }
+
+    fn action_idempotency_key(
+        action_type: &str,
+        plan: &serde_json::Value,
+        goal: &str,
+        history: &[String],
+    ) -> Option<String> {
+        match action_type {
+            "open_app" | "switch_app" => {
+                let app = plan["name"]
+                    .as_str()
+                    .or_else(|| plan["app"].as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_lowercase();
+                if app.is_empty() {
+                    None
+                } else {
+                    Some(format!("{}:{}", action_type, app))
+                }
+            }
+            "open_url" => {
+                let url = plan["url"].as_str().unwrap_or("").trim().to_lowercase();
+                if url.is_empty() {
+                    None
+                } else {
+                    Some(format!("open_url:{}", url))
+                }
+            }
+            "mail_send" => {
+                let recipient = Self::preferred_mail_recipient(Some(goal)).unwrap_or_default();
+                let subject = Self::preferred_mail_subject(Some(goal)).unwrap_or_default();
+                let scope = Self::preferred_run_scope_marker(Some(goal)).unwrap_or_default();
+                let draft_id = plan["draft_id"].as_str().unwrap_or("").trim().to_string();
+                let suffix = if !draft_id.is_empty() {
+                    format!("draft={}", draft_id)
+                } else if !scope.is_empty() {
+                    format!("scope={}", scope.to_lowercase())
+                } else if !recipient.is_empty() || !subject.is_empty() {
+                    format!(
+                        "recipient={}::subject={}",
+                        recipient.to_lowercase(),
+                        subject.to_lowercase()
+                    )
+                } else {
+                    "generic".to_string()
+                };
+                Some(format!("mail_send:{}", suffix))
+            }
+            "shortcut" | "key" => {
+                let raw_key = plan["key"].as_str().unwrap_or("").to_string();
+                let raw_modifiers: Vec<String> = plan["modifiers"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let (key, modifiers) = Self::normalize_shortcut_parts(&raw_key, &raw_modifiers);
+                let app_context = plan["app"]
+                    .as_str()
+                    .map(|v| v.trim().to_lowercase())
+                    .filter(|v| !v.is_empty())
+                    .or_else(|| {
+                        Self::last_opened_app_from_history(history).map(|v| v.trim().to_lowercase())
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
+                let has_command = modifiers.iter().any(|m| m == "command");
+                let has_shift = modifiers.iter().any(|m| m == "shift");
+                if key == "n" && has_command {
+                    return Some(format!("shortcut:{}:command+n:new_item", app_context));
+                }
+                if key == "d" && has_command && has_shift {
+                    return Some(format!(
+                        "shortcut:{}:command+shift+d:mail_send",
+                        app_context
+                    ));
+                }
+                None
+            }
+            _ => None,
+        }
     }
 
     fn extract_quoted_fragments(goal: &str) -> Vec<String> {
@@ -1577,6 +2089,52 @@ impl ActionRunner {
         let mut description = format!("Executing {}", action_type);
         let mut action_status_override: Option<&str> = None;
         let mut action_data: Option<serde_json::Value> = None;
+        let focus_guard_required = matches!(
+            action_type,
+            "type"
+                | "paste"
+                | "copy"
+                | "select_all"
+                | "shortcut"
+                | "key"
+                | "open_app"
+                | "switch_app"
+        );
+        let mut focus_guard_target =
+            if focus_guard_required && !matches!(action_type, "open_app" | "switch_app") {
+                Self::preferred_target_app_from_history(action_type, plan, history)
+            } else {
+                None
+            };
+        let idempotency_key = if Self::bool_env_with_default("STEER_ACTION_IDEMPOTENCY", true) {
+            Self::action_idempotency_key(action_type, plan, goal, history)
+        } else {
+            None
+        };
+
+        if let Some(key) = idempotency_key.as_deref() {
+            let already_done = if Self::is_single_fire_idempotency_key(key) {
+                Self::idempotency_success_hit(session, key, None)
+            } else {
+                Self::idempotency_recent_hit(session, key, Self::idempotency_recent_window())
+            };
+            if already_done {
+                let skip_description = format!("Idempotent skip: {}", key);
+                history.push(skip_description.clone());
+                session.add_step(
+                    action_type,
+                    &skip_description,
+                    "success",
+                    Some(json!({
+                        "proof": "idempotent_skip",
+                        "idempotency_key": key
+                    })),
+                );
+                let _ = crate::session_store::save_session(session);
+                *consecutive_failures = 0;
+                return Ok(());
+            }
+        }
 
         // Pre-action focus: keep action target app frontmost to prevent drift.
         Self::stabilize_focus_for_action(action_type, plan, history, goal).await;
@@ -1866,14 +2424,30 @@ impl ActionRunner {
                         let draft_id = Self::mail_ensure_draft(Some(goal), history)
                             .ok()
                             .filter(|v| !v.trim().is_empty());
-                        let _ =
-                            Self::mail_set_recipient_if_missing(Some(goal), draft_id.as_deref());
+                        let recipient_hint = Self::preferred_mail_recipient(Some(goal));
+                        if let Err(e) =
+                            Self::mail_set_recipient_if_missing(Some(goal), draft_id.as_deref())
+                        {
+                            description = format!("Type failed (mail recipient): {}", e);
+                            action_status_override = Some("failed");
+                        } else if let Some(recipient) = recipient_hint {
+                            let draft_for_log = draft_id.clone().unwrap_or_default();
+                            Self::log_evidence(
+                                "mail",
+                                "write",
+                                &[
+                                    ("status", "confirmed".to_string()),
+                                    ("recipient", recipient),
+                                    ("draft_id", draft_for_log),
+                                ],
+                            );
+                        }
                         let subject_already_set = history
                             .iter()
                             .any(|h| h.to_lowercase().contains("(mail subject)"));
                         let prefer_subject = heuristics::looks_like_subject(&text)
                             || (!subject_already_set && !text.contains('\n') && text.len() <= 120);
-                        if prefer_subject {
+                        if action_status_override != Some("failed") && prefer_subject {
                             match Self::mail_set_subject(&text, draft_id.as_deref()) {
                                 Ok(target_draft_id) => {
                                     Self::remember_mail_draft_id(history, &target_draft_id);
@@ -1882,13 +2456,22 @@ impl ActionRunner {
                                         "proof": "mail_subject_set",
                                         "text_len": text.chars().count()
                                     }));
+                                    Self::log_evidence(
+                                        "mail",
+                                        "write",
+                                        &[
+                                            ("status", "confirmed".to_string()),
+                                            ("subject", text.clone()),
+                                            ("draft_id", target_draft_id),
+                                        ],
+                                    );
                                 }
                                 Err(e) => {
                                     description = format!("Type failed (mail subject): {}", e);
                                     action_status_override = Some("failed");
                                 }
                             }
-                        } else {
+                        } else if action_status_override != Some("failed") {
                             match Self::mail_append_body(&text, draft_id.as_deref()) {
                                 Ok((target_draft_id, mut readback_len)) => {
                                     Self::remember_mail_draft_id(history, &target_draft_id);
@@ -1902,17 +2485,6 @@ impl ActionRunner {
                                             && forced_text.trim() != text.trim()
                                         {
                                             if let Ok((forced_draft_id, forced_len)) =
-                                                Self::mail_create_filled_draft(
-                                                    Some(goal),
-                                                    &forced_text,
-                                                )
-                                            {
-                                                Self::remember_mail_draft_id(
-                                                    history,
-                                                    &forced_draft_id,
-                                                );
-                                                readback_len = forced_len;
-                                            } else if let Ok((forced_draft_id, forced_len)) =
                                                 Self::mail_append_body(
                                                     &forced_text,
                                                     Some(target_draft_id.as_str()),
@@ -1938,6 +2510,15 @@ impl ActionRunner {
                                             "text_len": text.chars().count(),
                                             "readback_len": readback_len
                                         }));
+                                        Self::log_evidence(
+                                            "mail",
+                                            "write",
+                                            &[
+                                                ("status", "confirmed".to_string()),
+                                                ("body_len", readback_len.to_string()),
+                                                ("draft_id", target_draft_id),
+                                            ],
+                                        );
                                     }
                                 }
                                 Err(e) => {
@@ -1977,13 +2558,29 @@ impl ActionRunner {
                             }
                         }
                         match Self::notes_write_text(&write_text, Some(goal)) {
-                            Ok(_) => {
-                                description = format!("Typed '{}' (notes body)", write_text);
+                            Ok(write_result) => {
+                                description = format!(
+                                    "Typed '{}' (notes body note_id={} note_name={})",
+                                    write_text, write_result.note_id, write_result.note_name
+                                );
                                 action_status_override = Some("success");
                                 action_data = Some(json!({
                                     "proof": "notes_write_text",
-                                    "text_len": write_text.chars().count()
+                                    "text_len": write_text.chars().count(),
+                                    "note_id": write_result.note_id,
+                                    "note_name": write_result.note_name,
+                                    "note_body_len": write_result.body_len
                                 }));
+                                Self::log_evidence(
+                                    "notes",
+                                    "write",
+                                    &[
+                                        ("status", "confirmed".to_string()),
+                                        ("note_id", write_result.note_id.clone()),
+                                        ("note_name", write_result.note_name.clone()),
+                                        ("body_len", write_result.body_len.to_string()),
+                                    ],
+                                );
                             }
                             Err(e) => {
                                 description = format!("Type failed (notes body): {}", e);
@@ -1992,13 +2589,29 @@ impl ActionRunner {
                         }
                     } else if app_name.eq_ignore_ascii_case("TextEdit") {
                         match Self::textedit_append_text(&text, Some(goal)) {
-                            Ok(_) => {
-                                description = format!("Typed '{}' (textedit body)", text);
+                            Ok(write_result) => {
+                                description = format!(
+                                    "Typed '{}' (textedit body doc_id={} doc_name={})",
+                                    text, write_result.doc_id, write_result.doc_name
+                                );
                                 action_status_override = Some("success");
                                 action_data = Some(json!({
                                     "proof": "textedit_append_text",
-                                    "text_len": text.chars().count()
+                                    "text_len": text.chars().count(),
+                                    "doc_id": write_result.doc_id,
+                                    "doc_name": write_result.doc_name,
+                                    "doc_body_len": write_result.body_len
                                 }));
+                                Self::log_evidence(
+                                    "textedit",
+                                    "write",
+                                    &[
+                                        ("status", "confirmed".to_string()),
+                                        ("doc_id", write_result.doc_id.clone()),
+                                        ("doc_name", write_result.doc_name.clone()),
+                                        ("body_len", write_result.body_len.to_string()),
+                                    ],
+                                );
                             }
                             Err(e) => {
                                 description = format!("Type failed (textedit body): {}", e);
@@ -2065,8 +2678,57 @@ impl ActionRunner {
                     let is_cmd_shift_d = key == "d" && has_command && has_shift;
                     let front_app = crate::tool_chaining::CrossAppBridge::get_frontmost_app()
                         .unwrap_or_default();
+                    let cmd_n_target_app = plan["app"]
+                        .as_str()
+                        .unwrap_or(front_app.as_str())
+                        .trim()
+                        .to_string();
+                    let cmd_n_single_fire_key = format!(
+                        "shortcut:{}:command+n:new_item",
+                        cmd_n_target_app.to_lowercase()
+                    );
+                    let cmd_n_session_skip = is_cmd_n
+                        && !cmd_n_target_app.is_empty()
+                        && Self::session_has_single_fire_new_item(session, &cmd_n_single_fire_key);
+                    let (cmd_n_attempts, cmd_n_successes) = if is_cmd_n {
+                        Self::session_cmd_n_stats(session, &cmd_n_target_app)
+                    } else {
+                        (0, 0)
+                    };
+                    let cmd_n_attempt_guard_hit = is_cmd_n
+                        && !cmd_n_target_app.is_empty()
+                        && cmd_n_successes == 0
+                        && cmd_n_attempts >= Self::max_cmd_n_attempts_per_app();
 
-                    if is_cmd_n && front_app.eq_ignore_ascii_case("Mail") {
+                    if cmd_n_attempt_guard_hit {
+                        description = format!(
+                            "Shortcut '{}' + {:?} blocked (cmd+n loop guard in {}, attempts={})",
+                            key, shortcut_modifiers, cmd_n_target_app, cmd_n_attempts
+                        );
+                        action_status_override = Some("failed");
+                        action_data = Some(json!({
+                            "proof": "cmd_n_loop_guard_block",
+                            "front_app": cmd_n_target_app,
+                            "shortcut": "cmd+n",
+                            "attempts": cmd_n_attempts
+                        }));
+                    } else if is_cmd_n
+                        && !cmd_n_target_app.is_empty()
+                        && (Self::should_skip_redundant_cmd_n(history, &cmd_n_target_app)
+                            || cmd_n_session_skip)
+                    {
+                        description = format!(
+                            "Shortcut '{}' + {:?} skipped (redundant new item in {})",
+                            key, shortcut_modifiers, cmd_n_target_app
+                        );
+                        action_status_override = Some("success");
+                        action_data = Some(json!({
+                            "proof": "redundant_new_item_skip",
+                            "front_app": cmd_n_target_app,
+                            "shortcut": "cmd+n"
+                        }));
+                    } else if is_cmd_n && cmd_n_target_app.eq_ignore_ascii_case("Mail") {
+                        let _ = heuristics::ensure_app_focus("Mail", 5).await;
                         match Self::mail_ensure_draft(Some(goal), history) {
                             Ok(draft_id) => {
                                 Self::remember_mail_draft_id(history, &draft_id);
@@ -2119,11 +2781,26 @@ impl ActionRunner {
                                     "body_len": send_result.body_len
                                 }));
                                 println!(
-                                    "MAIL_SEND_PROOF|status={}|recipient={}|subject={}|body_len={}",
+                                    "MAIL_SEND_PROOF|status={}|recipient={}|subject={}|body_len={}|draft_id={}",
                                     send_result.status,
                                     send_result.recipient,
                                     send_result.subject,
-                                    send_result.body_len.unwrap_or(-1)
+                                    send_result.body_len.unwrap_or(-1),
+                                    send_result.draft_id
+                                );
+                                Self::log_evidence(
+                                    "mail",
+                                    "send",
+                                    &[
+                                        ("status", send_result.status.clone()),
+                                        ("recipient", send_result.recipient.clone()),
+                                        ("subject", send_result.subject.clone()),
+                                        (
+                                            "body_len",
+                                            send_result.body_len.unwrap_or(-1).to_string(),
+                                        ),
+                                        ("draft_id", send_result.draft_id.clone()),
+                                    ],
                                 );
                             }
                             Err(e) => {
@@ -2186,7 +2863,56 @@ impl ActionRunner {
                         key == "s" && modifiers.iter().any(|m| m.eq_ignore_ascii_case("command"));
                     let front_app = crate::tool_chaining::CrossAppBridge::get_frontmost_app()
                         .unwrap_or_default();
-                    if is_cmd_n && front_app.eq_ignore_ascii_case("Mail") {
+                    let cmd_n_target_app = plan["app"]
+                        .as_str()
+                        .unwrap_or(front_app.as_str())
+                        .trim()
+                        .to_string();
+                    let cmd_n_single_fire_key = format!(
+                        "shortcut:{}:command+n:new_item",
+                        cmd_n_target_app.to_lowercase()
+                    );
+                    let cmd_n_session_skip = is_cmd_n
+                        && !cmd_n_target_app.is_empty()
+                        && Self::session_has_single_fire_new_item(session, &cmd_n_single_fire_key);
+                    let (cmd_n_attempts, cmd_n_successes) = if is_cmd_n {
+                        Self::session_cmd_n_stats(session, &cmd_n_target_app)
+                    } else {
+                        (0, 0)
+                    };
+                    let cmd_n_attempt_guard_hit = is_cmd_n
+                        && !cmd_n_target_app.is_empty()
+                        && cmd_n_successes == 0
+                        && cmd_n_attempts >= Self::max_cmd_n_attempts_per_app();
+                    if cmd_n_attempt_guard_hit {
+                        description = format!(
+                            "Shortcut '{}' + {:?} blocked (cmd+n loop guard in {}, attempts={})",
+                            key, modifiers, cmd_n_target_app, cmd_n_attempts
+                        );
+                        action_status_override = Some("failed");
+                        action_data = Some(json!({
+                            "proof": "cmd_n_loop_guard_block",
+                            "front_app": cmd_n_target_app,
+                            "shortcut": "cmd+n",
+                            "attempts": cmd_n_attempts
+                        }));
+                    } else if is_cmd_n
+                        && !cmd_n_target_app.is_empty()
+                        && (Self::should_skip_redundant_cmd_n(history, &cmd_n_target_app)
+                            || cmd_n_session_skip)
+                    {
+                        description = format!(
+                            "Shortcut '{}' + {:?} skipped (redundant new item in {})",
+                            key, modifiers, cmd_n_target_app
+                        );
+                        action_status_override = Some("success");
+                        action_data = Some(json!({
+                            "proof": "redundant_new_item_skip",
+                            "front_app": cmd_n_target_app,
+                            "shortcut": "cmd+n"
+                        }));
+                    } else if is_cmd_n && cmd_n_target_app.eq_ignore_ascii_case("Mail") {
+                        let _ = heuristics::ensure_app_focus("Mail", 5).await;
                         match Self::mail_ensure_draft(Some(goal), history) {
                             Ok(draft_id) => {
                                 Self::remember_mail_draft_id(history, &draft_id);
@@ -2237,11 +2963,26 @@ impl ActionRunner {
                                     "body_len": send_result.body_len
                                 }));
                                 println!(
-                                    "MAIL_SEND_PROOF|status={}|recipient={}|subject={}|body_len={}",
+                                    "MAIL_SEND_PROOF|status={}|recipient={}|subject={}|body_len={}|draft_id={}",
                                     send_result.status,
                                     send_result.recipient,
                                     send_result.subject,
-                                    send_result.body_len.unwrap_or(-1)
+                                    send_result.body_len.unwrap_or(-1),
+                                    send_result.draft_id
+                                );
+                                Self::log_evidence(
+                                    "mail",
+                                    "send",
+                                    &[
+                                        ("status", send_result.status.clone()),
+                                        ("recipient", send_result.recipient.clone()),
+                                        ("subject", send_result.subject.clone()),
+                                        (
+                                            "body_len",
+                                            send_result.body_len.unwrap_or(-1).to_string(),
+                                        ),
+                                        ("draft_id", send_result.draft_id.clone()),
+                                    ],
                                 );
                             }
                             Err(e) => {
@@ -2268,6 +3009,11 @@ impl ActionRunner {
                                 "proof": "textedit_save",
                                 "front_app": "TextEdit"
                             }));
+                            Self::log_evidence(
+                                "textedit",
+                                "save",
+                                &[("status", "confirmed".to_string())],
+                            );
                         } else {
                             description = format!("Shortcut '{}' + {:?}", key, modifiers);
                         }
@@ -2329,12 +3075,25 @@ impl ActionRunner {
                             "fresh_recovery_used": fresh_recovery_used
                         }));
                         println!(
-                            "MAIL_SEND_PROOF|status={}|recipient={}|subject={}|body_len={}|fresh_recovery={}",
+                            "MAIL_SEND_PROOF|status={}|recipient={}|subject={}|body_len={}|draft_id={}|fresh_recovery={}",
                             send_result.status,
                             send_result.recipient,
                             send_result.subject,
                             send_result.body_len.unwrap_or(-1),
+                            send_result.draft_id,
                             fresh_recovery_used
+                        );
+                        Self::log_evidence(
+                            "mail",
+                            "send",
+                            &[
+                                ("status", send_result.status.clone()),
+                                ("recipient", send_result.recipient.clone()),
+                                ("subject", send_result.subject.clone()),
+                                ("body_len", send_result.body_len.unwrap_or(-1).to_string()),
+                                ("draft_id", send_result.draft_id.clone()),
+                                ("fresh_recovery", fresh_recovery_used.to_string()),
+                            ],
                         );
                     }
                     Err(e) => {
@@ -2357,84 +3116,114 @@ impl ActionRunner {
                     let draft_id = Self::mail_ensure_draft(Some(goal), history)
                         .ok()
                         .filter(|v| !v.trim().is_empty());
-                    let _ = Self::mail_set_recipient_if_missing(Some(goal), draft_id.as_deref());
-                    let mut text = crate::tool_chaining::CrossAppBridge::get_clipboard()
-                        .unwrap_or_else(|_| "".to_string());
-                    let fallback = Self::mail_fallback_body_from_goal(goal);
-                    if text.trim().len() < 6 {
-                        if !fallback.is_empty() {
-                            text = fallback;
+                    let recipient_hint = Self::preferred_mail_recipient(Some(goal));
+                    if let Err(e) =
+                        Self::mail_set_recipient_if_missing(Some(goal), draft_id.as_deref())
+                    {
+                        description = format!("Paste failed (mail recipient): {}", e);
+                        action_status_override = Some("failed");
+                    } else if let Some(recipient) = recipient_hint {
+                        let draft_for_log = draft_id.clone().unwrap_or_default();
+                        Self::log_evidence(
+                            "mail",
+                            "write",
+                            &[
+                                ("status", "confirmed".to_string()),
+                                ("recipient", recipient),
+                                ("draft_id", draft_for_log),
+                            ],
+                        );
+                    }
+                    if action_status_override != Some("failed") {
+                        let mut text = crate::tool_chaining::CrossAppBridge::get_clipboard()
+                            .unwrap_or_else(|_| "".to_string());
+                        let fallback = Self::mail_fallback_body_from_goal(goal);
+                        if text.trim().len() < 6 {
+                            if !fallback.is_empty() {
+                                text = fallback;
+                            }
+                        } else {
+                            let quoted = Self::extract_quoted_fragments(goal)
+                                .into_iter()
+                                .filter(|s| s.len() >= 3)
+                                .collect::<Vec<_>>();
+                            let has_any_goal_fragment =
+                                quoted.iter().any(|frag| text.contains(frag));
+                            if !has_any_goal_fragment && !fallback.is_empty() {
+                                text = fallback;
+                            }
                         }
-                    } else {
                         let quoted = Self::extract_quoted_fragments(goal)
                             .into_iter()
                             .filter(|s| s.len() >= 3)
                             .collect::<Vec<_>>();
-                        let has_any_goal_fragment = quoted.iter().any(|frag| text.contains(frag));
-                        if !has_any_goal_fragment && !fallback.is_empty() {
-                            text = fallback;
-                        }
-                    }
-                    let quoted = Self::extract_quoted_fragments(goal)
-                        .into_iter()
-                        .filter(|s| s.len() >= 3)
-                        .collect::<Vec<_>>();
-                    if !quoted.is_empty() {
-                        let mut missing = Vec::new();
-                        for frag in &quoted {
-                            if !text.contains(frag) {
-                                missing.push(frag.clone());
-                            }
-                        }
-                        if !missing.is_empty() {
-                            if text.trim().is_empty() {
-                                text = missing.join("\n");
-                            } else {
-                                text = format!("{}\n{}", text.trim_end(), missing.join("\n"));
-                            }
-                        }
-                    }
-                    match Self::mail_append_body(&text, draft_id.as_deref()) {
-                        Ok((target_draft_id, mut readback_len)) => {
-                            Self::remember_mail_draft_id(history, &target_draft_id);
-                            if readback_len <= 2 {
-                                let forced_text = Self::extract_quoted_fragments(goal)
-                                    .into_iter()
-                                    .filter(|s| s.len() >= 3)
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                if !forced_text.trim().is_empty()
-                                    && forced_text.trim() != text.trim()
-                                {
-                                    if let Ok((forced_draft_id, forced_len)) =
-                                        Self::mail_append_body(
-                                            &forced_text,
-                                            Some(target_draft_id.as_str()),
-                                        )
-                                    {
-                                        Self::remember_mail_draft_id(history, &forced_draft_id);
-                                        readback_len = forced_len;
-                                    }
+                        if !quoted.is_empty() {
+                            let mut missing = Vec::new();
+                            for frag in &quoted {
+                                if !text.contains(frag) {
+                                    missing.push(frag.clone());
                                 }
                             }
-                            if readback_len <= 2 {
-                                description =
-                                    "Paste failed (mail body): empty readback after append"
-                                        .to_string();
-                                action_status_override = Some("failed");
-                            } else {
-                                description = "Pasted clipboard contents (mail body)".to_string();
-                                action_status_override = Some("success");
-                                action_data = Some(json!({
-                                    "proof": "mail_body_appended",
-                                    "text_len": text.chars().count(),
-                                    "readback_len": readback_len
-                                }));
+                            if !missing.is_empty() {
+                                if text.trim().is_empty() {
+                                    text = missing.join("\n");
+                                } else {
+                                    text = format!("{}\n{}", text.trim_end(), missing.join("\n"));
+                                }
                             }
                         }
-                        Err(e) => {
-                            description = format!("Paste failed (mail body): {}", e);
-                            action_status_override = Some("failed");
+                        match Self::mail_append_body(&text, draft_id.as_deref()) {
+                            Ok((target_draft_id, mut readback_len)) => {
+                                Self::remember_mail_draft_id(history, &target_draft_id);
+                                if readback_len <= 2 {
+                                    let forced_text = Self::extract_quoted_fragments(goal)
+                                        .into_iter()
+                                        .filter(|s| s.len() >= 3)
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    if !forced_text.trim().is_empty()
+                                        && forced_text.trim() != text.trim()
+                                    {
+                                        if let Ok((forced_draft_id, forced_len)) =
+                                            Self::mail_append_body(
+                                                &forced_text,
+                                                Some(target_draft_id.as_str()),
+                                            )
+                                        {
+                                            Self::remember_mail_draft_id(history, &forced_draft_id);
+                                            readback_len = forced_len;
+                                        }
+                                    }
+                                }
+                                if readback_len <= 2 {
+                                    description =
+                                        "Paste failed (mail body): empty readback after append"
+                                            .to_string();
+                                    action_status_override = Some("failed");
+                                } else {
+                                    description =
+                                        "Pasted clipboard contents (mail body)".to_string();
+                                    action_status_override = Some("success");
+                                    action_data = Some(json!({
+                                        "proof": "mail_body_appended",
+                                        "text_len": text.chars().count(),
+                                        "readback_len": readback_len
+                                    }));
+                                    Self::log_evidence(
+                                        "mail",
+                                        "write",
+                                        &[
+                                            ("status", "confirmed".to_string()),
+                                            ("body_len", readback_len.to_string()),
+                                            ("draft_id", target_draft_id),
+                                        ],
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                description = format!("Paste failed (mail body): {}", e);
+                                action_status_override = Some("failed");
+                            }
                         }
                     }
                 } else if front_app.eq_ignore_ascii_case("TextEdit") {
@@ -2464,13 +3253,29 @@ impl ActionRunner {
                         }
                     }
                     match Self::textedit_append_text(&text, Some(goal)) {
-                        Ok(_) => {
-                            description = "Pasted clipboard contents (textedit body)".to_string();
+                        Ok(write_result) => {
+                            description = format!(
+                                "Pasted clipboard contents (textedit body doc_id={} doc_name={})",
+                                write_result.doc_id, write_result.doc_name
+                            );
                             action_status_override = Some("success");
                             action_data = Some(json!({
                                 "proof": "textedit_append_text",
-                                "text_len": text.chars().count()
+                                "text_len": text.chars().count(),
+                                "doc_id": write_result.doc_id,
+                                "doc_name": write_result.doc_name,
+                                "doc_body_len": write_result.body_len
                             }));
+                            Self::log_evidence(
+                                "textedit",
+                                "write",
+                                &[
+                                    ("status", "confirmed".to_string()),
+                                    ("doc_id", write_result.doc_id.clone()),
+                                    ("doc_name", write_result.doc_name.clone()),
+                                    ("body_len", write_result.body_len.to_string()),
+                                ],
+                            );
                         }
                         Err(e) => {
                             description = format!("Paste failed (textedit body): {}", e);
@@ -2569,14 +3374,34 @@ impl ActionRunner {
                     description = "switch_app failed: missing app/name".to_string();
                     action_status_override = Some("failed");
                 } else {
-                    match crate::tool_chaining::CrossAppBridge::switch_to_app(app_name) {
-                        Ok(_) => {
-                            let _ = heuristics::ensure_app_focus(app_name, 3).await;
-                            description = format!("Switched to app: {}", app_name);
+                    let mut redundant_skip = false;
+                    if Self::bool_env_with_default("STEER_BLOCK_REDUNDANT_SWITCH_APP", true) {
+                        if let Ok(front_app) =
+                            crate::tool_chaining::CrossAppBridge::get_frontmost_app()
+                        {
+                            if front_app.eq_ignore_ascii_case(app_name) {
+                                description =
+                                    format!("Switched to app: {} (skipped redundant)", app_name);
+                                action_status_override = Some("success");
+                                action_data = Some(json!({
+                                    "proof": "redundant_switch_app_skip",
+                                    "front_app": front_app
+                                }));
+                                redundant_skip = true;
+                            }
                         }
-                        Err(e) => {
-                            description = format!("switch_app failed: {}", e);
-                            action_status_override = Some("failed");
+                    }
+                    if !redundant_skip {
+                        match crate::tool_chaining::CrossAppBridge::switch_to_app(app_name) {
+                            Ok(_) => {
+                                let _ = heuristics::ensure_app_focus(app_name, 3).await;
+                                focus_guard_target = Some(app_name.to_string());
+                                description = format!("Switched to app: {}", app_name);
+                            }
+                            Err(e) => {
+                                description = format!("switch_app failed: {}", e);
+                                action_status_override = Some("failed");
+                            }
                         }
                     }
                 }
@@ -2621,22 +3446,53 @@ impl ActionRunner {
                             "      🚀 Launching/Focusing App: '{}' (Canonical: '{}')",
                             name, canonical_name
                         );
-                        match crate::tool_chaining::CrossAppBridge::switch_to_app(&canonical_name) {
-                            Ok(_) => {
-                                let _ = heuristics::ensure_app_focus(&canonical_name, 3).await;
-                                let step = SmartStep::new(
-                                    UiAction::Type(canonical_name.clone()),
-                                    "Open App",
-                                );
-                                session_steps.push(step);
-                                description = format!("Opened app: {}", canonical_name);
-                                session
-                                    .add_message("tool", &format!("open_app: {}", canonical_name));
+                        let mut redundant_skip = false;
+                        if Self::bool_env_with_default("STEER_BLOCK_REDUNDANT_OPEN_APP", true) {
+                            if let Ok(front_app_now) =
+                                crate::tool_chaining::CrossAppBridge::get_frontmost_app()
+                            {
+                                if front_app_now.eq_ignore_ascii_case(&canonical_name)
+                                    && Self::history_has_recent_open_for_app(
+                                        history,
+                                        &canonical_name,
+                                    )
+                                {
+                                    description = format!(
+                                        "Opened app: {} (skipped redundant)",
+                                        canonical_name
+                                    );
+                                    action_status_override = Some("success");
+                                    action_data = Some(json!({
+                                        "proof": "redundant_open_app_skip",
+                                        "front_app": front_app_now
+                                    }));
+                                    redundant_skip = true;
+                                }
                             }
-                            Err(e) => {
-                                error!("      ❌ App open failed: {}", e);
-                                description = format!("Open app failed: {}", e);
-                                action_status_override = Some("failed");
+                        }
+                        if !redundant_skip {
+                            match crate::tool_chaining::CrossAppBridge::switch_to_app(
+                                &canonical_name,
+                            ) {
+                                Ok(_) => {
+                                    let _ = heuristics::ensure_app_focus(&canonical_name, 3).await;
+                                    focus_guard_target = Some(canonical_name.clone());
+                                    let step = SmartStep::new(
+                                        UiAction::Type(canonical_name.clone()),
+                                        "Open App",
+                                    );
+                                    session_steps.push(step);
+                                    description = format!("Opened app: {}", canonical_name);
+                                    session.add_message(
+                                        "tool",
+                                        &format!("open_app: {}", canonical_name),
+                                    );
+                                }
+                                Err(e) => {
+                                    error!("      ❌ App open failed: {}", e);
+                                    description = format!("Open app failed: {}", e);
+                                    action_status_override = Some("failed");
+                                }
                             }
                         }
                     }
@@ -2674,6 +3530,55 @@ impl ActionRunner {
             driver.steps.clear();
         }
 
+        if action_status_override.is_none() && focus_guard_required {
+            if let Some(target_app) = focus_guard_target.as_deref() {
+                let retries = Self::focus_recovery_max_retries();
+                let (focus_ok, front_after, attempts, recovery_trace) =
+                    Self::recover_focus_and_verify(target_app, retries).await;
+                if focus_ok {
+                    if attempts > 0 {
+                        Self::put_action_data_field(
+                            &mut action_data,
+                            "focus_recovery",
+                            json!({
+                                "status": "recovered",
+                                "expected_app": target_app,
+                                "front_app_after": front_after,
+                                "attempts": attempts,
+                                "profile": Self::focus_recovery_profile(),
+                                "trace": recovery_trace
+                            }),
+                        );
+                    }
+                } else {
+                    let actual = if front_after.trim().is_empty() {
+                        "unknown".to_string()
+                    } else {
+                        front_after
+                    };
+                    let detail = format!(
+                        "focus_recovery_failed expected={} actual={} retries={}",
+                        target_app, actual, attempts
+                    );
+                    description = format!("{} | {}", description, detail);
+                    action_status_override = Some("failed");
+                    Self::put_action_data_field(
+                        &mut action_data,
+                        "focus_recovery",
+                        json!({
+                            "status": "failed",
+                            "expected_app": target_app,
+                            "front_app_after": actual,
+                            "attempts": attempts,
+                            "max_retries": retries,
+                            "profile": Self::focus_recovery_profile(),
+                            "trace": recovery_trace
+                        }),
+                    );
+                }
+            }
+        }
+
         // Log to history and session
         if action_status_override.is_none() {
             let lower_desc = description.to_lowercase();
@@ -2695,6 +3600,9 @@ impl ActionRunner {
         }
 
         let status = action_status_override.unwrap_or("success");
+        if let Some(key) = idempotency_key {
+            Self::put_action_data_field(&mut action_data, "idempotency_key", json!(key));
+        }
         history.push(description.clone());
         if action_data.is_none() {
             if let Ok(front_after) = crate::tool_chaining::CrossAppBridge::get_frontmost_app() {
@@ -2712,7 +3620,27 @@ impl ActionRunner {
             *consecutive_failures = 0;
         }
 
-        if status != "success" && matches!(action_type, "click_visual" | "click_ref") {
+        let strict_fail_all_actions = std::env::var("STEER_STRICT_ACTION_ERRORS")
+            .ok()
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+        let hard_fail_action = matches!(
+            action_type,
+            "click_visual"
+                | "click_ref"
+                | "open_app"
+                | "switch_app"
+                | "type"
+                | "paste"
+                | "mail_send"
+        );
+
+        if status != "success" && (hard_fail_action || strict_fail_all_actions) {
             return Err(anyhow::anyhow!(
                 "Critical {} action failed: {}",
                 action_type,
@@ -2727,6 +3655,7 @@ impl ActionRunner {
 #[cfg(test)]
 mod tests {
     use super::ActionRunner;
+    use serde_json::json;
 
     #[test]
     fn normalize_email_candidate_strips_korean_particle_suffix() {
@@ -2739,5 +3668,124 @@ mod tests {
         let goal = "받는 사람에 \"qed4950@gmail.com\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요.";
         let got = ActionRunner::extract_mail_recipient_from_goal(goal);
         assert_eq!(got.as_deref(), Some("qed4950@gmail.com"));
+    }
+
+    #[test]
+    fn action_idempotency_key_scopes_cmd_n_to_app_context() {
+        let plan_with_app = json!({
+            "action": "shortcut",
+            "key": "n",
+            "modifiers": ["command"],
+            "app": "Mail"
+        });
+        let key =
+            ActionRunner::action_idempotency_key("shortcut", &plan_with_app, "Mail 초안 작성", &[]);
+        assert_eq!(key.as_deref(), Some("shortcut:mail:command+n:new_item"));
+
+        let history = vec!["Opened app: Notes".to_string()];
+        let plan_without_app = json!({
+            "action": "shortcut",
+            "key": "n",
+            "modifiers": ["command"]
+        });
+        let key_from_history = ActionRunner::action_idempotency_key(
+            "shortcut",
+            &plan_without_app,
+            "메모 작성",
+            &history,
+        );
+        assert_eq!(
+            key_from_history.as_deref(),
+            Some("shortcut:notes:command+n:new_item")
+        );
+    }
+
+    #[test]
+    fn redundant_cmd_n_skip_is_scoped_to_same_app_context() {
+        let history = vec![
+            "Opened app: Mail".to_string(),
+            "Shortcut 'n' + [\"command\"] (Created new item)".to_string(),
+            "Typed 'Subject' (mail subject)".to_string(),
+        ];
+        assert!(ActionRunner::should_skip_redundant_cmd_n(&history, "Mail"));
+        assert!(!ActionRunner::should_skip_redundant_cmd_n(
+            &history, "Notes"
+        ));
+    }
+
+    #[test]
+    fn history_recent_open_for_app_uses_latest_open_entry() {
+        let history = vec![
+            "Opened app: Notes".to_string(),
+            "Typed 'hello' (notes body)".to_string(),
+            "Opened app: Mail".to_string(),
+        ];
+        assert!(ActionRunner::history_has_recent_open_for_app(
+            &history, "Mail"
+        ));
+        assert!(!ActionRunner::history_has_recent_open_for_app(
+            &history, "Notes"
+        ));
+    }
+
+    #[test]
+    fn single_fire_cmd_n_idempotency_survives_long_step_history() {
+        let mut session = crate::session_store::Session::new("mail 작성", Some("test"));
+        session.add_step(
+            "shortcut",
+            "Shortcut 'n' + [\"command\"] (Created new item)",
+            "success",
+            Some(json!({
+                "proof": "created_new_item",
+                "idempotency_key": "shortcut:mail:command+n:new_item"
+            })),
+        );
+        for i in 0..30usize {
+            session.add_step(
+                "type",
+                &format!("noise step {}", i),
+                "success",
+                Some(json!({"idempotency_key": format!("noise:{}", i)})),
+            );
+        }
+        assert!(ActionRunner::idempotency_success_hit(
+            &session,
+            "shortcut:mail:command+n:new_item",
+            None
+        ));
+        assert!(!ActionRunner::idempotency_recent_hit(
+            &session,
+            "shortcut:mail:command+n:new_item",
+            8
+        ));
+    }
+
+    #[test]
+    fn session_cmd_n_stats_counts_attempts_and_successes_per_app() {
+        let mut session = crate::session_store::Session::new("mail 작성", Some("test"));
+        session.add_step(
+            "shortcut",
+            "Shortcut 'n' + [\"command\"] failed",
+            "failed",
+            Some(json!({"idempotency_key": "shortcut:mail:command+n:new_item"})),
+        );
+        session.add_step(
+            "shortcut",
+            "Shortcut 'n' + [\"command\"] (Created new item)",
+            "success",
+            Some(json!({"idempotency_key": "shortcut:mail:command+n:new_item"})),
+        );
+        session.add_step(
+            "shortcut",
+            "Shortcut 'n' + [\"command\"] (Created new item)",
+            "success",
+            Some(json!({"idempotency_key": "shortcut:notes:command+n:new_item"})),
+        );
+
+        let (mail_attempts, mail_successes) = ActionRunner::session_cmd_n_stats(&session, "Mail");
+        let (notes_attempts, notes_successes) =
+            ActionRunner::session_cmd_n_stats(&session, "Notes");
+        assert_eq!((mail_attempts, mail_successes), (2, 1));
+        assert_eq!((notes_attempts, notes_successes), (1, 1));
     }
 }

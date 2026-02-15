@@ -31,10 +31,13 @@ APPROVAL_ASK_FALLBACK_VALUE="${STEER_APPROVAL_ASK_FALLBACK:-deny}"
 TEST_MODE_VALUE="${STEER_TEST_MODE:-0}"
 REQUIRE_TELEGRAM_REPORT_VALUE="${STEER_REQUIRE_TELEGRAM_REPORT:-1}"
 DETERMINISTIC_GOAL_AUTOPLAN_VALUE="${STEER_DETERMINISTIC_GOAL_AUTOPLAN:-}"
+SCENARIO_IDS_RAW="${STEER_SCENARIO_IDS:-1,2,3,4,5}"
 if [ -z "$DETERMINISTIC_GOAL_AUTOPLAN_VALUE" ]; then
     DETERMINISTIC_GOAL_AUTOPLAN_VALUE="1"
 fi
 REQUIRE_MAIL_BODY_VALUE="${STEER_REQUIRE_MAIL_BODY:-1}"
+REQUIRE_MAIL_SUBJECT_VALUE="${STEER_REQUIRE_MAIL_SUBJECT:-1}"
+REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE="${STEER_REQUIRE_SENT_MAILBOX_EVIDENCE:-1}"
 MAIL_TO_TARGET="${STEER_DEFAULT_MAIL_TO:-$(git config --get user.email 2>/dev/null || true)}"
 OPENAI_PREFLIGHT_REQUIRED_VALUE="${STEER_PREFLIGHT_REQUIRE_OPENAI_KEY:-0}"
 
@@ -51,6 +54,10 @@ MARKER_S5="RUN_SCOPE_S5_${TIMESTAMP}"
 CURRENT_SCENARIO_MARKER=""
 CURRENT_SCENARIO_START_EPOCH=0
 CURRENT_LOG_FILE=""
+CURRENT_INPUT_GUARD_ABORTED=0
+CURRENT_INPUT_GUARD_ABORT_REASON=""
+SELECTED_SCENARIO_IDS=""
+SELECTED_SCENARIO_COUNT=0
 
 CONTRACT_FILE_RAW="${STEER_SCENARIO_CONTRACT_FILE:-configs/complex_scenario_contracts.sh}"
 if [ -z "${CONTRACT_FILE_RAW#/}" ]; then
@@ -64,6 +71,38 @@ if [ ! -f "$CONTRACT_FILE" ]; then
 fi
 # shellcheck disable=SC1090
 source "$CONTRACT_FILE"
+
+normalize_scenario_ids() {
+    local raw="$1"
+    local normalized=""
+    local token=""
+    for token in $(printf '%s' "$raw" | tr ',/' ' '); do
+        token="$(printf '%s' "$token" | tr -d '[:space:]')"
+        case "$token" in
+            1|2|3|4|5)
+                if [[ " $normalized " != *" $token "* ]]; then
+                    normalized="${normalized} ${token}"
+                fi
+                ;;
+            *)
+                ;;
+        esac
+    done
+    printf '%s\n' "${normalized# }"
+}
+
+should_run_scenario() {
+    local id="$1"
+    [[ " ${SELECTED_SCENARIO_IDS} " == *" ${id} "* ]]
+}
+
+SELECTED_SCENARIO_IDS="$(normalize_scenario_ids "$SCENARIO_IDS_RAW")"
+if [ -z "$SELECTED_SCENARIO_IDS" ]; then
+    echo "❌ 유효한 STEER_SCENARIO_IDS 값이 없습니다: '${SCENARIO_IDS_RAW}'"
+    echo "   허용 값: 1,2,3,4,5 (예: STEER_SCENARIO_IDS=1,3,5)"
+    exit 1
+fi
+SELECTED_SCENARIO_COUNT="$(printf '%s\n' "$SELECTED_SCENARIO_IDS" | wc -w | tr -d ' ')"
 
 detect_cli_llm_provider() {
     local preferred="${STEER_CLI_LLM_AUTO_ORDER:-codex,gemini,claude}"
@@ -122,6 +161,9 @@ echo "🔧 STEER_SCENARIO_MODE=${SCENARIO_MODE_VALUE} (0=LLM planning, 1=fallbac
 echo "📸 STEER_NODE_CAPTURE=1, STEER_NODE_CAPTURE_ALL=${NODE_CAPTURE_ALL_VALUE}"
 echo "🧪 STEER_TEST_MODE=${TEST_MODE_VALUE}"
 echo "📨 STEER_REQUIRE_MAIL_BODY=${REQUIRE_MAIL_BODY_VALUE}"
+echo "📝 STEER_REQUIRE_MAIL_SUBJECT=${REQUIRE_MAIL_SUBJECT_VALUE}"
+echo "📬 STEER_REQUIRE_SENT_MAILBOX_EVIDENCE=${REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE}"
+echo "🧩 STEER_SCENARIO_IDS=${SELECTED_SCENARIO_IDS}"
 echo "🧯 STEER_FAIL_ON_FALLBACK=${FAIL_ON_FALLBACK_VALUE} (1=mark failed on fallback action)"
 echo "🧭 STEER_DETERMINISTIC_GOAL_AUTOPLAN=${DETERMINISTIC_GOAL_AUTOPLAN_VALUE}"
 if [ -n "$CLI_LLM_VALUE" ]; then
@@ -297,6 +339,22 @@ semantic_require_rust_contract() {
     esac
 }
 
+semantic_allow_scenario_fallback() {
+    case "${STEER_SEMANTIC_SCHEMA_ONLY:-1}" in
+        1|true|TRUE|yes|YES|on|ON)
+            return 1
+            ;;
+    esac
+    case "${STEER_SEMANTIC_ALLOW_SCENARIO_FALLBACK:-0}" in
+        1|true|TRUE|yes|YES|on|ON)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 is_noise_token() {
     local token="$1"
     if [ "${#token}" -gt 120 ]; then
@@ -367,6 +425,34 @@ preflight_checks() {
     else
         echo "✅ Preflight: Screen capture works."
         rm -f "$preflight_capture"
+    fi
+
+    if [ "${STEER_PREFLIGHT_FOCUS_HANDOFF:-1}" = "1" ]; then
+        local focus_activate_out=""
+        local focus_front_out=""
+        local focus_front=""
+        if ! run_cmd_with_timeout_capture "$preflight_timeout" osascript -e 'tell application "Finder" to activate'; then
+            focus_activate_out="${RUN_TIMEOUT_STDERR:-$RUN_TIMEOUT_STDOUT}"
+            echo "❌ Preflight failed: Focus handoff activate(Finder) failed."
+            [ -n "$focus_activate_out" ] && echo "   Details: $focus_activate_out"
+            failed=1
+        elif ! run_cmd_with_timeout_capture "$preflight_timeout" osascript -e 'tell application "System Events" to return name of first application process whose frontmost is true'; then
+            focus_front_out="${RUN_TIMEOUT_STDERR:-$RUN_TIMEOUT_STDOUT}"
+            echo "❌ Preflight failed: Focus handoff frontmost check failed."
+            [ -n "$focus_front_out" ] && echo "   Details: $focus_front_out"
+            failed=1
+        else
+            focus_front="$(printf '%s' "${RUN_TIMEOUT_STDOUT}" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            if [ "$focus_front" != "Finder" ]; then
+                echo "❌ Preflight failed: Focus handoff check failed (expected=Finder actual=${focus_front:-unknown})."
+                echo "   Fix: 실행 중 전면 앱 충돌을 막기 위해 전용 데스크톱/사용자 세션에서 실행하세요."
+                failed=1
+            else
+                echo "✅ Preflight: Focus handoff works (frontmost=Finder)."
+            fi
+        fi
+    else
+        echo "ℹ️ Preflight: Focus handoff check disabled (STEER_PREFLIGHT_FOCUS_HANDOFF=0)."
     fi
 
     if [ "$OPENAI_PREFLIGHT_REQUIRED_VALUE" = "1" ] && [ "$SCENARIO_MODE_VALUE" = "0" ] && [ -z "$CLI_LLM_VALUE" ] && ! has_openai_key_configured; then
@@ -447,6 +533,37 @@ compute_notifier_timeout() {
     fi
 
     echo $((base_timeout + (image_count * per_image_sec)))
+}
+
+compress_telegram_report() {
+    local message="$1"
+    local max_chars="${STEER_TELEGRAM_REPORT_MAX_CHARS:-3300}"
+    local max_evidence_lines="${STEER_TELEGRAM_EVIDENCE_MAX_LINES:-18}"
+    if ! [[ "$max_chars" =~ ^[0-9]+$ ]]; then
+        max_chars=3300
+    fi
+    if ! [[ "$max_evidence_lines" =~ ^[0-9]+$ ]]; then
+        max_evidence_lines=18
+    fi
+    local compressed="$message"
+    if [ "${#compressed}" -gt "$max_chars" ]; then
+        compressed="$(printf '%s\n' "$compressed" | awk -v max_lines="$max_evidence_lines" '
+BEGIN { in_evidence=0; evidence_lines=0 }
+{
+    if ($0 ~ /^근거:/) { in_evidence=1; print; next }
+    if (in_evidence == 0) { print; next }
+    if (evidence_lines < max_lines) { print; evidence_lines++; next }
+}
+END {
+    if (in_evidence == 1 && evidence_lines >= max_lines) {
+        print "- ...(근거 축약, 상세는 로그/캡처 파일 참조)"
+    }
+}')"
+    fi
+    if [ "${#compressed}" -gt "$max_chars" ]; then
+        compressed="${compressed:0:max_chars}"$'\n'"- ...(메시지 길이 축약)"
+    fi
+    printf '%s' "$compressed"
 }
 
 log_run_attempt() {
@@ -559,6 +676,8 @@ run_surf_with_input_guard() {
     local log_file="$2"
     local node_dir="$3"
     local use_guard="${STEER_PAUSE_ON_USER_INPUT:-1}"
+    CURRENT_INPUT_GUARD_ABORTED=0
+    CURRENT_INPUT_GUARD_ABORT_REASON=""
     if [ "$use_guard" != "1" ]; then
         if [ -n "$CLI_LLM_VALUE" ]; then
             STEER_SCENARIO_MODE="$SCENARIO_MODE_VALUE" \
@@ -588,11 +707,15 @@ run_surf_with_input_guard() {
     local active_threshold="${STEER_INPUT_ACTIVE_THRESHOLD_SECONDS:-1}"
     local resume_idle="${STEER_IDLE_RESUME_SECONDS:-3}"
     local poll_interval="${STEER_INPUT_POLL_SECONDS:-1}"
+    local max_pauses="${STEER_INPUT_GUARD_MAX_PAUSES:-40}"
+    local max_pause_seconds="${STEER_INPUT_GUARD_MAX_PAUSE_SECONDS:-300}"
     local paused=0
     local pause_count=0
+    local pause_started_epoch=0
+    local total_paused_seconds=0
     local run_pid=""
 
-    echo "🛡️ User-input guard enabled (mode=${STEER_USER_INPUT_GUARD_MODE:-all}, apps=${STEER_USER_ACTIVE_APPS:-Terminal,Codex,iTerm2}, active<=${active_threshold}s, resume>=${resume_idle}s)"
+    echo "🛡️ User-input guard enabled (mode=${STEER_USER_INPUT_GUARD_MODE:-all}, apps=${STEER_USER_ACTIVE_APPS:-Terminal,Codex,iTerm2}, active<=${active_threshold}s, resume>=${resume_idle}s, max_pauses=${max_pauses}, max_pause_seconds=${max_pause_seconds})"
 
     if [ -n "$CLI_LLM_VALUE" ]; then
         STEER_SCENARIO_MODE="$SCENARIO_MODE_VALUE" \
@@ -629,14 +752,56 @@ run_surf_with_input_guard() {
                 pkill -STOP -P "$run_pid" >/dev/null 2>&1 || true
                 paused=1
                 pause_count=$((pause_count + 1))
+                pause_started_epoch="$(date +%s)"
                 echo "⏸️ [InputGuard] Paused run (front_app=${front_app}, idle=${idle_sec}s, count=${pause_count})"
                 echo "⏸️ [InputGuard] Paused run (front_app=${front_app}, idle=${idle_sec}s, count=${pause_count})" >> "$log_file"
+                if [ "$max_pauses" -gt 0 ] && [ "$pause_count" -ge "$max_pauses" ]; then
+                    CURRENT_INPUT_GUARD_ABORTED=1
+                    CURRENT_INPUT_GUARD_ABORT_REASON="max_pauses_exceeded(${pause_count}/${max_pauses})"
+                    echo "⛔️ [InputGuard] Abort run: ${CURRENT_INPUT_GUARD_ABORT_REASON}"
+                    echo "⛔️ [InputGuard] Abort run: ${CURRENT_INPUT_GUARD_ABORT_REASON}" >> "$log_file"
+                    kill -TERM "$run_pid" >/dev/null 2>&1 || true
+                    pkill -TERM -P "$run_pid" >/dev/null 2>&1 || true
+                    sleep 1
+                    kill -KILL "$run_pid" >/dev/null 2>&1 || true
+                    pkill -KILL -P "$run_pid" >/dev/null 2>&1 || true
+                    break
+                fi
             elif [ "$paused" -eq 1 ] && [ "$idle_sec" -ge "$resume_idle" ]; then
                 kill -CONT "$run_pid" >/dev/null 2>&1 || true
                 pkill -CONT -P "$run_pid" >/dev/null 2>&1 || true
                 paused=0
+                if [ "$pause_started_epoch" -gt 0 ]; then
+                    local resume_epoch
+                    resume_epoch="$(date +%s)"
+                    if [ "$resume_epoch" -gt "$pause_started_epoch" ]; then
+                        total_paused_seconds=$((total_paused_seconds + resume_epoch - pause_started_epoch))
+                    fi
+                fi
+                pause_started_epoch=0
                 echo "▶️ [InputGuard] Resumed run (idle=${idle_sec}s)"
                 echo "▶️ [InputGuard] Resumed run (idle=${idle_sec}s)" >> "$log_file"
+            fi
+            if [ "$paused" -eq 1 ] && [ "$max_pause_seconds" -gt 0 ] && [ "$pause_started_epoch" -gt 0 ]; then
+                local now_epoch
+                now_epoch="$(date +%s)"
+                local current_pause
+                current_pause=$((now_epoch - pause_started_epoch))
+                if [ "$current_pause" -lt 0 ]; then
+                    current_pause=0
+                fi
+                if [ $((total_paused_seconds + current_pause)) -ge "$max_pause_seconds" ]; then
+                    CURRENT_INPUT_GUARD_ABORTED=1
+                    CURRENT_INPUT_GUARD_ABORT_REASON="max_pause_seconds_exceeded(${total_paused_seconds}+${current_pause}/${max_pause_seconds})"
+                    echo "⛔️ [InputGuard] Abort run: ${CURRENT_INPUT_GUARD_ABORT_REASON}"
+                    echo "⛔️ [InputGuard] Abort run: ${CURRENT_INPUT_GUARD_ABORT_REASON}" >> "$log_file"
+                    kill -TERM "$run_pid" >/dev/null 2>&1 || true
+                    pkill -TERM -P "$run_pid" >/dev/null 2>&1 || true
+                    sleep 1
+                    kill -KILL "$run_pid" >/dev/null 2>&1 || true
+                    pkill -KILL -P "$run_pid" >/dev/null 2>&1 || true
+                    break
+                fi
             fi
         fi
         sleep "$poll_interval"
@@ -644,9 +809,171 @@ run_surf_with_input_guard() {
 
     wait "$run_pid"
     local exit_code=$?
+    if [ "$paused" -eq 1 ] && [ "$pause_started_epoch" -gt 0 ]; then
+        local end_epoch
+        end_epoch="$(date +%s)"
+        if [ "$end_epoch" -gt "$pause_started_epoch" ]; then
+            total_paused_seconds=$((total_paused_seconds + end_epoch - pause_started_epoch))
+        fi
+    fi
     echo "🧾 [InputGuard] pause_count=${pause_count}"
     echo "🧾 [InputGuard] pause_count=${pause_count}" >> "$log_file"
+    echo "🧾 [InputGuard] paused_seconds=${total_paused_seconds}"
+    echo "🧾 [InputGuard] paused_seconds=${total_paused_seconds}" >> "$log_file"
+    if [ "${CURRENT_INPUT_GUARD_ABORTED:-0}" = "1" ] && [ "$exit_code" -eq 0 ]; then
+        exit_code=124
+    fi
     return $exit_code
+}
+
+extract_latest_notes_target_from_log() {
+    local log_file="$1"
+    [ -f "$log_file" ] || return 0
+    local line=""
+    local note_id=""
+    local note_name=""
+    line="$(grep -E 'note_id=|"note_id"|note_name=|"note_name"' "$log_file" 2>/dev/null | tail -n 1 || true)"
+    [ -z "$line" ] && return 0
+    note_id="$(printf '%s\n' "$line" | perl -ne '
+        if (/note_id=([^|[:space:]]+)/) { print $1; exit }
+        if (/"note_id"\s*:\s*"([^"]+)"/) { print $1; exit }
+    ')"
+    note_name="$(printf '%s\n' "$line" | perl -ne '
+        if (/note_name=([^|]+)/) { my $v=$1; $v =~ s/[[:space:]]+$//; print $v; exit }
+        if (/"note_name"\s*:\s*"([^"]+)"/) { print $1; exit }
+    ')"
+    if [ -n "$note_id" ] || [ -n "$note_name" ]; then
+        printf '%s|%s\n' "$note_id" "$note_name"
+    fi
+}
+
+extract_latest_textedit_target_from_log() {
+    local log_file="$1"
+    [ -f "$log_file" ] || return 0
+    local line=""
+    local doc_id=""
+    local doc_name=""
+    line="$(grep -E 'doc_id=|"doc_id"|doc_name=|"doc_name"' "$log_file" 2>/dev/null | tail -n 1 || true)"
+    [ -z "$line" ] && return 0
+    doc_id="$(printf '%s\n' "$line" | perl -ne '
+        if (/doc_id=([^|[:space:]]+)/) { print $1; exit }
+        if (/"doc_id"\s*:\s*"([^"]+)"/) { print $1; exit }
+    ')"
+    doc_name="$(printf '%s\n' "$line" | perl -ne '
+        if (/doc_name=([^|]+)/) { my $v=$1; $v =~ s/[[:space:]]+$//; print $v; exit }
+        if (/"doc_name"\s*:\s*"([^"]+)"/) { print $1; exit }
+    ')"
+    if [ -n "$doc_id" ] || [ -n "$doc_name" ]; then
+        printf '%s|%s\n' "$doc_id" "$doc_name"
+    fi
+}
+
+token_presence_location_scoped_docs() {
+    local token="$1"
+    local marker="$2"
+    local log_file="$3"
+    local notes_target=""
+    local textedit_target=""
+    local note_id=""
+    local note_name=""
+    local doc_id=""
+    local doc_name=""
+
+    [ -z "$token" ] && return 0
+    [ -z "$marker" ] && return 0
+    [ -f "$log_file" ] || return 0
+
+    notes_target="$(extract_latest_notes_target_from_log "$log_file" || true)"
+    textedit_target="$(extract_latest_textedit_target_from_log "$log_file" || true)"
+
+    if [ -n "$notes_target" ]; then
+        IFS='|' read -r note_id note_name <<< "$notes_target"
+    fi
+    if [ -n "$textedit_target" ]; then
+        IFS='|' read -r doc_id doc_name <<< "$textedit_target"
+    fi
+
+    if [ -z "$note_id" ] && [ -z "$note_name" ] && [ -z "$doc_id" ] && [ -z "$doc_name" ]; then
+        return 0
+    fi
+
+    osascript - "$token" "$marker" "$note_id" "$note_name" "$doc_id" "$doc_name" <<'APPLESCRIPT' 2>/dev/null || true
+on run argv
+    set tokenText to item 1 of argv
+    set markerText to item 2 of argv
+    set noteIdTarget to item 3 of argv
+    set noteNameTarget to item 4 of argv
+    set docIdTarget to item 5 of argv
+    set docNameTarget to item 6 of argv
+
+    if noteIdTarget is not "" or noteNameTarget is not "" then
+        try
+            tell application "Notes"
+                if (count of accounts) > 0 then
+                    repeat with ac in accounts
+                        repeat with fd in folders of ac
+                            repeat with n in notes of fd
+                                set cId to ""
+                                set cName to ""
+                                set cBody to ""
+                                try
+                                    set cId to id of n as text
+                                end try
+                                try
+                                    set cName to name of n as text
+                                end try
+                                try
+                                    set cBody to body of n as text
+                                end try
+                                set idMatch to (noteIdTarget is not "" and cId is noteIdTarget)
+                                set nameMatch to (noteNameTarget is not "" and cName is noteNameTarget)
+                                if idMatch or nameMatch then
+                                    set scopeOk to (markerText is "" or cBody contains markerText or cName contains markerText)
+                                    if scopeOk and cName contains tokenText then return "NOTE_ID_TITLE"
+                                    if scopeOk and cBody contains tokenText then return "NOTE_ID_BODY"
+                                end if
+                            end repeat
+                        end repeat
+                    end repeat
+                end if
+            end tell
+        end try
+    end if
+
+    if docIdTarget is not "" or docNameTarget is not "" then
+        try
+            tell application "TextEdit"
+                set docCount to count of documents
+                if docCount > 0 then
+                    repeat with idx from docCount to 1 by -1
+                        set d to item idx of documents
+                        set cId to ""
+                        set cName to ""
+                        set cText to ""
+                        try
+                            set cId to id of d as text
+                        end try
+                        try
+                            set cName to name of d as text
+                        end try
+                        try
+                            set cText to text of d as text
+                        end try
+                        set idMatch to (docIdTarget is not "" and cId is docIdTarget)
+                        set nameMatch to (docNameTarget is not "" and cName is docNameTarget)
+                        if idMatch or nameMatch then
+                            set scopeOk to (markerText is "" or cText contains markerText)
+                            if scopeOk and cText contains tokenText then return "TEXTEDIT_ID_BODY"
+                        end if
+                    end repeat
+                end if
+            end tell
+        end try
+    end if
+
+    return "NOT_FOUND"
+end run
+APPLESCRIPT
 }
 
 token_presence_location() {
@@ -661,24 +988,28 @@ token_presence_location() {
     local tmp_err=""
     local osa_pid=""
     local log_location=""
-
-    if [ -n "${CURRENT_LOG_FILE:-}" ]; then
-        log_location="$(token_presence_location_from_log "$token" "$CURRENT_LOG_FILE")"
-        if [ -n "$log_location" ]; then
-            printf '%s\n' "$log_location"
-            return 0
-        fi
-    fi
+    local scoped_doc_location=""
+    local skip_global_doc_scan="${STEER_SEMANTIC_DISABLE_GLOBAL_DOC_SCAN:-1}"
+    local skip_sent_mail_scan="${STEER_SEMANTIC_DISABLE_SENT_MAIL_SCAN:-1}"
+    local allow_log_evidence="${STEER_SEMANTIC_ALLOW_LOG_EVIDENCE:-0}"
 
     if [ "$require_marker" = "1" ] && [ -z "$marker" ]; then
         printf '%s\n' "MARKER_REQUIRED"
         return 0
     fi
+
+    if [ -n "${CURRENT_LOG_FILE:-}" ]; then
+        scoped_doc_location="$(token_presence_location_scoped_docs "$token" "$marker" "$CURRENT_LOG_FILE")"
+        if [ -n "$scoped_doc_location" ] && ! semantic_location_missing "$scoped_doc_location"; then
+            printf '%s\n' "$scoped_doc_location"
+            return 0
+        fi
+    fi
     tmp_out="$(mktemp -t steer_osa_out.XXXXXX)"
     tmp_err="$(mktemp -t steer_osa_err.XXXXXX)"
 
     (
-        osascript - "$token" "$marker" "$scan_limit" "$run_start_epoch" <<'APPLESCRIPT'
+        osascript - "$token" "$marker" "$scan_limit" "$run_start_epoch" "$skip_global_doc_scan" "$skip_sent_mail_scan" <<'APPLESCRIPT'
 on run argv
     set tokenText to item 1 of argv
     set markerText to ""
@@ -699,6 +1030,20 @@ on run argv
             set runStartEpoch to 0
         end try
     end if
+    set skipDocScan to false
+    if (count of argv) > 4 then
+        set scanArg to item 5 of argv
+        if scanArg is "1" or scanArg is "true" or scanArg is "yes" or scanArg is "on" then
+            set skipDocScan to true
+        end if
+    end if
+    set skipSentScan to false
+    if (count of argv) > 5 then
+        set sentArg to item 6 of argv
+        if sentArg is "1" or sentArg is "true" or sentArg is "yes" or sentArg is "on" then
+            set skipSentScan to true
+        end if
+    end if
     set nowEpoch to 0
     if runStartEpoch > 0 then
         try
@@ -709,58 +1054,19 @@ on run argv
     end if
     if scanLimit < 10 then set scanLimit to 10
 
-    try
-        tell application "Notes"
-            if (count of accounts) > 0 then
-                repeat with ac in accounts
-                    repeat with f in folders of ac
-                        set noteCount to count of notes of f
-                        if noteCount > 0 then
-                            -- Some Notes providers expose newest items at the beginning.
-                            -- Scan both head and tail windows to avoid false negatives.
-                            set headLimit to scanLimit
-                            if headLimit > noteCount then set headLimit to noteCount
-                            repeat with noteIdx from 1 to headLimit by 1
-                                set n to item noteIdx of notes of f
-                                set timeOk to true
-                                if runStartEpoch > 0 then
-                                    set timeOk to false
-                                    try
-                                        set modifiedAt to modification date of n
-                                        set modifiedAgeSeconds to ((current date) - modifiedAt)
-                                        if modifiedAgeSeconds < 0 then set modifiedAgeSeconds to 0
-                                        set modifiedEpoch to nowEpoch - (round modifiedAgeSeconds rounding down)
-                                        if modifiedEpoch ≥ runStartEpoch then set timeOk to true
-                                    on error
-                                        -- Notes metadata access can vary by account/provider.
-                                        -- Degrade gracefully instead of forcing a false negative.
-                                        set timeOk to true
-                                    end try
-                                end if
-                                if timeOk is false and markerText is not "" then
-                                    -- Marker scope is a stronger per-run signal than provider timestamps.
-                                    set timeOk to true
-                                end if
-                                if timeOk then
-                                    try
-                                        set nName to name of n as text
-                                    on error
-                                        set nName to ""
-                                    end try
-                                    try
-                                        set nBody to body of n as text
-                                    on error
-                                        set nBody to ""
-                                    end try
-                                    set scopeOk to (markerText is "" or nBody contains markerText or nName contains markerText)
-                                    if scopeOk and nName contains tokenText then return "NOTE_TITLE"
-                                    if scopeOk and nBody contains tokenText then return "NOTE_BODY"
-                                end if
-                            end repeat
-                            if noteCount > headLimit then
-                                set tailLower to noteCount - scanLimit + 1
-                                if tailLower < (headLimit + 1) then set tailLower to (headLimit + 1)
-                                repeat with noteIdx from noteCount to tailLower by -1
+    if skipDocScan is false then
+        try
+            tell application "Notes"
+                if (count of accounts) > 0 then
+                    repeat with ac in accounts
+                        repeat with f in folders of ac
+                            set noteCount to count of notes of f
+                            if noteCount > 0 then
+                                -- Some Notes providers expose newest items at the beginning.
+                                -- Scan both head and tail windows to avoid false negatives.
+                                set headLimit to scanLimit
+                                if headLimit > noteCount then set headLimit to noteCount
+                                repeat with noteIdx from 1 to headLimit by 1
                                     set n to item noteIdx of notes of f
                                     set timeOk to true
                                     if runStartEpoch > 0 then
@@ -772,10 +1078,13 @@ on run argv
                                             set modifiedEpoch to nowEpoch - (round modifiedAgeSeconds rounding down)
                                             if modifiedEpoch ≥ runStartEpoch then set timeOk to true
                                         on error
+                                            -- Notes metadata access can vary by account/provider.
+                                            -- Degrade gracefully instead of forcing a false negative.
                                             set timeOk to true
                                         end try
                                     end if
                                     if timeOk is false and markerText is not "" then
+                                        -- Marker scope is a stronger per-run signal than provider timestamps.
                                         set timeOk to true
                                     end if
                                     if timeOk then
@@ -794,37 +1103,75 @@ on run argv
                                         if scopeOk and nBody contains tokenText then return "NOTE_BODY"
                                     end if
                                 end repeat
+                                if noteCount > headLimit then
+                                    set tailLower to noteCount - scanLimit + 1
+                                    if tailLower < (headLimit + 1) then set tailLower to (headLimit + 1)
+                                    repeat with noteIdx from noteCount to tailLower by -1
+                                        set n to item noteIdx of notes of f
+                                        set timeOk to true
+                                        if runStartEpoch > 0 then
+                                            set timeOk to false
+                                            try
+                                                set modifiedAt to modification date of n
+                                                set modifiedAgeSeconds to ((current date) - modifiedAt)
+                                                if modifiedAgeSeconds < 0 then set modifiedAgeSeconds to 0
+                                                set modifiedEpoch to nowEpoch - (round modifiedAgeSeconds rounding down)
+                                                if modifiedEpoch ≥ runStartEpoch then set timeOk to true
+                                            on error
+                                                set timeOk to true
+                                            end try
+                                        end if
+                                        if timeOk is false and markerText is not "" then
+                                            set timeOk to true
+                                        end if
+                                        if timeOk then
+                                            try
+                                                set nName to name of n as text
+                                            on error
+                                                set nName to ""
+                                            end try
+                                            try
+                                                set nBody to body of n as text
+                                            on error
+                                                set nBody to ""
+                                            end try
+                                            set scopeOk to (markerText is "" or nBody contains markerText or nName contains markerText)
+                                            if scopeOk and nName contains tokenText then return "NOTE_TITLE"
+                                            if scopeOk and nBody contains tokenText then return "NOTE_BODY"
+                                        end if
+                                    end repeat
+                                end if
                             end if
-                        end if
+                        end repeat
                     end repeat
-                end repeat
-            end if
-        end tell
-    on error
-        return "CHECK_ERROR"
-    end try
+                end if
+            end tell
+        on error
+            return "CHECK_ERROR"
+        end try
 
-    try
-        tell application "TextEdit"
-            set docCount to count of documents
-            if docCount > 0 then
-                set lowerDoc to docCount - scanLimit
-                if lowerDoc < 1 then set lowerDoc to 1
-                repeat with idx from docCount to lowerDoc by -1
-                    set d to item idx of documents
-                    try
-                        set t to text of d as text
-                    on error
-                        set t to ""
-                    end try
-                    set scopeOk to (markerText is "" or t contains markerText)
-                    if scopeOk and t contains tokenText then return "TEXTEDIT_BODY"
-                end repeat
-            end if
-        end tell
-    on error
-        -- TextEdit may not be running; continue to Mail checks.
-    end try
+        try
+            tell application "TextEdit"
+                set docCount to count of documents
+                if docCount > 0 then
+                    set lowerDoc to docCount - scanLimit
+                    if lowerDoc < 1 then set lowerDoc to 1
+                    repeat with idx from docCount to lowerDoc by -1
+                        set d to item idx of documents
+                        try
+                            set t to text of d as text
+                        on error
+                            set t to ""
+                        end try
+                        set scopeOk to (markerText is "" or t contains markerText)
+                        if scopeOk and t contains tokenText then return "TEXTEDIT_BODY"
+                    end repeat
+                end if
+            end tell
+        on error
+            -- TextEdit may not be running; continue to Mail checks.
+        end try
+    end if
 
     try
         tell application "Mail"
@@ -851,61 +1198,63 @@ on run argv
                 end repeat
             end if
 
-            repeat with ac in accounts
-                try
-                    set sentBoxes to {}
-                    repeat with sentName in {"Sent Messages", "Sent Mail", "Sent", "보낸 편지함", "All Mail"}
-                        try
-                            set end of sentBoxes to (mailbox (sentName as text) of ac)
-                        end try
-                    end repeat
-                    if (count of sentBoxes) = 0 then
-                        try
-                            set sentMbx to sent mailbox of ac
-                            if sentMbx is not missing value then set end of sentBoxes to sentMbx
-                        end try
-                    end if
-                    repeat with sentMbx in sentBoxes
-                        set sentCount to count of messages of sentMbx
-                        if sentCount > 0 then
-                            set lowerBound to sentCount - scanLimit
-                            if lowerBound < 1 then set lowerBound to 1
-                            repeat with idx from sentCount to lowerBound by -1
-                                set sm to message idx of sentMbx
-                                set ss to ""
-                                set sc to ""
-                                set timeOk to true
-                                try
-                                    set ss to subject of sm as text
-                                end try
-                                try
-                                    set sc to content of sm as text
-                                end try
-                                if runStartEpoch > 0 then
-                                    set timeOk to false
-                                    set sentAt to missing value
-                                    try
-                                        set sentAt to date sent of sm
-                                    on error
-                                        try
-                                            set sentAt to date received of sm
-                                        end try
-                                    end try
-                                    if sentAt is not missing value and nowEpoch > 0 then
-                                        set sentAgeSeconds to ((current date) - sentAt)
-                                        if sentAgeSeconds < 0 then set sentAgeSeconds to 0
-                                        set sentEpoch to nowEpoch - (round sentAgeSeconds rounding down)
-                                        if sentEpoch ≥ runStartEpoch then set timeOk to true
-                                    end if
-                                end if
-                                set sentScopeOk to (timeOk and (markerText is "" or sc contains markerText or ss contains markerText))
-                                if sentScopeOk and ss contains tokenText then return "MAIL_SENT_SUBJECT"
-                                if sentScopeOk and sc contains tokenText then return "MAIL_SENT_BODY"
-                            end repeat
+            if skipSentScan is false then
+                repeat with ac in accounts
+                    try
+                        set sentBoxes to {}
+                        repeat with sentName in {"Sent Messages", "Sent Mail", "Sent", "보낸 편지함", "All Mail"}
+                            try
+                                set end of sentBoxes to (mailbox (sentName as text) of ac)
+                            end try
+                        end repeat
+                        if (count of sentBoxes) = 0 then
+                            try
+                                set sentMbx to sent mailbox of ac
+                                if sentMbx is not missing value then set end of sentBoxes to sentMbx
+                            end try
                         end if
-                    end repeat
-                end try
-            end repeat
+                        repeat with sentMbx in sentBoxes
+                            set sentCount to count of messages of sentMbx
+                            if sentCount > 0 then
+                                set lowerBound to sentCount - scanLimit
+                                if lowerBound < 1 then set lowerBound to 1
+                                repeat with idx from sentCount to lowerBound by -1
+                                    set sm to message idx of sentMbx
+                                    set ss to ""
+                                    set sc to ""
+                                    set timeOk to true
+                                    try
+                                        set ss to subject of sm as text
+                                    end try
+                                    try
+                                        set sc to content of sm as text
+                                    end try
+                                    if runStartEpoch > 0 then
+                                        set timeOk to false
+                                        set sentAt to missing value
+                                        try
+                                            set sentAt to date sent of sm
+                                        on error
+                                            try
+                                                set sentAt to date received of sm
+                                            end try
+                                        end try
+                                        if sentAt is not missing value and nowEpoch > 0 then
+                                            set sentAgeSeconds to ((current date) - sentAt)
+                                            if sentAgeSeconds < 0 then set sentAgeSeconds to 0
+                                            set sentEpoch to nowEpoch - (round sentAgeSeconds rounding down)
+                                            if sentEpoch ≥ runStartEpoch then set timeOk to true
+                                        end if
+                                    end if
+                                    set sentScopeOk to (timeOk and (markerText is "" or sc contains markerText or ss contains markerText))
+                                    if sentScopeOk and ss contains tokenText then return "MAIL_SENT_SUBJECT"
+                                    if sentScopeOk and sc contains tokenText then return "MAIL_SENT_BODY"
+                                end repeat
+                            end if
+                        end repeat
+                    end try
+                end repeat
+            end if
         end tell
     on error
         return "CHECK_ERROR"
@@ -939,36 +1288,50 @@ APPLESCRIPT
     if [ -z "$result" ]; then
         result="CHECK_ERROR"
     fi
+    if semantic_location_missing "$result" && [ "$allow_log_evidence" = "1" ] && [ -n "${CURRENT_LOG_FILE:-}" ]; then
+        log_location="$(token_presence_location_from_log "$token" "$CURRENT_LOG_FILE" "$marker" "$require_marker")"
+        if [ -n "$log_location" ]; then
+            result="$log_location"
+        fi
+    fi
     printf '%s\n' "$result"
 }
 
 token_presence_location_from_log() {
     local token="$1"
     local log_file="$2"
+    local marker="${3:-}"
+    local require_marker="${4:-1}"
     [ -z "$token" ] && return 0
     [ -f "$log_file" ] || return 0
 
     local lines=""
     lines="$(grep -F -- "$token" "$log_file" 2>/dev/null | tail -n 200 || true)"
     [ -z "$lines" ] && return 0
+    if [ -n "$marker" ]; then
+        lines="$(printf '%s\n' "$lines" | grep -F -- "$marker" || true)"
+        [ -z "$lines" ] && return 0
+    elif [ "$require_marker" = "1" ]; then
+        return 0
+    fi
 
-    if printf '%s\n' "$lines" | grep -Eiq "MAIL_SEND_PROOF\\|.*subject=|\\(mail subject\\)|MAIL_SUBJECT"; then
+    if printf '%s\n' "$lines" | grep -Eiq "MAIL_SEND_PROOF\\|.*subject=|EVIDENCE\\|target=mail\\|event=(send|write)\\|.*subject=|\\(mail subject\\)|MAIL_SUBJECT"; then
         printf '%s\n' "LOG_MAIL_SUBJECT"
         return 0
     fi
-    if printf '%s\n' "$lines" | grep -Eiq "MAIL_SEND_PROOF\\|.*recipient=|recipient"; then
+    if printf '%s\n' "$lines" | grep -Eiq "MAIL_SEND_PROOF\\|.*recipient=|EVIDENCE\\|target=mail\\|event=(send|write)\\|.*recipient=|\"recipient\"[[:space:]]*:"; then
         printf '%s\n' "LOG_MAIL_RECIPIENT"
         return 0
     fi
-    if printf '%s\n' "$lines" | grep -Eiq "MAIL_SEND_PROOF\\|.*body_len=|\\(mail body\\)|MAIL_BODY"; then
+    if printf '%s\n' "$lines" | grep -Eiq "MAIL_SEND_PROOF\\|.*body_len=|EVIDENCE\\|target=mail\\|event=(send|write)\\|.*body_len=|\\(mail body\\)|MAIL_BODY"; then
         printf '%s\n' "LOG_MAIL_BODY"
         return 0
     fi
-    if printf '%s\n' "$lines" | grep -Eiq "\\(textedit body\\)|textedit_append_text|TEXTEDIT_BODY"; then
+    if printf '%s\n' "$lines" | grep -Eiq "EVIDENCE\\|target=textedit\\|event=write\\|.*body_len=|\\(textedit body\\)|textedit_append_text|TEXTEDIT_BODY"; then
         printf '%s\n' "LOG_TEXTEDIT_BODY"
         return 0
     fi
-    if printf '%s\n' "$lines" | grep -Eiq "\\(notes body\\)|notes_write_text|NOTE_BODY"; then
+    if printf '%s\n' "$lines" | grep -Eiq "EVIDENCE\\|target=notes\\|event=write\\|.*body_len=|\\(notes body\\)|notes_write_text|NOTE_BODY"; then
         printf '%s\n' "LOG_NOTE_BODY"
         return 0
     fi
@@ -1138,17 +1501,37 @@ APPLESCRIPT
 mail_send_proof_from_log() {
     local log_file="$1"
     local line=""
+    line="$(grep -E 'EVIDENCE\|target=mail\|event=send\|' "$log_file" 2>/dev/null | tail -n 1)"
+    if [ -n "$line" ]; then
+        local status=""
+        local recipient=""
+        local subject=""
+        local body_len=""
+        local draft_id=""
+        status="$(printf '%s\n' "$line" | perl -ne 'if (/(?:^|\|)status=([^|]*)/) { print $1; exit }')"
+        recipient="$(printf '%s\n' "$line" | perl -ne 'if (/(?:^|\|)recipient=([^|]*)/) { print $1; exit }')"
+        subject="$(printf '%s\n' "$line" | perl -ne 'if (/(?:^|\|)subject=([^|]*)/) { print $1; exit }')"
+        body_len="$(printf '%s\n' "$line" | perl -ne 'if (/(?:^|\|)body_len=([0-9-]+)/) { print $1; exit }')"
+        draft_id="$(printf '%s\n' "$line" | perl -ne 'if (/(?:^|\|)draft_id=([^|]*)/) { print $1; exit }')"
+        if [ -n "$status" ]; then
+            printf '%s|%s|%s|%s|%s\n' "$status" "$recipient" "$subject" "${body_len:--1}" "$draft_id"
+            return 0
+        fi
+    fi
+
     line="$(grep -E 'MAIL_SEND_PROOF\|' "$log_file" 2>/dev/null | tail -n 1)"
     if [ -n "$line" ]; then
         local status=""
         local recipient=""
         local subject=""
         local body_len=""
+        local draft_id=""
         status="$(printf '%s\n' "$line" | perl -ne 'if (/status=([^|]*)/) { print $1; exit }')"
         recipient="$(printf '%s\n' "$line" | perl -ne 'if (/recipient=([^|]*)/) { print $1; exit }')"
         subject="$(printf '%s\n' "$line" | perl -ne 'if (/subject=([^|]*)/) { print $1; exit }')"
         body_len="$(printf '%s\n' "$line" | perl -ne 'if (/body_len=([0-9-]+)/) { print $1; exit }')"
-        printf '%s|%s|%s|%s\n' "$status" "$recipient" "$subject" "${body_len:--1}"
+        draft_id="$(printf '%s\n' "$line" | perl -ne 'if (/draft_id=([^|]*)/) { print $1; exit }')"
+        printf '%s|%s|%s|%s|%s\n' "$status" "$recipient" "$subject" "${body_len:--1}" "$draft_id"
         return 0
     fi
 
@@ -1158,12 +1541,51 @@ mail_send_proof_from_log() {
     local recipient=""
     local subject=""
     local body_len=""
+    local draft_id=""
     status="$(printf '%s\n' "$line" | perl -ne 'if (/"send_status"\s*:\s*"([^"]*)"/) { print $1; exit }')"
     recipient="$(printf '%s\n' "$line" | perl -ne 'if (/"recipient"\s*:\s*"([^"]*)"/) { print $1; exit }')"
     subject="$(printf '%s\n' "$line" | perl -ne 'if (/"subject"\s*:\s*"([^"]*)"/) { print $1; exit }')"
     body_len="$(printf '%s\n' "$line" | perl -ne 'if (/"body_len"\s*:\s*([0-9-]+)/) { print $1; exit }')"
-    printf '%s|%s|%s|%s\n' "$status" "$recipient" "$subject" "${body_len:--1}"
+    draft_id="$(printf '%s\n' "$line" | perl -ne 'if (/"draft_id"\s*:\s*"([^"]*)"/) { print $1; exit }')"
+    printf '%s|%s|%s|%s|%s\n' "$status" "$recipient" "$subject" "${body_len:--1}" "$draft_id"
     return 0
+}
+
+mail_write_evidence_for_draft() {
+    local log_file="$1"
+    local draft_id="$2"
+    [ -f "$log_file" ] || {
+        printf '0|0|-1\n'
+        return 0
+    }
+    [ -n "$draft_id" ] || {
+        printf '0|0|-1\n'
+        return 0
+    }
+
+    local lines=""
+    local recipient_seen=0
+    local subject_seen=0
+    local max_body_len="-1"
+    lines="$(grep -E 'EVIDENCE\|target=mail\|event=write\|' "$log_file" 2>/dev/null | grep -F "draft_id=${draft_id}" || true)"
+    [ -n "$lines" ] || {
+        printf '0|0|-1\n'
+        return 0
+    }
+    if printf '%s\n' "$lines" | grep -Eiq '(?:^|\|)recipient='; then
+        recipient_seen=1
+    fi
+    if printf '%s\n' "$lines" | grep -Eiq '(?:^|\|)subject='; then
+        subject_seen=1
+    fi
+    max_body_len="$(printf '%s\n' "$lines" | perl -ne '
+        if (/(?:^|\|)body_len=([0-9-]+)/) {
+            my $v = $1;
+            if (!defined($max) || $v > $max) { $max = $v; }
+        }
+        END { if (defined($max)) { print $max; } else { print "-1"; } }
+    ')"
+    printf '%s|%s|%s\n' "$recipient_seen" "$subject_seen" "${max_body_len:--1}"
 }
 
 # Run agent command and detect logical failures from logs as well as exit code.
@@ -1181,6 +1603,13 @@ run_agent_scenario() {
 
     CURRENT_SCENARIO_START_EPOCH="$(date +%s)"
     if ! run_surf_with_input_guard "$prompt" "$log_file" "$node_dir"; then
+        if [ "${CURRENT_INPUT_GUARD_ABORTED:-0}" = "1" ]; then
+            log_run_attempt \
+                "$log_file" \
+                "input_guard_abort" \
+                "failed" \
+                "${CURRENT_INPUT_GUARD_ABORT_REASON:-unknown}"
+        fi
         return 1
     fi
 
@@ -1218,6 +1647,7 @@ capture_and_notify() {
     local status=$3
     local log_file=$4
     local scenario_goal=$5
+    local scenario_request="${6:-$scenario_goal}"
     local fallback_screenshot="scenario_results/complex_scenario_${scenario_num}_${TIMESTAMP}.png"
     local telegram_main_image=""
     CURRENT_LOG_FILE="$log_file"
@@ -1229,6 +1659,7 @@ capture_and_notify() {
     local mail_proof_recipient=""
     local mail_proof_subject=""
     local mail_proof_body_len="-1"
+    local mail_proof_draft_id=""
     local expected_tokens=()
     local merged_tokens=()
     local required_artifacts=()
@@ -1237,28 +1668,49 @@ capture_and_notify() {
     local require_node_capture=0
     local semantic_contract_rust_error=0
     local semantic_contract_rust_error_detail=""
+    local semantic_contract_rust_warning_detail=""
 
-    while IFS= read -r token; do
-        [ -z "$token" ] && continue
-        expected_tokens+=("$token")
-    done < <(complex_scenario_expected_tokens "$scenario_num")
+    local allow_static_scenario_contract=0
+    case "${STEER_SEMANTIC_ALLOW_SCENARIO_CONTRACT_TOKENS:-0}" in
+        1|true|TRUE|yes|YES|on|ON)
+            allow_static_scenario_contract=1
+            ;;
+    esac
+    if [ "$allow_static_scenario_contract" -eq 1 ]; then
+        while IFS= read -r token; do
+            [ -z "$token" ] && continue
+            expected_tokens+=("$token")
+        done < <(complex_scenario_expected_tokens "$scenario_num")
+    fi
     local rust_tokens=""
-    if rust_tokens="$(extract_semantic_contract_with_rust "tokens" "$scenario_goal")"; then
+    local allow_scenario_fallback=0
+    if semantic_allow_scenario_fallback; then
+        allow_scenario_fallback=1
+    fi
+    if rust_tokens="$(extract_semantic_contract_with_rust "tokens" "$scenario_request")"; then
         if [ -n "$rust_tokens" ]; then
             while IFS= read -r token; do
                 [ -z "$token" ] && continue
                 expected_tokens+=("$token")
             done < <(printf '%s\n' "$rust_tokens")
         elif semantic_require_rust_contract; then
-            semantic_contract_rust_error=1
-            semantic_contract_rust_error_detail="semantic_contract_rs returned empty tokens"
+            if [ "$allow_scenario_fallback" -eq 1 ] && [ "${#expected_tokens[@]}" -gt 0 ]; then
+                semantic_contract_rust_warning_detail="semantic_contract_rs returned empty tokens (fallback to scenario contract tokens)"
+            else
+                semantic_contract_rust_error=1
+                semantic_contract_rust_error_detail="semantic_contract_rs returned empty tokens"
+            fi
         fi
     elif semantic_require_rust_contract; then
-        semantic_contract_rust_error=1
-        if [ "${STEER_USE_RUST_SEMANTIC_CONTRACT:-1}" != "1" ]; then
-            semantic_contract_rust_error_detail="STEER_USE_RUST_SEMANTIC_CONTRACT=1 required"
+        if [ "$allow_scenario_fallback" -eq 1 ] && [ "${#expected_tokens[@]}" -gt 0 ]; then
+            semantic_contract_rust_warning_detail="semantic_contract_rs unavailable (fallback to scenario contract tokens)"
         else
-            semantic_contract_rust_error_detail="semantic_contract_rs unavailable"
+            semantic_contract_rust_error=1
+            if [ "${STEER_USE_RUST_SEMANTIC_CONTRACT:-1}" != "1" ]; then
+                semantic_contract_rust_error_detail="STEER_USE_RUST_SEMANTIC_CONTRACT=1 required"
+            else
+                semantic_contract_rust_error_detail="semantic_contract_rs unavailable"
+            fi
         fi
     fi
     mail_subject_for_verify="$(complex_scenario_mail_subject "$scenario_num")"
@@ -1296,13 +1748,15 @@ capture_and_notify() {
     done
 
     if proof_line="$(mail_send_proof_from_log "$log_file")"; then
-        IFS='|' read -r mail_proof_status mail_proof_recipient mail_proof_subject mail_proof_body_len <<< "$proof_line"
+        IFS='|' read -r mail_proof_status mail_proof_recipient mail_proof_subject mail_proof_body_len mail_proof_draft_id <<< "$proof_line"
     fi
 
     if [ "${STEER_SEMANTIC_VERIFY:-1}" = "1" ]; then
         if [ "$semantic_contract_rust_error" -eq 1 ]; then
             status="failed"
             semantic_lines="${semantic_lines}- 의미검증 계약 위반: Rust semantic contract 추출 실패 (${semantic_contract_rust_error_detail:-unknown})"$'\n'
+        elif [ -n "$semantic_contract_rust_warning_detail" ]; then
+            semantic_lines="${semantic_lines}- 의미검증 계약 경고: ${semantic_contract_rust_warning_detail}"$'\n'
         fi
         local semantic_checked=0
         for token in "${expected_tokens[@]}"; do
@@ -1360,9 +1814,19 @@ capture_and_notify() {
         local mail_log_recipient="${mail_proof_recipient:-}"
         local mail_log_subject="${mail_proof_subject:-}"
         local mail_log_body_len="${mail_proof_body_len:--1}"
+        local mail_log_draft_id="${mail_proof_draft_id:-}"
+        local mail_write_recipient_seen=0
+        local mail_write_subject_seen=0
+        local mail_write_body_len="-1"
+        if [ -n "$mail_log_draft_id" ]; then
+            local write_line=""
+            if write_line="$(mail_write_evidence_for_draft "$log_file" "$mail_log_draft_id")"; then
+                IFS='|' read -r mail_write_recipient_seen mail_write_subject_seen mail_write_body_len <<< "$write_line"
+            fi
+        fi
         if [ "$mail_log_status" = "sent_confirmed" ]; then
             mail_send_logged=1
-        elif grep -Eiq "Shortcut 'd'.*shift.*Mail sent|Mail send completed|\"send_status\"[[:space:]]*:[[:space:]]*\"sent_confirmed\"|MAIL_SEND_PROOF\\|status=sent_confirmed" "$log_file"; then
+        elif grep -Eiq "Shortcut 'd'.*shift.*Mail sent|Mail send completed|\"send_status\"[[:space:]]*:[[:space:]]*\"sent_confirmed\"|MAIL_SEND_PROOF\\|status=sent_confirmed|EVIDENCE\\|target=mail\\|event=send\\|status=sent_confirmed" "$log_file"; then
             mail_send_logged=1
         fi
         local outgoing_count
@@ -1385,6 +1849,27 @@ capture_and_notify() {
                         mail_sent_ok=1
                         ;;
                 esac
+            fi
+        fi
+        local mail_subject_ok=1
+        local mail_subject_location="SUBJECT_NOT_REQUIRED"
+        if [ "$REQUIRE_MAIL_SUBJECT_VALUE" = "1" ]; then
+            mail_subject_ok=0
+            local trimmed_mail_subject=""
+            trimmed_mail_subject="$(printf '%s' "${mail_log_subject:-}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+            if [ -n "$trimmed_mail_subject" ]; then
+                mail_subject_ok=1
+                mail_subject_location="LOG_MAIL_SUBJECT"
+                if [ -n "$CURRENT_SCENARIO_MARKER" ] && ! printf '%s' "$trimmed_mail_subject" | grep -Fq "$CURRENT_SCENARIO_MARKER"; then
+                    mail_subject_ok=0
+                    mail_subject_location="SUBJECT_MISSING_SCOPE_MARKER"
+                fi
+            else
+                mail_subject_location="SUBJECT_EMPTY"
+            fi
+            if [ "$mail_subject_ok" -ne 1 ] && [ "${mail_write_subject_seen:-0}" = "1" ]; then
+                mail_subject_ok=1
+                mail_subject_location="LOG_MAIL_WRITE_SUBJECT"
             fi
         fi
         local expected_recipients_raw
@@ -1423,6 +1908,9 @@ capture_and_notify() {
                 if [ -n "$normalized_log_recipient" ] && [ "$normalized_log_recipient" = "$expected_recipient" ]; then
                     recipient_single_ok=1
                     recipient_single_location="LOG_MAIL_RECIPIENT"
+                elif [ "${mail_write_recipient_seen:-0}" = "1" ]; then
+                    recipient_single_ok=1
+                    recipient_single_location="LOG_MAIL_WRITE_RECIPIENT"
                 else
                     recipient_single_location="$(mail_sent_recipient_location "$expected_recipient" "$CURRENT_SCENARIO_MARKER" "$CURRENT_SCENARIO_START_EPOCH")"
                     if [ "$recipient_single_location" = "MAIL_SENT_RECIPIENT" ]; then
@@ -1437,6 +1925,8 @@ capture_and_notify() {
             if [ "$mail_recipient_ok" -eq 1 ]; then
                 if [ -n "$normalized_log_recipient" ]; then
                     mail_recipient_location="LOG_MAIL_RECIPIENT"
+                elif [ "${mail_write_recipient_seen:-0}" = "1" ]; then
+                    mail_recipient_location="LOG_MAIL_WRITE_RECIPIENT"
                 else
                     mail_recipient_location="MAIL_SENT_RECIPIENT"
                 fi
@@ -1449,7 +1939,10 @@ capture_and_notify() {
         if [ "$REQUIRE_MAIL_BODY_VALUE" = "1" ]; then
             mail_body_ok=0
             mail_body_location="${mail_sent_location}"
-            if [ "$mail_sent_location" = "MAIL_SENT_BODY" ]; then
+            if [ "${mail_write_body_len:--1}" -gt 2 ] 2>/dev/null; then
+                mail_body_ok=1
+                mail_body_location="LOG_MAIL_WRITE_BODY_LEN"
+            elif [ "$mail_sent_location" = "MAIL_SENT_BODY" ]; then
                 mail_body_ok=1
                 mail_body_location="MAIL_SENT_BODY"
             elif [ "${mail_log_body_len:-0}" -gt 2 ] 2>/dev/null; then
@@ -1457,10 +1950,32 @@ capture_and_notify() {
                 mail_body_location="LOG_MAIL_BODY_LEN"
             fi
         fi
-        if [ "$mail_send_logged" -eq 1 ] && [ "$mail_sent_ok" -eq 1 ] && [ "$mail_recipient_ok" -eq 1 ] && [ "$mail_body_ok" -eq 1 ]; then
-            semantic_lines="${semantic_lines}- 메일 발송 검증 ✅ (send-action 로그/증거 + recipients=${expected_recipients_label}, outgoing=${outgoing_count}, sent_location=${mail_sent_location}, body_location=${mail_body_location}, body_len=${mail_log_body_len:-n/a}, subject=${mail_log_subject:-n/a})"$'\n'
+        local mail_mailbox_evidence_ok=0
+        local mail_mailbox_evidence_location="$mail_sent_location"
+        case "$mail_sent_location" in
+            MAIL_SENT_SUBJECT|MAIL_SENT_BODY)
+                mail_mailbox_evidence_ok=1
+                ;;
+        esac
+        if [ "$mail_mailbox_evidence_ok" -ne 1 ] && [ "$mail_recipient_location" = "MAIL_SENT_RECIPIENT" ]; then
+            mail_mailbox_evidence_ok=1
+            mail_mailbox_evidence_location="MAIL_SENT_RECIPIENT"
+        fi
+        if [ "$mail_mailbox_evidence_ok" -ne 1 ] \
+            && [ "$mail_sent_location" = "LOG_MAIL_SEND" ] \
+            && [ -n "$mail_log_draft_id" ] \
+            && [ "${mail_write_body_len:--1}" -gt 2 ] 2>/dev/null \
+            && { [ "${mail_write_recipient_seen:-0}" = "1" ] || [ -n "$mail_log_recipient" ]; }; then
+            mail_mailbox_evidence_ok=1
+            mail_mailbox_evidence_location="LOG_MAIL_FLOW_DRAFT"
+        fi
+        if [ "$REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE" != "1" ]; then
+            mail_mailbox_evidence_ok=1
+        fi
+        if [ "$mail_send_logged" -eq 1 ] && [ "$mail_sent_ok" -eq 1 ] && [ "$mail_recipient_ok" -eq 1 ] && [ "$mail_body_ok" -eq 1 ] && [ "$mail_subject_ok" -eq 1 ] && [ "$mail_mailbox_evidence_ok" -eq 1 ]; then
+            semantic_lines="${semantic_lines}- 메일 발송 검증 ✅ (send-action 로그/증거 + recipients=${expected_recipients_label}, outgoing=${outgoing_count}, sent_location=${mail_sent_location}, mailbox_evidence=${mail_mailbox_evidence_location}, subject_location=${mail_subject_location}, body_location=${mail_body_location}, body_len=${mail_log_body_len:-n/a}, draft_id=${mail_log_draft_id:-n/a}, write_recipient=${mail_write_recipient_seen:-0}, write_subject=${mail_write_subject_seen:-0}, write_body_len=${mail_write_body_len:--1}, subject=${mail_log_subject:-n/a})"$'\n'
         else
-            semantic_lines="${semantic_lines}- 메일 발송 검증 ❌ (send-action 로그=${mail_send_logged}, outgoing=${outgoing_count}, sent_location=${mail_sent_location}, body_required=${REQUIRE_MAIL_BODY_VALUE}, body_location=${mail_body_location}, body_len=${mail_log_body_len:-n/a}, recipients=${expected_recipients_label}, recipient_location=${mail_recipient_location}, token=${mail_verify_token:-none})"$'\n'
+            semantic_lines="${semantic_lines}- 메일 발송 검증 ❌ (send-action 로그=${mail_send_logged}, outgoing=${outgoing_count}, sent_location=${mail_sent_location}, mailbox_required=${REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE}, mailbox_location=${mail_mailbox_evidence_location}, subject_required=${REQUIRE_MAIL_SUBJECT_VALUE}, subject_location=${mail_subject_location}, body_required=${REQUIRE_MAIL_BODY_VALUE}, body_location=${mail_body_location}, body_len=${mail_log_body_len:-n/a}, draft_id=${mail_log_draft_id:-n/a}, write_recipient=${mail_write_recipient_seen:-0}, write_subject=${mail_write_subject_seen:-0}, write_body_len=${mail_write_body_len:--1}, recipients=${expected_recipients_label}, recipient_location=${mail_recipient_location}, token=${mail_verify_token:-none})"$'\n'
             status="failed"
         fi
     fi
@@ -1473,7 +1988,7 @@ capture_and_notify() {
 
     # Build concise evidence lines from log for detailed Telegram report.
     local key_logs=""
-    key_logs=$(grep -En "Goal completed by planner|Surf failed|Supervisor escalated|Preflight failed|Execution Error|SCHEMA_ERROR|PLAN_REJECTED|LLM Refused|fallback action|FALLBACK_ACTION:|Node evidence" "$log_file" 2>/dev/null | tail -n 8 | sed -E 's/^[0-9]+://')
+    key_logs=$(grep -En "Goal completed by planner|Surf failed|Supervisor escalated|Preflight failed|Execution Error|SCHEMA_ERROR|PLAN_REJECTED|LLM Refused|fallback action|FALLBACK_ACTION:|Node evidence|MAIL_SEND_PROOF\\||EVIDENCE\\|" "$log_file" 2>/dev/null | tail -n 8 | sed -E 's/^[0-9]+://')
     if [ -z "$key_logs" ]; then
         key_logs=$(tail -n 3 "$log_file" 2>/dev/null | sed -E 's/^[[:space:]]+//')
     fi
@@ -1496,11 +2011,16 @@ capture_and_notify() {
     evidence_lines="${evidence_lines}- STEER_NODE_CAPTURE_ALL=${NODE_CAPTURE_ALL_VALUE}"$'\n'
     evidence_lines="${evidence_lines}- STEER_TEST_MODE=${TEST_MODE_VALUE}"$'\n'
     evidence_lines="${evidence_lines}- STEER_REQUIRE_MAIL_BODY=${REQUIRE_MAIL_BODY_VALUE}"$'\n'
+    evidence_lines="${evidence_lines}- STEER_REQUIRE_MAIL_SUBJECT=${REQUIRE_MAIL_SUBJECT_VALUE}"$'\n'
+    evidence_lines="${evidence_lines}- STEER_REQUIRE_SENT_MAILBOX_EVIDENCE=${REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE}"$'\n'
     if [ "$fallback_hit" -eq 1 ]; then
         evidence_lines="${evidence_lines}- fallback 액션 감지됨(fallback action/FALLBACK_ACTION)"$'\n'
         if [ "$FAIL_ON_FALLBACK_VALUE" = "1" ]; then
             evidence_lines="${evidence_lines}- 정책상 fallback 감지 시 실패 처리(STEER_FAIL_ON_FALLBACK=1)"$'\n'
         fi
+    fi
+    if [ "${CURRENT_INPUT_GUARD_ABORTED:-0}" = "1" ]; then
+        evidence_lines="${evidence_lines}- 입력 가드 중단: ${CURRENT_INPUT_GUARD_ABORT_REASON:-unknown}"$'\n'
     fi
     evidence_lines="${evidence_lines}${semantic_lines}"
 
@@ -1519,6 +2039,7 @@ capture_and_notify() {
     : > "$node_image_list_file"
     local node_step_summary=""
     local node_step_count=0
+    local node_error_steps=""
 
     if [ "$node_count" -gt 0 ] && [ -f "$log_file" ]; then
         local node_last_rows=""
@@ -1554,12 +2075,35 @@ capture_and_notify() {
             }
         ' "$log_file" | sort -t'|' -k1,1 -k2,2n)
 
+        node_error_steps=$(awk '
+            {
+                if (match($0, /\[Step [0-9]+\/[0-9]+\]/)) {
+                    stepLine = substr($0, RSTART, RLENGTH)
+                    gsub(/^\[Step /, "", stepLine)
+                    gsub(/\/[0-9]+\]$/, "", stepLine)
+                    current_step = stepLine
+                }
+                if ($0 ~ /Execution Error:/ && current_step != "") {
+                    err[current_step] = 1
+                }
+            }
+            END {
+                for (s in err) {
+                    print s
+                }
+            }
+        ' "$log_file" | sort -n)
+
         if [ -n "$node_last_rows" ]; then
             while IFS= read -r row; do
                 [ -z "$row" ] && continue
                 IFS='|' read -r _step_key _ord path step action phase app note <<< "$row"
                 local node_status="✅ 실행"
-                if [[ "$phase" == *error* ]] || [[ "$note" == *failed* ]]; then
+                local step_has_error=0
+                if [ -n "$node_error_steps" ] && printf '%s\n' "$node_error_steps" | grep -qx "$step"; then
+                    step_has_error=1
+                fi
+                if [[ "$phase" == *error* ]] || [[ "$note" == *failed* ]] || [ "$step_has_error" -eq 1 ]; then
                     node_status="❌ 실행오류"
                 fi
                 node_step_count=$((node_step_count + 1))
@@ -1582,7 +2126,7 @@ capture_and_notify() {
         evidence_lines="${evidence_lines}- 단계별 마지막 결과"$'\n'"${node_step_summary}"
     fi
     evidence_lines="${evidence_lines}- 단계별 요약 수: ${node_step_count}"$'\n'
-    evidence_lines="${evidence_lines}- 단계 상태는 '액션 실행 여부' 기준이며, 내용 충족 여부는 의미검증 라인 기준"$'\n'
+    evidence_lines="${evidence_lines}- 단계 상태는 노드 캡처 + Execution Error 로그 기준이며, 내용 충족 여부는 의미검증 라인 기준"$'\n'
 
     if [ -s "$node_image_list_file" ]; then
         telegram_main_image=""
@@ -1602,6 +2146,25 @@ capture_and_notify() {
         status_label="✅ 성공"
     fi
 
+    local judgement_summary="semantic_missing=${semantic_missing:-0}, mail_proof=${mail_proof_status:-none}, node_capture_required=${require_node_capture}, node_count=${node_count}"
+    local fail_primary_reason="none"
+    local retry_guide="동일 시나리오를 재실행해도 됩니다."
+    if [ "$status" != "success" ]; then
+        if [ -n "$terminal_status" ]; then
+            fail_primary_reason="terminal_status=${terminal_status}"
+            retry_guide="승인/수동 단계 해소 후 같은 시나리오를 다시 실행하세요."
+        elif [ "$semantic_missing" -gt 0 ]; then
+            fail_primary_reason="semantic_missing_tokens=${semantic_missing}"
+            retry_guide="요구 토큰이 실제 앱 결과에 남도록 단계 입력을 보강하세요."
+        elif [ "${fallback_hit:-0}" -eq 1 ]; then
+            fail_primary_reason="fallback_detected"
+            retry_guide="fallback 유도 원인(포커스/권한/플랜)을 먼저 제거하세요."
+        else
+            fail_primary_reason="evidence_or_runtime_failure"
+            retry_guide="실패 근거 라인 기준으로 실패 단계만 수정 후 재실행하세요."
+        fi
+    fi
+
     local telegram_message
     telegram_message=$(cat <<EOF
 작업: 시나리오 ${scenario_num} - ${scenario_name}
@@ -1609,10 +2172,16 @@ capture_and_notify() {
 수행: 자동 시나리오 실행 및 결과 캡처/검증
 결과: ${result_info}
 상태: ${status_label}
+판정:
+- ${judgement_summary}
+- fail_reason=${fail_primary_reason}
+재실행 가이드:
+- ${retry_guide}
 근거:
 ${evidence_lines}- 로그: $(basename "$log_file")
 EOF
 )
+    telegram_message="$(compress_telegram_report "$telegram_message")"
 
     # Keep local audit copy of the raw pre-rewrite message.
     local raw_message_file="scenario_results/complex_scenario_${scenario_num}_${TIMESTAMP}.telegram.raw.txt"
@@ -1694,118 +2263,138 @@ fi
 echo ""
 
 # Scenario 1: Calendar -> Safari -> Notes -> Mail
-echo "---------------------------------------------------"
-echo "📅 Scenario 1: Calendar → Safari → Notes → Mail"
-LOG_FILE="scenario_results/complex_scenario_1_${TIMESTAMP}.log"
-SCENARIO_GOAL="Multi-app draft chain without screen-reading dependency."
-CURRENT_SCENARIO_MARKER="$MARKER_S1"
-echo "Goal: ${SCENARIO_GOAL}"
-CMD="Calendar를 열고 전면으로 가져오세요. Notes를 열어 새 메모(Cmd+N)를 만들고 제목을 \"${SUBJECT_S1}\"로 입력한 뒤 아래 3줄을 그대로 입력하세요: \"Calendar opened\", \"Notes draft ready\", \"Mail prep pending\". 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. TextEdit를 열어 새 문서(Cmd+N)에 붙여넣기(Cmd+V)하고 다음 줄에 \"Shared via TextEdit\"를 입력하세요. 다음 줄에 \"${MARKER_S1}\"를 정확히 입력하세요. 다시 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S1}\"를 입력한 뒤 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
+if should_run_scenario 1; then
+    echo "---------------------------------------------------"
+    echo "📅 Scenario 1: Calendar → Safari → Notes → Mail"
+    LOG_FILE="scenario_results/complex_scenario_1_${TIMESTAMP}.log"
+    SCENARIO_GOAL="Multi-app draft chain without screen-reading dependency."
+    CURRENT_SCENARIO_MARKER="$MARKER_S1"
+    echo "Goal: ${SCENARIO_GOAL}"
+    CMD="Calendar를 열고 전면으로 가져오세요. Notes를 열어 새 메모(Cmd+N)를 만들고 제목을 \"${SUBJECT_S1}\"로 입력한 뒤 아래 3줄을 그대로 입력하세요: \"Calendar opened\", \"Notes draft ready\", \"Mail prep pending\". 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. TextEdit를 열어 새 문서(Cmd+N)에 붙여넣기(Cmd+V)하고 다음 줄에 \"Shared via TextEdit\"를 입력하세요. 다음 줄에 \"${MARKER_S1}\"를 정확히 입력하세요. 다시 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S1}\"를 입력한 뒤 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
 
-scenario_status="failed"
-if run_agent_scenario "$CMD" "$LOG_FILE" 1; then
-    scenario_status="success"
-fi
-if capture_and_notify 1 "일정 브리핑 체인" "$scenario_status" "$LOG_FILE" "$SCENARIO_GOAL"; then
-    echo "✅ Scenario 1 Complete."
-    SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+    scenario_status="failed"
+    if run_agent_scenario "$CMD" "$LOG_FILE" 1; then
+        scenario_status="success"
+    fi
+    if capture_and_notify 1 "일정 브리핑 체인" "$scenario_status" "$LOG_FILE" "$SCENARIO_GOAL" "$CMD"; then
+        echo "✅ Scenario 1 Complete."
+        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+    else
+        echo "❌ Scenario 1 Failed."
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+    fi
+    sleep 5
 else
-    echo "❌ Scenario 1 Failed."
-    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "⏭️  Scenario 1 skipped (STEER_SCENARIO_IDS=${SELECTED_SCENARIO_IDS})"
 fi
-sleep 5
 
 # Scenario 2: Finder -> TextEdit -> Notes
-echo "---------------------------------------------------"
-echo "📂 Scenario 2: Finder → TextEdit → Notes"
-LOG_FILE="scenario_results/complex_scenario_2_${TIMESTAMP}.log"
-SCENARIO_GOAL="Finder/TextEdit/Notes/Mail transfer chain."
-CURRENT_SCENARIO_MARKER="$MARKER_S2"
-echo "Goal: ${SCENARIO_GOAL}"
-CMD="Finder를 열어 Downloads 폴더로 이동하세요. TextEdit를 열어 새 문서(Cmd+N)를 만들고 제목 \"${SUBJECT_S2}\"를 입력한 뒤 아래 3줄을 그대로 입력하세요: \"1. invoice.pdf\", \"2. screenshot.png\", \"3. notes.txt\". 다음 줄에 \"${MARKER_S2}\"를 정확히 입력하세요. 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Notes를 열어 새 메모(Cmd+N)를 만들고 붙여넣기(Cmd+V)하세요. 다시 전체 선택(Cmd+A) 후 복사(Cmd+C)하고 Mail을 열어 새 이메일(Cmd+N) 초안을 만든 뒤 제목 \"${SUBJECT_S2}\"를 입력하고 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
+if should_run_scenario 2; then
+    echo "---------------------------------------------------"
+    echo "📂 Scenario 2: Finder → TextEdit → Notes"
+    LOG_FILE="scenario_results/complex_scenario_2_${TIMESTAMP}.log"
+    SCENARIO_GOAL="Finder/TextEdit/Notes/Mail transfer chain."
+    CURRENT_SCENARIO_MARKER="$MARKER_S2"
+    echo "Goal: ${SCENARIO_GOAL}"
+    CMD="Finder를 열어 Downloads 폴더로 이동하세요. TextEdit를 열어 새 문서(Cmd+N)를 만들고 제목 \"${SUBJECT_S2}\"를 입력한 뒤 아래 3줄을 그대로 입력하세요: \"1. invoice.pdf\", \"2. screenshot.png\", \"3. notes.txt\". 다음 줄에 \"${MARKER_S2}\"를 정확히 입력하세요. 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Notes를 열어 새 메모(Cmd+N)를 만들고 붙여넣기(Cmd+V)하세요. 다시 전체 선택(Cmd+A) 후 복사(Cmd+C)하고 Mail을 열어 새 이메일(Cmd+N) 초안을 만든 뒤 제목 \"${SUBJECT_S2}\"를 입력하고 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
 
-scenario_status="failed"
-if run_agent_scenario "$CMD" "$LOG_FILE" 2; then
-    scenario_status="success"
-fi
-if capture_and_notify 2 "다운로드 분류 체인" "$scenario_status" "$LOG_FILE" "$SCENARIO_GOAL"; then
-    echo "✅ Scenario 2 Complete."
-    SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+    scenario_status="failed"
+    if run_agent_scenario "$CMD" "$LOG_FILE" 2; then
+        scenario_status="success"
+    fi
+    if capture_and_notify 2 "다운로드 분류 체인" "$scenario_status" "$LOG_FILE" "$SCENARIO_GOAL" "$CMD"; then
+        echo "✅ Scenario 2 Complete."
+        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+    else
+        echo "❌ Scenario 2 Failed."
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+    fi
+    sleep 5
 else
-    echo "❌ Scenario 2 Failed."
-    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "⏭️  Scenario 2 skipped (STEER_SCENARIO_IDS=${SELECTED_SCENARIO_IDS})"
 fi
-sleep 5
 
 # Scenario 3: Safari -> Calculator -> Notes
-echo "---------------------------------------------------"
-echo "📈 Scenario 3: Safari → Calculator → Notes"
-LOG_FILE="scenario_results/complex_scenario_3_${TIMESTAMP}.log"
-SCENARIO_GOAL="Browser + calculation + document handoff chain."
-CURRENT_SCENARIO_MARKER="$MARKER_S3"
-echo "Goal: ${SCENARIO_GOAL}"
-CMD="Safari를 열고 https://www.google.com 으로 이동하세요. 새 탭(Cmd+T)을 열고 https://www.wikipedia.org 로 이동하세요. Calculator를 열어 \"120*1300=\" 을 입력해 계산한 뒤 복사(Cmd+C)하세요. Notes를 열어 새 메모(Cmd+N)를 만들고 제목 \"${SUBJECT_S3}\"를 입력한 뒤 다음 줄에 \"120*1300=\"를 입력하고 다음 줄에 붙여넣기(Cmd+V)하세요. TextEdit를 열어 새 문서(Cmd+N)에 방금 메모 내용을 붙여넣기(Cmd+V)하고 마지막 줄에 \"Done\"을 입력하세요. 다음 줄에 \"${MARKER_S3}\"를 정확히 입력하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S3}\"를 입력한 뒤 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
+if should_run_scenario 3; then
+    echo "---------------------------------------------------"
+    echo "📈 Scenario 3: Safari → Calculator → Notes"
+    LOG_FILE="scenario_results/complex_scenario_3_${TIMESTAMP}.log"
+    SCENARIO_GOAL="Browser + calculation + document handoff chain."
+    CURRENT_SCENARIO_MARKER="$MARKER_S3"
+    echo "Goal: ${SCENARIO_GOAL}"
+    CMD="Safari를 열고 https://www.google.com 으로 이동하세요. 새 탭(Cmd+T)을 열고 https://www.wikipedia.org 로 이동하세요. Calculator를 열어 \"120*1300=\" 을 입력해 계산한 뒤 복사(Cmd+C)하세요. Notes를 열어 새 메모(Cmd+N)를 만들고 제목 \"${SUBJECT_S3}\"를 입력한 뒤 다음 줄에 \"120*1300=\"를 입력하고 다음 줄에 붙여넣기(Cmd+V)하세요. TextEdit를 열어 새 문서(Cmd+N)에 방금 메모 내용을 붙여넣기(Cmd+V)하고 마지막 줄에 \"Done\"을 입력하세요. 다음 줄에 \"${MARKER_S3}\"를 정확히 입력하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S3}\"를 입력한 뒤 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
 
-scenario_status="failed"
-if run_agent_scenario "$CMD" "$LOG_FILE" 3; then
-    scenario_status="success"
-fi
-if capture_and_notify 3 "주가 비교 체인" "$scenario_status" "$LOG_FILE" "$SCENARIO_GOAL"; then
-    echo "✅ Scenario 3 Complete."
-    SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+    scenario_status="failed"
+    if run_agent_scenario "$CMD" "$LOG_FILE" 3; then
+        scenario_status="success"
+    fi
+    if capture_and_notify 3 "주가 비교 체인" "$scenario_status" "$LOG_FILE" "$SCENARIO_GOAL" "$CMD"; then
+        echo "✅ Scenario 3 Complete."
+        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+    else
+        echo "❌ Scenario 3 Failed."
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+    fi
+    sleep 5
 else
-    echo "❌ Scenario 3 Failed."
-    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "⏭️  Scenario 3 skipped (STEER_SCENARIO_IDS=${SELECTED_SCENARIO_IDS})"
 fi
-sleep 5
 
 # Scenario 4: Notes -> Safari -> TextEdit
-echo "---------------------------------------------------"
-echo "🧠 Scenario 4: Notes → Safari → TextEdit"
-LOG_FILE="scenario_results/complex_scenario_4_${TIMESTAMP}.log"
-SCENARIO_GOAL="Idea note -> web query -> report -> mail draft chain."
-CURRENT_SCENARIO_MARKER="$MARKER_S4"
-echo "Goal: ${SCENARIO_GOAL}"
-CMD="Notes를 열어 새 메모(Cmd+N)를 만들고 아래 3줄을 그대로 입력하세요: \"focus music\", \"pomodoro timer\", \"daily review template\". 다음 줄에 \"${MARKER_S4}\"를 정확히 입력하세요. 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Safari를 열고 https://www.google.com 으로 이동한 뒤 붙여넣기(Cmd+V)하고 Enter를 누르세요. 주소창에 포커스(Cmd+L) 후 복사(Cmd+C)하세요. TextEdit를 열어 새 문서(Cmd+N)에 \"${SUBJECT_S4}\" 제목을 입력하고 다음 줄에 붙여넣기(Cmd+V)하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S4}\"를 입력한 뒤 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
+if should_run_scenario 4; then
+    echo "---------------------------------------------------"
+    echo "🧠 Scenario 4: Notes → Safari → TextEdit"
+    LOG_FILE="scenario_results/complex_scenario_4_${TIMESTAMP}.log"
+    SCENARIO_GOAL="Idea note -> web query -> report -> mail draft chain."
+    CURRENT_SCENARIO_MARKER="$MARKER_S4"
+    echo "Goal: ${SCENARIO_GOAL}"
+    CMD="Notes를 열어 새 메모(Cmd+N)를 만들고 아래 3줄을 그대로 입력하세요: \"focus music\", \"pomodoro timer\", \"daily review template\". 다음 줄에 \"${MARKER_S4}\"를 정확히 입력하세요. 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Safari를 열고 https://www.google.com 으로 이동한 뒤 붙여넣기(Cmd+V)하고 Enter를 누르세요. 주소창에 포커스(Cmd+L) 후 복사(Cmd+C)하세요. TextEdit를 열어 새 문서(Cmd+N)에 \"${SUBJECT_S4}\" 제목을 입력하고 다음 줄에 붙여넣기(Cmd+V)하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S4}\"를 입력한 뒤 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
 
-scenario_status="failed"
-if run_agent_scenario "$CMD" "$LOG_FILE" 4; then
-    scenario_status="success"
-fi
-if capture_and_notify 4 "아이디어 리서치 체인" "$scenario_status" "$LOG_FILE" "$SCENARIO_GOAL"; then
-    echo "✅ Scenario 4 Complete."
-    SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+    scenario_status="failed"
+    if run_agent_scenario "$CMD" "$LOG_FILE" 4; then
+        scenario_status="success"
+    fi
+    if capture_and_notify 4 "아이디어 리서치 체인" "$scenario_status" "$LOG_FILE" "$SCENARIO_GOAL" "$CMD"; then
+        echo "✅ Scenario 4 Complete."
+        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+    else
+        echo "❌ Scenario 4 Failed."
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+    fi
+    sleep 5
 else
-    echo "❌ Scenario 4 Failed."
-    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "⏭️  Scenario 4 skipped (STEER_SCENARIO_IDS=${SELECTED_SCENARIO_IDS})"
 fi
-sleep 5
 
 # Scenario 5: Safari -> Calculator -> Notes -> Mail
-echo "---------------------------------------------------"
-echo "💱 Scenario 5: Safari → Calculator → Notes → Mail"
-LOG_FILE="scenario_results/complex_scenario_5_${TIMESTAMP}.log"
-SCENARIO_GOAL="Finder/Calculator/Notes/Mail budget draft chain."
-CURRENT_SCENARIO_MARKER="$MARKER_S5"
-echo "Goal: ${SCENARIO_GOAL}"
-CMD="Finder를 열어 Desktop으로 이동하세요. Calculator를 열어 \"120*1450=\" 을 입력해 계산하고 결과를 복사(Cmd+C)하세요. Notes를 열어 새 메모(Cmd+N)를 만들고 제목 \"${SUBJECT_S5}\"를 입력한 뒤 다음 줄에 \"Base: 120 USD\"를 입력하고 다음 줄에 붙여넣기(Cmd+V)하세요. 다음 줄에 \"${MARKER_S5}\"를 정확히 입력하세요. 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S5}\"를 입력한 다음 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
+if should_run_scenario 5; then
+    echo "---------------------------------------------------"
+    echo "💱 Scenario 5: Safari → Calculator → Notes → Mail"
+    LOG_FILE="scenario_results/complex_scenario_5_${TIMESTAMP}.log"
+    SCENARIO_GOAL="Finder/Calculator/Notes/Mail budget draft chain."
+    CURRENT_SCENARIO_MARKER="$MARKER_S5"
+    echo "Goal: ${SCENARIO_GOAL}"
+    CMD="Finder를 열어 Desktop으로 이동하세요. Calculator를 열어 \"120*1450=\" 을 입력해 계산하고 결과를 복사(Cmd+C)하세요. Notes를 열어 새 메모(Cmd+N)를 만들고 제목 \"${SUBJECT_S5}\"를 입력한 뒤 다음 줄에 \"Base: 120 USD\"를 입력하고 다음 줄에 붙여넣기(Cmd+V)하세요. 다음 줄에 \"${MARKER_S5}\"를 정확히 입력하세요. 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S5}\"를 입력한 다음 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
 
-scenario_status="failed"
-if run_agent_scenario "$CMD" "$LOG_FILE" 5; then
-    scenario_status="success"
-fi
-if capture_and_notify 5 "환율 예산 체인" "$scenario_status" "$LOG_FILE" "$SCENARIO_GOAL"; then
-    echo "✅ Scenario 5 Complete."
-    SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+    scenario_status="failed"
+    if run_agent_scenario "$CMD" "$LOG_FILE" 5; then
+        scenario_status="success"
+    fi
+    if capture_and_notify 5 "환율 예산 체인" "$scenario_status" "$LOG_FILE" "$SCENARIO_GOAL" "$CMD"; then
+        echo "✅ Scenario 5 Complete."
+        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+    else
+        echo "❌ Scenario 5 Failed."
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+    fi
 else
-    echo "❌ Scenario 5 Failed."
-    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "⏭️  Scenario 5 skipped (STEER_SCENARIO_IDS=${SELECTED_SCENARIO_IDS})"
 fi
 
 echo ""
-echo "📊 Summary: success=${SUCCESS_COUNT}, failed=${FAIL_COUNT}"
+echo "📊 Summary: selected=${SELECTED_SCENARIO_COUNT}, success=${SUCCESS_COUNT}, failed=${FAIL_COUNT}"
 if [ "$FAIL_COUNT" -gt 0 ]; then
     echo "⚠️  Completed with failures."
     exit 1
 fi
-echo "🎉 All 5 Complex Scenarios Succeeded."
+echo "🎉 All selected complex scenarios succeeded."

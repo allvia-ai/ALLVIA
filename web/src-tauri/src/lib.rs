@@ -4,6 +4,38 @@ use tauri::{
   Manager,
 };
 
+#[tauri::command]
+fn open_artifact_path(path: String) -> Result<String, String> {
+  let trimmed = path.trim();
+  if trimmed.is_empty() {
+    return Err("empty_path".to_string());
+  }
+
+  let mut target = std::path::PathBuf::from(trimmed);
+  if !target.is_absolute() {
+    let cwd = std::env::current_dir().map_err(|e| format!("cwd_error: {}", e))?;
+    target = cwd.join(target);
+  }
+
+  let resolved = target.canonicalize().unwrap_or(target.clone());
+  let metadata = std::fs::metadata(&resolved)
+    .map_err(|_| format!("path_not_found: {}", resolved.to_string_lossy()))?;
+
+  let mut cmd = std::process::Command::new("open");
+  if metadata.is_file() {
+    cmd.arg("-R").arg(&resolved);
+  } else {
+    cmd.arg(&resolved);
+  }
+
+  let status = cmd.status().map_err(|e| format!("open_error: {}", e))?;
+  if !status.success() {
+    return Err(format!("open_failed: {}", status));
+  }
+
+  Ok(resolved.to_string_lossy().to_string())
+}
+
 fn position_window_bottom_center(window: &tauri::WebviewWindow) {
   if let (Ok(Some(monitor)), Ok(window_size)) = (window.current_monitor(), window.outer_size()) {
     let monitor_size = monitor.size();
@@ -84,6 +116,7 @@ pub fn run() {
             api.prevent_close();
         }
     })
+    .invoke_handler(tauri::generate_handler![open_artifact_path])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }

@@ -4,6 +4,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +91,38 @@ fn parse_bool_env_with_default(key: &str, default: bool) -> bool {
 }
 
 impl N8nApi {
+    fn n8n_cli_binary_available() -> bool {
+        Command::new("n8n")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    fn resolve_cli_invocation(&self) -> Result<(String, Vec<String>)> {
+        if Self::n8n_cli_binary_available() {
+            return Ok(("n8n".to_string(), Vec::new()));
+        }
+
+        let allow_npx_cli = parse_bool_env_with_default("STEER_N8N_ALLOW_NPX_CLI", false);
+        if allow_npx_cli || matches!(self.runtime_mode(), N8nRuntime::Npx) {
+            if !parse_bool_env_with_default("STEER_N8N_ENABLE_NPX_RUNTIME", false) && !allow_npx_cli
+            {
+                return Err(anyhow::anyhow!(
+                    "n8n CLI binary is missing and npx CLI fallback is disabled. \
+Set STEER_N8N_ALLOW_NPX_CLI=1 (or enable npx runtime explicitly)."
+                ));
+            }
+            return Ok(("npx".to_string(), vec!["-y".to_string(), "n8n".to_string()]));
+        }
+
+        Err(anyhow::anyhow!(
+            "n8n CLI binary not found in PATH. Install n8n or set STEER_N8N_ALLOW_NPX_CLI=1"
+        ))
+    }
+
     fn build_http_client() -> Client {
         let prefer_no_proxy =
             cfg!(test) || parse_bool_env_with_default("STEER_HTTP_NO_SYSTEM_PROXY", false);
@@ -257,8 +290,6 @@ impl N8nApi {
             ));
         }
         println!("⚠️  Starting n8n with npx fallback runtime...");
-        use std::process::{Command, Stdio};
-
         let mut args = vec!["-y", "n8n", "start"];
         if crate::env_flag("STEER_N8N_USE_TUNNEL") {
             args.push("--tunnel");
@@ -670,10 +701,11 @@ impl N8nApi {
 
         println!("📥 Importing workflow via CLI from {}...", path);
 
-        let output = tokio::process::Command::new("npx")
-            .args(["-y", "n8n", "import:workflow", "--input", &path])
-            .output()
-            .await?;
+        let (cli_bin, cli_prefix) = self.resolve_cli_invocation()?;
+        let mut cmd = tokio::process::Command::new(&cli_bin);
+        cmd.args(&cli_prefix);
+        cmd.args(["import:workflow", "--input", &path]);
+        let output = cmd.output().await?;
 
         // Cleanup
         if let Err(e) = tokio::fs::remove_file(&path).await {
@@ -690,7 +722,8 @@ impl N8nApi {
                 .unwrap_or_else(|| "signal".to_string());
             let detail = if !stderr.is_empty() { stderr } else { stdout };
             return Err(anyhow::anyhow!(
-                "CLI Import failed (exit {}): {}",
+                "CLI Import failed (bin={}, exit {}): {}",
+                cli_bin,
                 code,
                 detail
             ));
@@ -731,17 +764,19 @@ impl N8nApi {
         import_marker: &str,
     ) -> Result<String> {
         let path = format!("/tmp/n8n_export_{}.json", uuid::Uuid::new_v4());
-        let output = tokio::process::Command::new("npx")
-            .args(["-y", "n8n", "export:workflow", "--all", "--output", &path])
-            .output()
-            .await?;
+        let (cli_bin, cli_prefix) = self.resolve_cli_invocation()?;
+        let mut cmd = tokio::process::Command::new(&cli_bin);
+        cmd.args(&cli_prefix);
+        cmd.args(["export:workflow", "--all", "--output", &path]);
+        let output = cmd.output().await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
             let detail = if !stderr.is_empty() { stderr } else { stdout };
             return Err(anyhow::anyhow!(
-                "CLI workflow id lookup failed after import: {}",
+                "CLI workflow id lookup failed after import (bin={}): {}",
+                cli_bin,
                 detail
             ));
         }

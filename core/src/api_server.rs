@@ -18,6 +18,8 @@ use crate::{
     visual_verification, workflow_intake,
 };
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 use sysinfo::System;
 
@@ -37,6 +39,12 @@ struct AgentExecutionGuard {
     plan_id: String,
 }
 
+#[derive(Debug)]
+struct AgentExecutionLockConflict {
+    scope: String,
+    active_plan_id: Option<String>,
+}
+
 impl Drop for AgentExecutionGuard {
     fn drop(&mut self) {
         if let Ok(mut set) = inflight_agent_executions().lock() {
@@ -45,17 +53,49 @@ impl Drop for AgentExecutionGuard {
     }
 }
 
-fn acquire_agent_execution(plan_id: &str) -> Option<AgentExecutionGuard> {
+fn agent_execution_lock_scope() -> String {
+    let configured = std::env::var("STEER_AGENT_EXECUTION_LOCK_SCOPE")
+        .ok()
+        .unwrap_or_else(|| "global".to_string());
+    match configured.trim().to_lowercase().as_str() {
+        "plan" | "per_plan" | "per-plan" => "plan".to_string(),
+        _ => "global".to_string(),
+    }
+}
+
+fn acquire_agent_execution(
+    plan_id: &str,
+) -> Result<AgentExecutionGuard, AgentExecutionLockConflict> {
+    let scope = agent_execution_lock_scope();
     if let Ok(mut set) = inflight_agent_executions().lock() {
+        if scope == "global" {
+            if let Some(active) = set.iter().next() {
+                return Err(AgentExecutionLockConflict {
+                    scope,
+                    active_plan_id: Some(active.to_string()),
+                });
+            }
+            set.insert(plan_id.to_string());
+            return Ok(AgentExecutionGuard {
+                plan_id: plan_id.to_string(),
+            });
+        }
+
         if set.contains(plan_id) {
-            return None;
+            return Err(AgentExecutionLockConflict {
+                scope,
+                active_plan_id: Some(plan_id.to_string()),
+            });
         }
         set.insert(plan_id.to_string());
-        return Some(AgentExecutionGuard {
+        return Ok(AgentExecutionGuard {
             plan_id: plan_id.to_string(),
         });
     }
-    None
+    Err(AgentExecutionLockConflict {
+        scope,
+        active_plan_id: None,
+    })
 }
 
 // Request/Response types
@@ -114,6 +154,43 @@ pub struct AgentPlanResponse {
 #[derive(Deserialize)]
 pub struct AgentExecuteRequest {
     pub plan_id: String,
+    pub profile: Option<AgentExecutionProfile>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentExecutionProfile {
+    Strict,
+    Test,
+    Fast,
+}
+
+impl Default for AgentExecutionProfile {
+    fn default() -> Self {
+        Self::Strict
+    }
+}
+
+impl AgentExecutionProfile {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Test => "test",
+            Self::Fast => "fast",
+        }
+    }
+
+    fn execution_options(&self) -> crate::execution_controller::ExecutionOptions {
+        match self {
+            Self::Strict => crate::execution_controller::ExecutionOptions::strict(),
+            Self::Test => crate::execution_controller::ExecutionOptions::test(),
+            Self::Fast => crate::execution_controller::ExecutionOptions::fast(),
+        }
+    }
+
+    fn default_auto_replan_enabled(&self) -> bool {
+        matches!(self, Self::Test)
+    }
 }
 
 #[derive(Serialize)]
@@ -133,6 +210,33 @@ pub struct AgentExecuteResponse {
     pub execution_complete: bool,
     #[serde(default)]
     pub business_complete: bool,
+    #[serde(default)]
+    pub completion_score: Option<AgentCompletionScore>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub collision_policy: Option<String>,
+    #[serde(default)]
+    pub stage_dod: Vec<AgentStageDodCheck>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct AgentCompletionScore {
+    pub score: u8,
+    pub label: String,
+    pub pass: bool,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct AgentStageDodCheck {
+    pub stage: String,
+    pub key: String,
+    pub expected: String,
+    pub actual: String,
+    pub passed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -160,6 +264,67 @@ pub struct AgentApproveResponse {
     pub message: String,
     pub risk_level: String,
     pub policy: String,
+}
+
+#[derive(Serialize)]
+pub struct AgentPreflightCheckItem {
+    pub key: String,
+    pub label: String,
+    pub ok: bool,
+    pub expected: Option<String>,
+    pub actual: Option<String>,
+    pub message: String,
+}
+
+#[derive(Serialize)]
+pub struct AgentPreflightResponse {
+    pub ok: bool,
+    pub checks: Vec<AgentPreflightCheckItem>,
+    pub active_app: Option<String>,
+    pub checked_at: String,
+}
+
+#[derive(Deserialize)]
+pub struct AgentPreflightFixRequest {
+    pub action: String,
+    pub run_id: Option<String>,
+    pub stage_name: Option<String>,
+    pub assertion_key: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct AgentPreflightFixResponse {
+    pub ok: bool,
+    pub action: String,
+    pub message: String,
+    pub active_app: Option<String>,
+    pub fixed_at: String,
+    pub recorded: bool,
+    pub run_id: Option<String>,
+    pub stage_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct AgentRecoveryEventRequest {
+    pub run_id: String,
+    pub action_key: String,
+    pub status: String,
+    pub details: Option<String>,
+    pub stage_name: Option<String>,
+    pub expected: Option<String>,
+    pub actual: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct AgentRecoveryEventResponse {
+    pub ok: bool,
+    pub recorded: bool,
+    pub run_id: String,
+    pub stage_name: String,
+    pub action_key: String,
+    pub status: String,
+    pub recorded_at: String,
+    pub reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -556,6 +721,15 @@ pub async fn start_api_server(
         .route("/api/agent/execute", post(agent_execute_handler))
         .route("/api/agent/verify", post(agent_verify_handler))
         .route("/api/agent/approve", post(agent_approve_handler))
+        .route("/api/agent/preflight", get(agent_preflight_handler))
+        .route(
+            "/api/agent/preflight/fix",
+            post(agent_preflight_fix_handler),
+        )
+        .route(
+            "/api/agent/recovery-event",
+            post(agent_recovery_event_handler),
+        )
         .route("/api/agent/nl-runs", get(list_nl_runs_handler))
         .route("/api/agent/nl-metrics", get(nl_run_metrics_handler))
         .route("/api/agent/task-runs", get(list_task_runs_handler))
@@ -567,6 +741,10 @@ pub async fn start_api_server(
         .route(
             "/api/agent/task-runs/:run_id/assertions",
             get(list_task_stage_assertions_handler),
+        )
+        .route(
+            "/api/agent/task-runs/:run_id/artifacts",
+            get(list_task_run_artifacts_handler),
         )
         .route(
             "/api/agent/approval-policies",
@@ -664,6 +842,628 @@ async fn get_recent_logs() -> Json<Vec<LogEntry>> {
 async fn get_system_health() -> Json<crate::dependency_check::SystemHealth> {
     let health = crate::dependency_check::SystemHealth::check_all();
     Json(health)
+}
+
+fn run_osascript_inline(script: &str) -> Result<String, String> {
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(out)
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn open_system_settings_url(url: &str) -> Result<(), String> {
+    Command::new("open")
+        .arg(url)
+        .status()
+        .map_err(|e| e.to_string())
+        .and_then(|status| {
+            if status.success() {
+                Ok(())
+            } else {
+                Err(format!("open command failed for {}", url))
+            }
+        })
+}
+
+fn escape_applescript_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn parse_primary_mail_recipient(raw: &str) -> Option<String> {
+    let is_email_char =
+        |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '%' | '+' | '-' | '@');
+
+    let scrub_segment = |segment: &str| -> Option<String> {
+        let trimmed = segment
+            .trim()
+            .trim_matches('<')
+            .trim_matches('>')
+            .trim_matches('"')
+            .trim_matches('\'');
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let mut cleaned = String::new();
+        let mut started = false;
+        for ch in trimmed.chars() {
+            if is_email_char(ch) {
+                cleaned.push(ch);
+                started = true;
+            } else if started {
+                break;
+            }
+        }
+
+        let normalized = cleaned
+            .trim_end_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ':' | ')' | '('))
+            .to_ascii_lowercase();
+        if normalized.contains('@') && normalized.contains('.') {
+            Some(normalized)
+        } else {
+            None
+        }
+    };
+
+    raw.split(|ch: char| ch.is_whitespace() || ch == ',' || ch == ';')
+        .filter_map(scrub_segment)
+        .next()
+}
+
+fn resolve_mail_recipient_for_recovery(run_id: Option<&str>) -> Option<String> {
+    if let Some(id) = run_id {
+        if let Ok(Some(run)) = db::get_task_run(id) {
+            for candidate in crate::semantic_contract::extract_expected_recipients(&run.prompt) {
+                if let Some(parsed) = parse_primary_mail_recipient(&candidate) {
+                    return Some(parsed);
+                }
+            }
+        }
+    }
+    std::env::var("STEER_DEFAULT_MAIL_TO")
+        .ok()
+        .and_then(|v| parse_primary_mail_recipient(&v))
+}
+
+fn mail_fill_default_recipient(recipient: &str) -> Result<String, String> {
+    let recipient_escaped = escape_applescript_string(recipient);
+    let script = format!(
+        "tell application \"Mail\"\n\
+            activate\n\
+            if (count of outgoing messages) = 0 then return \"NO_OUTGOING\"\n\
+            set _msg to (last outgoing message)\n\
+            set _hasRecipient to false\n\
+            try\n\
+                if (count of to recipients of _msg) > 0 then\n\
+                    set _first to address of first to recipient of _msg as text\n\
+                    if _first is not \"\" then set _hasRecipient to true\n\
+                end if\n\
+            end try\n\
+            if _hasRecipient is false then\n\
+                make new to recipient at end of to recipients of _msg with properties {{address:\"{}\"}}\n\
+            end if\n\
+            set visible of _msg to true\n\
+            set _draftId to \"\"\n\
+            try\n\
+                set _draftId to id of _msg as text\n\
+            end try\n\
+            return \"OK|\" & _draftId\n\
+        end tell",
+        recipient_escaped
+    );
+    run_osascript_inline(&script)
+}
+
+fn mail_cleanup_outgoing_windows() -> Result<String, String> {
+    let script = "tell application \"Mail\"\n\
+        activate\n\
+        set _count to (count of outgoing messages)\n\
+        if _count = 0 then return \"NO_OUTGOING|0\"\n\
+        repeat with _msg in outgoing messages\n\
+            try\n\
+                set visible of _msg to false\n\
+            end try\n\
+        end repeat\n\
+        return \"OK|\" & (_count as text)\n\
+    end tell";
+    run_osascript_inline(script)
+}
+
+fn textedit_save_front_document() -> Result<String, String> {
+    let script = "tell application \"TextEdit\"\n\
+        activate\n\
+        if (count of documents) = 0 then return \"NO_DOCUMENT\"\n\
+        set _doc to front document\n\
+        save _doc\n\
+        set _docId to \"\"\n\
+        try\n\
+            set _docId to id of _doc as text\n\
+        end try\n\
+        return \"OK|\" & _docId\n\
+    end tell";
+    run_osascript_inline(script)
+}
+
+fn env_truthy_default(name: &str, default_value: bool) -> bool {
+    match std::env::var(name) {
+        Ok(raw) => matches!(raw.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"),
+        Err(_) => default_value,
+    }
+}
+
+fn preflight_focus_mode() -> String {
+    std::env::var("STEER_PREFLIGHT_FOCUS_MODE")
+        .ok()
+        .map(|v| v.trim().to_lowercase())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "passive".to_string())
+}
+
+async fn agent_preflight_handler() -> Json<AgentPreflightResponse> {
+    let mut checks: Vec<AgentPreflightCheckItem> = Vec::new();
+    let mut all_ok = true;
+    let mut active_app: Option<String> = None;
+
+    let accessibility = run_osascript_inline(
+        "tell application \"System Events\" to return name of first application process",
+    );
+    match accessibility {
+        Ok(name) => checks.push(AgentPreflightCheckItem {
+            key: "accessibility".to_string(),
+            label: "Accessibility".to_string(),
+            ok: true,
+            expected: None,
+            actual: Some(name),
+            message: "Accessibility permission available".to_string(),
+        }),
+        Err(err) => {
+            all_ok = false;
+            checks.push(AgentPreflightCheckItem {
+                key: "accessibility".to_string(),
+                label: "Accessibility".to_string(),
+                ok: false,
+                expected: None,
+                actual: None,
+                message: format!("Accessibility unavailable: {}", err),
+            });
+        }
+    }
+
+    let shot_path = format!("/tmp/steer_agent_preflight_{}.png", std::process::id());
+    let shot_ok = Command::new("screencapture")
+        .args(["-x", shot_path.as_str()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if shot_ok {
+        let _ = fs::remove_file(&shot_path);
+        checks.push(AgentPreflightCheckItem {
+            key: "screen_capture".to_string(),
+            label: "Screen Capture".to_string(),
+            ok: true,
+            expected: None,
+            actual: Some("ok".to_string()),
+            message: "Screen capture permission available".to_string(),
+        });
+    } else {
+        all_ok = false;
+        checks.push(AgentPreflightCheckItem {
+            key: "screen_capture".to_string(),
+            label: "Screen Capture".to_string(),
+            ok: false,
+            expected: None,
+            actual: None,
+            message: "Screen capture unavailable".to_string(),
+        });
+    }
+
+    if env_truthy_default("STEER_PREFLIGHT_FOCUS_HANDOFF", true) {
+        let focus_mode = preflight_focus_mode();
+        let front_res = run_osascript_inline(
+            "tell application \"System Events\" to return name of first application process whose frontmost is true",
+        );
+        let (focus_ok, focus_actual, focus_msg) = if focus_mode == "active" {
+            let activate_res = run_osascript_inline("tell application \"Finder\" to activate");
+            match (activate_res, front_res) {
+                (Ok(_), Ok(front)) => {
+                    active_app = Some(front.clone());
+                    if front == "Finder" {
+                        (
+                            true,
+                            Some(front),
+                            "Focus handoff ready (active mode, frontmost=Finder)".to_string(),
+                        )
+                    } else {
+                        (
+                            false,
+                            Some(front.clone()),
+                            format!("Focus handoff blocked (active mode, frontmost={})", front),
+                        )
+                    }
+                }
+                (_, Err(err)) => (false, None, format!("Focus handoff check failed: {}", err)),
+                (Err(err), _) => (
+                    false,
+                    None,
+                    format!("Focus handoff activate failed: {}", err),
+                ),
+            }
+        } else {
+            match front_res {
+                Ok(front) => {
+                    active_app = Some(front.clone());
+                    if front == "Finder" {
+                        (
+                            true,
+                            Some(front),
+                            "Focus handoff ready (passive mode, frontmost=Finder)".to_string(),
+                        )
+                    } else {
+                        (
+                            true,
+                            Some(front.clone()),
+                            format!(
+                                "Focus handoff passive check only (frontmost={}; recommended=Finder)",
+                                front
+                            ),
+                        )
+                    }
+                }
+                Err(err) => (false, None, format!("Focus handoff check failed: {}", err)),
+            }
+        };
+        if !focus_ok {
+            all_ok = false;
+        }
+        checks.push(AgentPreflightCheckItem {
+            key: "focus_handoff".to_string(),
+            label: "Focus Handoff".to_string(),
+            ok: focus_ok,
+            expected: Some(if focus_mode == "active" {
+                "Finder (required)".to_string()
+            } else {
+                "Finder (recommended)".to_string()
+            }),
+            actual: focus_actual,
+            message: focus_msg,
+        });
+    } else {
+        checks.push(AgentPreflightCheckItem {
+            key: "focus_handoff".to_string(),
+            label: "Focus Handoff".to_string(),
+            ok: true,
+            expected: Some("Finder".to_string()),
+            actual: Some("skipped".to_string()),
+            message: "Focus handoff check disabled by env".to_string(),
+        });
+    }
+
+    if active_app.is_none() {
+        if let Ok(front) = run_osascript_inline(
+            "tell application \"System Events\" to return name of first application process whose frontmost is true",
+        ) {
+            active_app = Some(front);
+        }
+    }
+
+    Json(AgentPreflightResponse {
+        ok: all_ok,
+        checks,
+        active_app,
+        checked_at: chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+async fn agent_preflight_fix_handler(
+    Json(payload): Json<AgentPreflightFixRequest>,
+) -> impl IntoResponse {
+    let action = payload.action.trim().to_string();
+    if action.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "missing_action" })),
+        )
+            .into_response();
+    }
+
+    let run_id = payload
+        .run_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string());
+    let stage_name = payload
+        .stage_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("recovery")
+        .to_string();
+    let assertion_key = payload
+        .assertion_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| format!("recovery.preflight.{}", action.replace(' ', "_")));
+
+    let fix_result: Result<String, String> = match action.as_str() {
+        "activate_finder" => run_osascript_inline("tell application \"Finder\" to activate")
+            .map(|_| "Finder를 전면으로 전환했습니다. 다시 점검을 실행하세요.".to_string()),
+        "activate_mail" => run_osascript_inline("tell application \"Mail\" to activate")
+            .map(|_| "Mail을 전면으로 전환했습니다.".to_string()),
+        "activate_notes" => run_osascript_inline("tell application \"Notes\" to activate")
+            .map(|_| "Notes를 전면으로 전환했습니다.".to_string()),
+        "activate_textedit" => run_osascript_inline("tell application \"TextEdit\" to activate")
+            .map(|_| "TextEdit를 전면으로 전환했습니다.".to_string()),
+        "prepare_isolated_mode" => run_osascript_inline(
+            "tell application \"Finder\" to activate\n\
+             delay 0.1\n\
+             tell application \"System Events\" to keystroke \"h\" using {command down, option down}\n\
+             delay 0.1\n\
+             tell application \"Finder\" to activate",
+        )
+        .map(|_| {
+            "격리 실행 모드를 준비했습니다(다른 앱 숨김 + Finder 전면). 실행 중 키보드/마우스 입력을 피하세요."
+                .to_string()
+        }),
+        "open_accessibility_settings" => open_system_settings_url(
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+        )
+        .map(|_| "접근성 권한 설정 화면을 열었습니다.".to_string()),
+        "open_screen_capture_settings" => open_system_settings_url(
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+        )
+        .map(|_| "화면 기록 권한 설정 화면을 열었습니다.".to_string()),
+        "open_input_monitoring_settings" => open_system_settings_url(
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
+        )
+        .map(|_| "입력 모니터링 권한 설정 화면을 열었습니다.".to_string()),
+        "mail_fill_default_recipient" => resolve_mail_recipient_for_recovery(run_id.as_deref())
+            .ok_or_else(|| {
+                "수신자 후보를 찾지 못했습니다(run prompt/STEER_DEFAULT_MAIL_TO 확인 필요)"
+                    .to_string()
+            })
+            .and_then(|recipient| {
+                mail_fill_default_recipient(&recipient).map(|result| {
+                    if result.starts_with("NO_OUTGOING") {
+                        "Mail의 outgoing message가 없어 수신자를 채우지 못했습니다.".to_string()
+                    } else {
+                        format!("Mail 수신자를 기본값({})으로 보강했습니다 ({})", recipient, result)
+                    }
+                })
+            }),
+        "mail_cleanup_outgoing_windows" => mail_cleanup_outgoing_windows().map(|result| {
+            if result.starts_with("NO_OUTGOING") {
+                "Mail outgoing 초안이 없어 정리할 항목이 없습니다.".to_string()
+            } else {
+                format!("Mail outgoing 초안 창을 정리했습니다 ({})", result)
+            }
+        }),
+        "textedit_save_front_document" => textedit_save_front_document().map(|result| {
+            if result.starts_with("NO_DOCUMENT") {
+                "TextEdit 문서가 없어 저장하지 못했습니다.".to_string()
+            } else {
+                format!("TextEdit front document 저장을 실행했습니다 ({})", result)
+            }
+        }),
+        _ => Err(format!("unsupported_action: {}", action)),
+    };
+
+    let active_app = run_osascript_inline(
+        "tell application \"System Events\" to return name of first application process whose frontmost is true",
+    )
+    .ok();
+
+    let persist_for_fix = |status: &str, details: &str| -> bool {
+        let Some(id) = run_id.as_deref() else {
+            return false;
+        };
+        persist_recovery_event(
+            id,
+            &stage_name,
+            &assertion_key,
+            status,
+            Some("completed"),
+            Some(status),
+            Some(details),
+        )
+        .unwrap_or(false)
+    };
+
+    match fix_result {
+        Ok(message) => {
+            let evidence = if let Some(front) = active_app.as_deref() {
+                format!("{} (front={})", message, front)
+            } else {
+                message.clone()
+            };
+            let recorded = persist_for_fix("completed", &evidence);
+            (
+                StatusCode::OK,
+                Json(json!(AgentPreflightFixResponse {
+                    ok: true,
+                    action,
+                    message,
+                    active_app,
+                    fixed_at: chrono::Utc::now().to_rfc3339(),
+                    recorded,
+                    run_id,
+                    stage_name: Some(stage_name),
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => {
+            let evidence = if let Some(front) = active_app.as_deref() {
+                format!("{} (front={})", err, front)
+            } else {
+                err.clone()
+            };
+            let recorded = persist_for_fix("failed", &evidence);
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "action": action,
+                    "error": err,
+                    "active_app": active_app,
+                    "fixed_at": chrono::Utc::now().to_rfc3339(),
+                    "recorded": recorded,
+                    "run_id": run_id,
+                    "stage_name": stage_name,
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+fn persist_recovery_event(
+    run_id: &str,
+    stage_name: &str,
+    action_key: &str,
+    status: &str,
+    expected: Option<&str>,
+    actual: Option<&str>,
+    details: Option<&str>,
+) -> Result<bool, String> {
+    let run_exists = db::get_task_run(run_id)
+        .map_err(|e| e.to_string())?
+        .is_some();
+    if !run_exists {
+        return Ok(false);
+    }
+
+    let clean_stage = if stage_name.trim().is_empty() {
+        "recovery"
+    } else {
+        stage_name.trim()
+    };
+    let clean_action = if action_key.trim().is_empty() {
+        "recovery.event"
+    } else {
+        action_key.trim()
+    };
+    let clean_status = if status.trim().is_empty() {
+        "completed"
+    } else {
+        status.trim()
+    };
+    let expected_value = expected
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("completed");
+    let actual_value = actual
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or(clean_status);
+    let passed = matches!(
+        clean_status.to_lowercase().as_str(),
+        "completed" | "success" | "ok"
+    );
+    let stage_order = 5;
+
+    db::record_task_stage_run(run_id, clean_stage, stage_order, clean_status, details)
+        .map_err(|e| e.to_string())?;
+    db::record_task_stage_assertion(
+        run_id,
+        clean_stage,
+        clean_action,
+        expected_value,
+        actual_value,
+        passed,
+        details,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+async fn agent_recovery_event_handler(
+    Json(payload): Json<AgentRecoveryEventRequest>,
+) -> impl IntoResponse {
+    let run_id = payload.run_id.trim().to_string();
+    let action_key = payload.action_key.trim().to_string();
+    let status = payload.status.trim().to_string();
+    if run_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "missing_run_id" })),
+        )
+            .into_response();
+    }
+    if action_key.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "missing_action_key" })),
+        )
+            .into_response();
+    }
+    if status.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "missing_status" })),
+        )
+            .into_response();
+    }
+
+    let stage_name = payload
+        .stage_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("recovery")
+        .to_string();
+    match persist_recovery_event(
+        &run_id,
+        &stage_name,
+        &action_key,
+        &status,
+        payload.expected.as_deref(),
+        payload.actual.as_deref(),
+        payload.details.as_deref(),
+    ) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(json!(AgentRecoveryEventResponse {
+                ok: true,
+                recorded: true,
+                run_id,
+                stage_name,
+                action_key,
+                status,
+                recorded_at: chrono::Utc::now().to_rfc3339(),
+                reason: None,
+            })),
+        )
+            .into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!(AgentRecoveryEventResponse {
+                ok: false,
+                recorded: false,
+                run_id,
+                stage_name,
+                action_key,
+                status,
+                recorded_at: chrono::Utc::now().to_rfc3339(),
+                reason: Some("run_not_found".to_string()),
+            })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "record_recovery_failed", "details": err })),
+        )
+            .into_response(),
+    }
 }
 
 async fn scan_project_handler(Query(query): Query<ProjectScanQuery>) -> Json<ProjectScanResponse> {
@@ -1707,6 +2507,29 @@ async fn list_task_stage_assertions_handler(Path(run_id): Path<String>) -> impl 
     }
 }
 
+async fn list_task_run_artifacts_handler(Path(run_id): Path<String>) -> impl IntoResponse {
+    match db::get_task_run(&run_id) {
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "task_run_not_found", "run_id": run_id })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "task_run_lookup_failed", "details": e.to_string() })),
+        )
+            .into_response(),
+        Ok(Some(_)) => match db::list_task_run_artifacts(&run_id) {
+            Ok(artifacts) => Json(json!({ "artifacts": artifacts })).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "task_run_artifacts_failed", "details": e.to_string() })),
+            )
+                .into_response(),
+        },
+    }
+}
+
 async fn list_nl_approval_policies(
     Query(query): Query<ApprovalPolicyQuery>,
 ) -> Json<Vec<ApprovalPolicyResponse>> {
@@ -1992,13 +2815,21 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
             .into_response();
     };
     let _exec_guard = match acquire_agent_execution(&payload.plan_id) {
-        Some(g) => g,
-        None => {
+        Ok(g) => g,
+        Err(conflict) => {
+            let error_code = if conflict.scope == "global" {
+                "agent_execution_in_progress_global"
+            } else {
+                "plan_execution_in_progress"
+            };
             return (
                 StatusCode::CONFLICT,
                 Json(json!({
-                    "error": "plan_execution_in_progress",
-                    "plan_id": payload.plan_id
+                    "error": error_code,
+                    "plan_id": payload.plan_id,
+                    "lock_scope": conflict.scope,
+                    "active_plan_id": conflict.active_plan_id,
+                    "message": "다른 실행이 진행 중입니다. 현재 실행이 끝난 뒤 다시 시도하세요."
                 })),
             )
                 .into_response();
@@ -2047,7 +2878,16 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
         nl_store::clear_plan_progress(&plan.plan_id);
         resume_from = 0;
     }
-    let mut result = execution_controller::execute_plan(&plan, resume_from).await;
+    let execution_profile = payload.profile.unwrap_or_default();
+    let execution_options = execution_profile.execution_options();
+    let mut result =
+        execution_controller::execute_plan(&plan, resume_from, execution_options).await;
+    stamp_run_scope_evidence(&mut result.logs, &run_id, &plan.plan_id);
+    result.logs.push(format!(
+        "Execution profile selected: {} (collision_policy={})",
+        execution_profile.as_str(),
+        execution_options.input_collision_policy.as_str()
+    ));
     if resume_from > 0 {
         result
             .logs
@@ -2063,7 +2903,7 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
     }
 
     // Simple auto-replan: one retry on failure or verification issues
-    let auto_replan = std::env::var("STEER_AUTO_REPLAN")
+    let auto_replan_env = std::env::var("STEER_AUTO_REPLAN")
         .ok()
         .map(|v| {
             matches!(
@@ -2072,17 +2912,23 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
             )
         })
         .unwrap_or(true);
+    let auto_replan = if execution_profile.default_auto_replan_enabled() {
+        auto_replan_env
+    } else {
+        false
+    };
     let allow_replan = !matches!(
         result.status.as_str(),
-        "manual_required" | "approval_required"
+        "manual_required" | "approval_required" | "blocked"
     );
     if auto_replan && allow_replan && (result.status == "error" || !verify.ok) {
         result
             .logs
             .push("Auto-replan: retrying once after short wait".to_string());
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        let retry = execution_controller::execute_plan(&plan, 0).await;
+        let retry = execution_controller::execute_plan(&plan, 0, execution_options).await;
         result.logs = retry.logs;
+        stamp_run_scope_evidence(&mut result.logs, &run_id, &plan.plan_id);
         result.status = retry.status;
         result.approval = retry.approval;
         result.manual_steps = retry.manual_steps;
@@ -2121,7 +2967,15 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
     let verify_actual = verification_ok.to_string();
     let evidence_actual = evidence_ok.to_string();
     let business_actual = business_complete.to_string();
+    let mut stage_dod: Vec<AgentStageDodCheck> = Vec::new();
 
+    let _ = db::record_task_stage_run(
+        &run_id,
+        "planner",
+        1,
+        "running",
+        Some("planner outcome evaluation"),
+    );
     let _ = db::record_task_stage_run(
         &run_id,
         "planner",
@@ -2136,11 +2990,26 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
     let _ = db::record_task_stage_assertion(
         &run_id,
         "planner",
-        "plan_steps_non_empty",
+        "planner.plan_steps_non_empty",
         "true",
         &planner_actual,
         planner_complete,
         Some(&format!("plan_id={}", plan.plan_id)),
+    );
+    stage_dod.push(AgentStageDodCheck {
+        stage: "planner".to_string(),
+        key: "planner.plan_steps_non_empty".to_string(),
+        expected: "true".to_string(),
+        actual: planner_actual.clone(),
+        passed: planner_complete,
+        evidence: Some(format!("plan_id={}", plan.plan_id)),
+    });
+    let _ = db::record_task_stage_run(
+        &run_id,
+        "execution",
+        2,
+        "running",
+        Some("execution result evaluation"),
     );
     let _ = db::record_task_stage_run(
         &run_id,
@@ -2160,11 +3029,26 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
     let _ = db::record_task_stage_assertion(
         &run_id,
         "execution",
-        "status_completed",
+        "execution.status_completed",
         "true",
         &execution_actual,
         execution_complete,
         Some(result.status.as_str()),
+    );
+    stage_dod.push(AgentStageDodCheck {
+        stage: "execution".to_string(),
+        key: "execution.status_completed".to_string(),
+        expected: "true".to_string(),
+        actual: execution_actual.clone(),
+        passed: execution_complete,
+        evidence: Some(result.status.clone()),
+    });
+    let _ = db::record_task_stage_run(
+        &run_id,
+        "verification",
+        3,
+        "running",
+        Some("verification result evaluation"),
     );
     let _ = db::record_task_stage_run(
         &run_id,
@@ -2180,17 +3064,32 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
     let _ = db::record_task_stage_assertion(
         &run_id,
         "verification",
-        "verify_ok",
+        "verification.verify_ok",
         "true",
         &verify_actual,
         verification_ok,
         Some(&verify.issues.join("; ")),
     );
+    stage_dod.push(AgentStageDodCheck {
+        stage: "verification".to_string(),
+        key: "verification.verify_ok".to_string(),
+        expected: "true".to_string(),
+        actual: verify_actual.clone(),
+        passed: verification_ok,
+        evidence: Some(verify.issues.join("; ")),
+    });
     let business_stage_requirements =
         "requires planner_complete && execution_complete && verify_ok && business_evidence_ok";
     let business_stage_details = format!(
         "{}; evidence={}",
         business_stage_requirements, evidence_detail
+    );
+    let _ = db::record_task_stage_run(
+        &run_id,
+        "business",
+        4,
+        "running",
+        Some("business evidence evaluation"),
     );
     let _ = db::record_task_stage_run(
         &run_id,
@@ -2206,21 +3105,83 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
     let _ = db::record_task_stage_assertion(
         &run_id,
         "business",
-        "business_evidence",
+        "business.business_evidence_ok",
         "true",
         &evidence_actual,
         evidence_ok,
         Some(&evidence_detail),
     );
+    let _ = db::upsert_task_run_artifact(
+        &run_id,
+        "business",
+        "business.business_evidence_ok",
+        &evidence_actual,
+        Some(&evidence_detail),
+    );
+    stage_dod.push(AgentStageDodCheck {
+        stage: "business".to_string(),
+        key: "business.business_evidence_ok".to_string(),
+        expected: "true".to_string(),
+        actual: evidence_actual.clone(),
+        passed: evidence_ok,
+        evidence: Some(evidence_detail.clone()),
+    });
     let _ = db::record_task_stage_assertion(
         &run_id,
         "business",
-        "business_complete",
+        "business.business_complete",
         "true",
         &business_actual,
         business_complete,
         Some(business_stage_requirements),
     );
+    let _ = db::upsert_task_run_artifact(
+        &run_id,
+        "business",
+        "business.business_complete",
+        &business_actual,
+        Some(business_stage_requirements),
+    );
+    stage_dod.push(AgentStageDodCheck {
+        stage: "business".to_string(),
+        key: "business.business_complete".to_string(),
+        expected: "true".to_string(),
+        actual: business_actual.clone(),
+        passed: business_complete,
+        evidence: Some(business_stage_requirements.to_string()),
+    });
+    for assertion in detect_artifact_evidence_assertions(&plan, &result.logs) {
+        let _ = db::record_task_stage_assertion(
+            &run_id,
+            "business",
+            assertion.key,
+            assertion.expected.as_str(),
+            assertion.actual.as_str(),
+            assertion.passed,
+            Some(assertion.evidence.as_str()),
+        );
+        let metadata = json!({
+            "expected": assertion.expected.as_str(),
+            "passed": assertion.passed,
+            "evidence": assertion.evidence.as_str()
+        })
+        .to_string();
+        let _ = db::upsert_task_run_artifact(
+            &run_id,
+            "artifact_assertion",
+            assertion.key,
+            assertion.actual.as_str(),
+            Some(metadata.as_str()),
+        );
+        stage_dod.push(AgentStageDodCheck {
+            stage: "business".to_string(),
+            key: assertion.key.to_string(),
+            expected: assertion.expected.to_string(),
+            actual: assertion.actual.to_string(),
+            passed: assertion.passed,
+            evidence: Some(assertion.evidence.to_string()),
+        });
+    }
 
     if result.status == "completed" && !business_complete {
         if !evidence_ok {
@@ -2246,6 +3207,74 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
         "business_failed"
     };
 
+    let mut final_nl_status = if business_complete {
+        "completed".to_string()
+    } else if matches!(
+        result.status.as_str(),
+        "manual_required" | "approval_required" | "blocked"
+    ) {
+        result.status.clone()
+    } else {
+        "error".to_string()
+    };
+
+    let mut completion_score = compute_completion_score(
+        &final_nl_status,
+        planner_complete,
+        execution_complete,
+        business_complete,
+        verification_ok,
+        evidence_ok,
+        verify.issues.len(),
+        result.manual_steps.len(),
+    );
+    if final_nl_status == "completed" && !completion_score.pass {
+        result.logs.push(format!(
+            "Final status downgraded: completion score below pass threshold (score={} threshold={})",
+            completion_score.score,
+            completion_score_pass_threshold()
+        ));
+        final_nl_status = "error".to_string();
+        completion_score = compute_completion_score(
+            &final_nl_status,
+            planner_complete,
+            execution_complete,
+            business_complete,
+            verification_ok,
+            evidence_ok,
+            verify.issues.len(),
+            result.manual_steps.len(),
+        );
+    }
+    let completion_expected = format!(">= {}", completion_score_pass_threshold());
+    let completion_actual = completion_score.score.to_string();
+    let completion_reasons = if completion_score.reasons.is_empty() {
+        "none".to_string()
+    } else {
+        completion_score.reasons.join("; ")
+    };
+    let _ = db::record_task_stage_assertion(
+        &run_id,
+        "business",
+        "business.completion_score",
+        &completion_expected,
+        &completion_actual,
+        completion_score.pass,
+        Some(&completion_reasons),
+    );
+    stage_dod.push(AgentStageDodCheck {
+        stage: "business".to_string(),
+        key: "business.completion_score".to_string(),
+        expected: completion_expected.clone(),
+        actual: completion_actual.clone(),
+        passed: completion_score.pass,
+        evidence: Some(completion_reasons.clone()),
+    });
+    result.logs.push(format!(
+        "Completion score: {} ({}) pass={}",
+        completion_score.score, completion_score.label, completion_score.pass
+    ));
+
     let summary = extract_summary(&result.logs);
     let details_json = serde_json::to_string(&result.logs).unwrap_or_default();
     let _ = db::update_task_run_outcome(
@@ -2257,17 +3286,6 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
         summary.as_deref(),
         Some(&details_json),
     );
-
-    let final_nl_status = if business_complete {
-        "completed".to_string()
-    } else if matches!(
-        result.status.as_str(),
-        "manual_required" | "approval_required" | "blocked"
-    ) {
-        result.status.clone()
-    } else {
-        "error".to_string()
-    };
 
     if let Some(state) = session {
         let _ = db::insert_nl_run(
@@ -2289,6 +3307,15 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
         planner_complete,
         execution_complete,
         business_complete,
+        completion_score: Some(completion_score),
+        profile: Some(execution_profile.as_str().to_string()),
+        collision_policy: Some(
+            execution_options
+                .input_collision_policy
+                .as_str()
+                .to_string(),
+        ),
+        stage_dod,
     };
 
     (StatusCode::OK, Json(response)).into_response()
@@ -2336,6 +3363,591 @@ async fn agent_approve_handler(Json(payload): Json<AgentApproveRequest>) -> impl
     (StatusCode::OK, Json(response)).into_response()
 }
 
+struct ArtifactEvidenceAssertion {
+    key: &'static str,
+    expected: String,
+    actual: String,
+    passed: bool,
+    evidence: String,
+}
+
+fn parse_pipe_fields_with_prefix(line: &str, prefix: &str) -> Option<HashMap<String, String>> {
+    let trimmed = line.trim();
+    if !trimmed
+        .to_ascii_lowercase()
+        .starts_with(&prefix.to_ascii_lowercase())
+    {
+        return None;
+    }
+    let mut out = HashMap::new();
+    for segment in trimmed.split('|').skip(1) {
+        if let Some((key, value)) = segment.split_once('=') {
+            let key_norm = key.trim().to_ascii_lowercase();
+            if key_norm.is_empty() {
+                continue;
+            }
+            out.insert(key_norm, value.trim().to_string());
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn parse_evidence_fields(line: &str) -> Option<HashMap<String, String>> {
+    parse_pipe_fields_with_prefix(line, "evidence|")
+}
+
+fn parse_run_scope_fields(line: &str) -> Option<HashMap<String, String>> {
+    parse_pipe_fields_with_prefix(line, "run_scope|")
+}
+
+fn run_scoped_evidence_required() -> bool {
+    std::env::var("STEER_REQUIRE_RUN_SCOPED_EVIDENCE")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(true)
+}
+
+fn current_run_scope_id(logs: &[String]) -> Option<String> {
+    logs.iter().rev().find_map(|line| {
+        let fields = parse_run_scope_fields(line)?;
+        fields
+            .get("run_id")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    })
+}
+
+fn evidence_fields_match_run_scope(
+    fields: &HashMap<String, String>,
+    run_scope_id: Option<&str>,
+) -> bool {
+    if !run_scoped_evidence_required() {
+        return true;
+    }
+    let Some(expected_run_id) = run_scope_id else {
+        return true;
+    };
+    fields
+        .get("run_id")
+        .map(|actual| actual.trim() == expected_run_id)
+        .unwrap_or(false)
+}
+
+fn stamp_run_scope_evidence(logs: &mut Vec<String>, run_id: &str, plan_id: &str) {
+    if logs.is_empty() {
+        return;
+    }
+    if !logs.iter().any(|line| {
+        line.to_ascii_lowercase()
+            .contains(&format!("run_scope|run_id={}", run_id).to_ascii_lowercase())
+    }) {
+        logs.insert(
+            0,
+            format!("RUN_SCOPE|run_id={}|plan_id={}", run_id, plan_id),
+        );
+    }
+
+    for line in logs.iter_mut() {
+        let lower = line.to_ascii_lowercase();
+        let is_evidence_line =
+            lower.starts_with("evidence|") || lower.starts_with("mail_send_proof|");
+        if !is_evidence_line {
+            continue;
+        }
+        if !lower.contains("|run_id=") {
+            line.push_str(&format!("|run_id={}", run_id));
+        }
+        if !lower.contains("|plan_id=") {
+            line.push_str(&format!("|plan_id={}", plan_id));
+        }
+    }
+}
+
+fn logs_have_evidence_fields(logs: &[String], expected: &[(&str, &str)]) -> bool {
+    let run_scope_id = current_run_scope_id(logs);
+    logs.iter().any(|line| {
+        let Some(fields) = parse_evidence_fields(line) else {
+            return false;
+        };
+        if !evidence_fields_match_run_scope(&fields, run_scope_id.as_deref()) {
+            return false;
+        }
+        expected.iter().all(|(key, value)| {
+            fields
+                .get(&key.to_ascii_lowercase())
+                .map(|actual| actual.eq_ignore_ascii_case(value))
+                .unwrap_or(false)
+        })
+    })
+}
+
+fn latest_evidence_fields(
+    logs: &[String],
+    target: &str,
+    event: &str,
+) -> Option<HashMap<String, String>> {
+    let run_scope_id = current_run_scope_id(logs);
+    logs.iter().rev().find_map(|line| {
+        let fields = parse_evidence_fields(line)?;
+        if !evidence_fields_match_run_scope(&fields, run_scope_id.as_deref()) {
+            return None;
+        }
+        let target_ok = fields
+            .get("target")
+            .map(|v| v.eq_ignore_ascii_case(target))
+            .unwrap_or(false);
+        let event_ok = fields
+            .get("event")
+            .map(|v| v.eq_ignore_ascii_case(event))
+            .unwrap_or(false);
+        if target_ok && event_ok {
+            Some(fields)
+        } else {
+            None
+        }
+    })
+}
+
+fn latest_evidence_field(
+    logs: &[String],
+    target: &str,
+    event: &str,
+    field: &str,
+) -> Option<String> {
+    latest_evidence_fields(logs, target, event).and_then(|fields| {
+        fields
+            .get(&field.to_ascii_lowercase())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn latest_legacy_mail_send_field(logs: &[String], field: &str) -> Option<String> {
+    let run_scope_id = current_run_scope_id(logs);
+    logs.iter().rev().find_map(|line| {
+        let Some(fields) = parse_pipe_fields_with_prefix(line, "mail_send_proof|") else {
+            return None;
+        };
+        if !evidence_fields_match_run_scope(&fields, run_scope_id.as_deref()) {
+            return None;
+        }
+        fields
+            .get(&field.to_ascii_lowercase())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn latest_evidence_int(logs: &[String], target: &str, event: &str, field: &str) -> Option<i64> {
+    latest_evidence_field(logs, target, event, field).and_then(|v| v.parse::<i64>().ok())
+}
+
+fn detect_artifact_evidence_assertions(
+    plan: &crate::nl_automation::Plan,
+    logs: &[String],
+) -> Vec<ArtifactEvidenceAssertion> {
+    let plan_text = plan
+        .steps
+        .iter()
+        .map(|step| step.description.to_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let lowered_logs: Vec<String> = logs.iter().map(|line| line.to_lowercase()).collect();
+    let joined_logs = lowered_logs.join("\n");
+
+    let keyword_required =
+        |keywords: &[&str]| -> bool { keywords.iter().any(|keyword| plan_text.contains(keyword)) };
+    let marker_confirmed =
+        |markers: &[&str]| -> bool { markers.iter().any(|marker| joined_logs.contains(marker)) };
+
+    let mail_required = keyword_required(&["mail", "email", "이메일"]);
+    let notes_required = keyword_required(&["notes", "note", "메모"]);
+    let textedit_required = keyword_required(&["textedit", "텍스트편집", "text edit"]);
+    let notion_required = keyword_required(&["notion", "노션"]);
+    let telegram_required = keyword_required(&["telegram", "텔레그램"]);
+
+    let mail_sent_confirmed =
+        logs_have_evidence_fields(
+            logs,
+            &[
+                ("target", "mail"),
+                ("event", "send"),
+                ("status", "sent_confirmed"),
+            ],
+        ) || marker_confirmed(&["mail_send_proof|status=sent_confirmed", "mail sent"]);
+    let notes_write_confirmed = logs_have_evidence_fields(
+        logs,
+        &[
+            ("target", "notes"),
+            ("event", "write"),
+            ("status", "confirmed"),
+        ],
+    ) || marker_confirmed(&[
+        "notes_write_confirmed",
+        "notes_write_text",
+        "notes appended",
+    ]);
+    let textedit_write_confirmed = logs_have_evidence_fields(
+        logs,
+        &[
+            ("target", "textedit"),
+            ("event", "write"),
+            ("status", "confirmed"),
+        ],
+    ) || marker_confirmed(&[
+        "textedit_write_confirmed",
+        "textedit_append_text",
+        "shared via textedit",
+    ]);
+    let textedit_save_confirmed =
+        logs_have_evidence_fields(
+            logs,
+            &[
+                ("target", "textedit"),
+                ("event", "save"),
+                ("status", "confirmed"),
+            ],
+        ) || marker_confirmed(&["textedit_save_confirmed", "saved in textedit", "cmd+s"]);
+    let notion_write_confirmed =
+        logs_have_evidence_fields(
+            logs,
+            &[
+                ("target", "notion"),
+                ("event", "write"),
+                ("status", "confirmed"),
+            ],
+        ) || marker_confirmed(&["notion: https://www.notion.so", "notion page created"]);
+    let telegram_delivery_confirmed = logs_have_evidence_fields(
+        logs,
+        &[
+            ("target", "telegram"),
+            ("event", "send"),
+            ("status", "sent"),
+        ],
+    ) || marker_confirmed(&["telegram: sent", "telegram sent"]);
+    let notes_structured = latest_evidence_fields(logs, "notes", "write");
+    let notes_note_id = notes_structured
+        .as_ref()
+        .and_then(|fields| fields.get("note_id").map(|v| v.trim().to_string()))
+        .unwrap_or_default();
+    let notes_body_len = latest_evidence_int(logs, "notes", "write", "body_len").unwrap_or(-1);
+    let notes_note_id_required = notes_required && notes_structured.is_some();
+
+    let textedit_write_structured = latest_evidence_fields(logs, "textedit", "write");
+    let textedit_doc_id = textedit_write_structured
+        .as_ref()
+        .and_then(|fields| fields.get("doc_id").map(|v| v.trim().to_string()))
+        .unwrap_or_default();
+    let textedit_body_len =
+        latest_evidence_int(logs, "textedit", "write", "body_len").unwrap_or(-1);
+    let textedit_doc_id_required = textedit_required && textedit_write_structured.is_some();
+    let run_scope_id = current_run_scope_id(logs);
+    let scoped_evidence_count = logs
+        .iter()
+        .filter_map(|line| parse_evidence_fields(line))
+        .filter(|fields| evidence_fields_match_run_scope(fields, run_scope_id.as_deref()))
+        .count();
+    let run_scope_required = run_scoped_evidence_required();
+    let run_scope_present = run_scope_id.is_some();
+
+    let mut out = vec![
+        ArtifactEvidenceAssertion {
+            key: "artifact.run_scope_present",
+            expected: if run_scope_required {
+                "true".to_string()
+            } else {
+                "optional".to_string()
+            },
+            actual: run_scope_present.to_string(),
+            passed: if run_scope_required {
+                run_scope_present
+            } else {
+                true
+            },
+            evidence: format!(
+                "run_scope_required={} run_scope_id={} scoped_evidence_count={}",
+                run_scope_required,
+                run_scope_id.clone().unwrap_or_default(),
+                scoped_evidence_count
+            ),
+        },
+        ArtifactEvidenceAssertion {
+            key: "artifact.mail_sent_confirmed",
+            expected: if mail_required {
+                "true".to_string()
+            } else {
+                "optional".to_string()
+            },
+            actual: mail_sent_confirmed.to_string(),
+            passed: if mail_required {
+                mail_sent_confirmed
+            } else {
+                true
+            },
+            evidence: format!(
+                "required={} marker_hint={} plan_keywords={}",
+                mail_required,
+                "EVIDENCE target=mail,event=send,status=sent_confirmed or legacy marker",
+                plan_text
+            ),
+        },
+        ArtifactEvidenceAssertion {
+            key: "artifact.notes_write_confirmed",
+            expected: if notes_required {
+                "true".to_string()
+            } else {
+                "optional".to_string()
+            },
+            actual: notes_write_confirmed.to_string(),
+            passed: if notes_required {
+                notes_write_confirmed
+            } else {
+                true
+            },
+            evidence: format!(
+                "required={} marker_hint={} plan_keywords={}",
+                notes_required,
+                "EVIDENCE target=notes,event=write,status=confirmed or legacy marker",
+                plan_text
+            ),
+        },
+        ArtifactEvidenceAssertion {
+            key: "artifact.notes_note_id_present",
+            expected: if notes_note_id_required {
+                "true".to_string()
+            } else {
+                "optional".to_string()
+            },
+            actual: (!notes_note_id.is_empty()).to_string(),
+            passed: if notes_note_id_required {
+                !notes_note_id.is_empty()
+            } else {
+                true
+            },
+            evidence: format!(
+                "structured_required={} note_id={}",
+                notes_note_id_required, notes_note_id
+            ),
+        },
+        ArtifactEvidenceAssertion {
+            key: "artifact.notes_body_nonempty",
+            expected: if notes_required {
+                ">2".to_string()
+            } else {
+                "optional".to_string()
+            },
+            actual: notes_body_len.to_string(),
+            passed: if notes_required {
+                notes_body_len > 2
+            } else {
+                true
+            },
+            evidence: "notes write body_len from EVIDENCE target=notes,event=write".to_string(),
+        },
+        ArtifactEvidenceAssertion {
+            key: "artifact.textedit_write_confirmed",
+            expected: if textedit_required {
+                "true".to_string()
+            } else {
+                "optional".to_string()
+            },
+            actual: textedit_write_confirmed.to_string(),
+            passed: if textedit_required {
+                textedit_write_confirmed
+            } else {
+                true
+            },
+            evidence: format!(
+                "required={} marker_hint={} plan_keywords={}",
+                textedit_required,
+                "EVIDENCE target=textedit,event=write,status=confirmed or legacy marker",
+                plan_text
+            ),
+        },
+        ArtifactEvidenceAssertion {
+            key: "artifact.textedit_doc_id_present",
+            expected: if textedit_doc_id_required {
+                "true".to_string()
+            } else {
+                "optional".to_string()
+            },
+            actual: (!textedit_doc_id.is_empty()).to_string(),
+            passed: if textedit_doc_id_required {
+                !textedit_doc_id.is_empty()
+            } else {
+                true
+            },
+            evidence: format!(
+                "structured_required={} doc_id={}",
+                textedit_doc_id_required, textedit_doc_id
+            ),
+        },
+        ArtifactEvidenceAssertion {
+            key: "artifact.textedit_body_nonempty",
+            expected: if textedit_required {
+                ">2".to_string()
+            } else {
+                "optional".to_string()
+            },
+            actual: textedit_body_len.to_string(),
+            passed: if textedit_required {
+                textedit_body_len > 2
+            } else {
+                true
+            },
+            evidence: "textedit write body_len from EVIDENCE target=textedit,event=write"
+                .to_string(),
+        },
+        ArtifactEvidenceAssertion {
+            key: "artifact.textedit_save_confirmed",
+            expected: if textedit_required {
+                "true".to_string()
+            } else {
+                "optional".to_string()
+            },
+            actual: textedit_save_confirmed.to_string(),
+            passed: if textedit_required {
+                textedit_save_confirmed
+            } else {
+                true
+            },
+            evidence: format!(
+                "required={} marker_hint={} plan_keywords={}",
+                textedit_required,
+                "EVIDENCE target=textedit,event=save,status=confirmed or legacy marker",
+                plan_text
+            ),
+        },
+        ArtifactEvidenceAssertion {
+            key: "artifact.notion_write_confirmed",
+            expected: if notion_required {
+                "true".to_string()
+            } else {
+                "optional".to_string()
+            },
+            actual: notion_write_confirmed.to_string(),
+            passed: if notion_required {
+                notion_write_confirmed
+            } else {
+                true
+            },
+            evidence: format!(
+                "required={} marker_hint={} plan_keywords={}",
+                notion_required,
+                "EVIDENCE target=notion,event=write,status=confirmed or legacy marker",
+                plan_text
+            ),
+        },
+        ArtifactEvidenceAssertion {
+            key: "artifact.telegram_delivery_confirmed",
+            expected: if telegram_required {
+                "true".to_string()
+            } else {
+                "optional".to_string()
+            },
+            actual: telegram_delivery_confirmed.to_string(),
+            passed: if telegram_required {
+                telegram_delivery_confirmed
+            } else {
+                true
+            },
+            evidence: format!(
+                "required={} marker_hint={} plan_keywords={}",
+                telegram_required,
+                "EVIDENCE target=telegram,event=send,status=sent or legacy marker",
+                plan_text
+            ),
+        },
+    ];
+
+    if mail_required {
+        let mail_recipient = latest_evidence_field(logs, "mail", "send", "recipient")
+            .or_else(|| latest_legacy_mail_send_field(logs, "recipient"))
+            .unwrap_or_default();
+        let recipient_present = !mail_recipient.trim().is_empty();
+        out.push(ArtifactEvidenceAssertion {
+            key: "artifact.mail_recipient_present",
+            expected: "true".to_string(),
+            actual: recipient_present.to_string(),
+            passed: recipient_present,
+            evidence: format!("mail_recipient={}", mail_recipient),
+        });
+
+        let mail_body_len = latest_evidence_int(logs, "mail", "send", "body_len").or_else(|| {
+            latest_legacy_mail_send_field(logs, "body_len").and_then(|v| v.parse::<i64>().ok())
+        });
+        let body_len_value = mail_body_len.unwrap_or(-1);
+        out.push(ArtifactEvidenceAssertion {
+            key: "artifact.mail_body_nonempty",
+            expected: ">2".to_string(),
+            actual: body_len_value.to_string(),
+            passed: body_len_value > 2,
+            evidence: "mail body evidence from EVIDENCE/mail_send_proof".to_string(),
+        });
+    }
+
+    let notion_structured = latest_evidence_fields(logs, "notion", "write");
+    let notion_page_required = notion_required && notion_structured.is_some();
+    let notion_page_id = notion_structured
+        .as_ref()
+        .and_then(|fields| fields.get("page_id").map(|v| v.trim().to_string()))
+        .unwrap_or_default();
+    out.push(ArtifactEvidenceAssertion {
+        key: "artifact.notion_page_id_present",
+        expected: if notion_page_required {
+            "true".to_string()
+        } else {
+            "optional".to_string()
+        },
+        actual: (!notion_page_id.is_empty()).to_string(),
+        passed: if notion_page_required {
+            !notion_page_id.is_empty()
+        } else {
+            true
+        },
+        evidence: format!(
+            "structured_required={} page_id={}",
+            notion_page_required, notion_page_id
+        ),
+    });
+
+    let telegram_structured = latest_evidence_fields(logs, "telegram", "send");
+    let telegram_message_required = telegram_required && telegram_structured.is_some();
+    let telegram_message_id = telegram_structured
+        .as_ref()
+        .and_then(|fields| fields.get("message_id").map(|v| v.trim().to_string()))
+        .unwrap_or_default();
+    out.push(ArtifactEvidenceAssertion {
+        key: "artifact.telegram_message_id_present",
+        expected: if telegram_message_required {
+            "true".to_string()
+        } else {
+            "optional".to_string()
+        },
+        actual: (!telegram_message_id.is_empty()).to_string(),
+        passed: if telegram_message_required {
+            !telegram_message_id.is_empty()
+        } else {
+            true
+        },
+        evidence: format!(
+            "structured_required={} message_id={}",
+            telegram_message_required, telegram_message_id
+        ),
+    });
+
+    out
+}
+
 fn evaluate_business_evidence(
     plan: &crate::nl_automation::Plan,
     logs: &[String],
@@ -2373,9 +3985,15 @@ fn evaluate_business_evidence(
         .iter()
         .find(|summary| is_meaningful_summary(plan, summary))
         .cloned();
-    if meaningful_summary.is_none() {
+    let generic_intent = matches!(plan.intent, crate::nl_automation::IntentType::GenericTask);
+    if meaningful_summary.is_none() && (!generic_intent || !summaries.is_empty()) {
         issues.push("missing meaningful summary output".to_string());
     }
+    issues.extend(validate_intent_business_contract(
+        plan,
+        meaningful_summary.as_deref(),
+        logs,
+    ));
 
     if issues.is_empty() {
         let summary = meaningful_summary
@@ -2385,6 +4003,521 @@ fn evaluate_business_evidence(
     }
 
     (false, issues.join("; "))
+}
+
+fn normalize_contract_token(input: &str) -> String {
+    input
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace() || ['-', '_', '@', '.'].contains(c))
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn summary_contains_token(summary: &str, token: &str) -> bool {
+    let token_norm = normalize_contract_token(token);
+    if token_norm.is_empty() {
+        return true;
+    }
+    let summary_norm = normalize_contract_token(summary);
+    summary_norm.contains(&token_norm)
+}
+
+fn slot_value(plan: &crate::nl_automation::Plan, key: &str) -> Option<String> {
+    plan.slots
+        .get(key)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn validate_intent_business_contract(
+    plan: &crate::nl_automation::Plan,
+    summary: Option<&str>,
+    logs: &[String],
+) -> Vec<String> {
+    let mut issues = Vec::new();
+    let summary_text = summary.unwrap_or("");
+    let joined_logs = logs.join("\n").to_lowercase();
+    let plan_text = plan
+        .steps
+        .iter()
+        .map(|step| step.description.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let plan_text_lower = plan_text.to_lowercase();
+    let contains_any = |haystack: &str, needles: &[&str]| -> bool {
+        needles.iter().any(|needle| haystack.contains(needle))
+    };
+    let plan_data_lower = plan
+        .steps
+        .iter()
+        .map(|step| step.data.to_string().to_lowercase())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let data_contains_any = |needles: &[&str]| -> bool { contains_any(&plan_data_lower, needles) };
+    let step_matches = |app_needles: &[&str], action_needles: &[&str]| -> bool {
+        plan.steps.iter().any(|step| {
+            let desc = step.description.to_lowercase();
+            let data = step.data.to_string().to_lowercase();
+            let app_hit = app_needles
+                .iter()
+                .any(|needle| desc.contains(needle) || data.contains(needle));
+            if !app_hit {
+                return false;
+            }
+            action_needles
+                .iter()
+                .any(|needle| desc.contains(needle) || data.contains(needle))
+        })
+    };
+    let expected_recipients = {
+        let mut recipients = crate::semantic_contract::extract_expected_recipients(&plan_text);
+        for value in plan.slots.values() {
+            for candidate in crate::semantic_contract::extract_expected_recipients(value) {
+                if !recipients
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(&candidate))
+                {
+                    recipients.push(candidate);
+                }
+            }
+        }
+        recipients
+    };
+    let mail_body_len = latest_evidence_int(logs, "mail", "send", "body_len").or_else(|| {
+        latest_legacy_mail_send_field(logs, "body_len").and_then(|raw| raw.parse::<i64>().ok())
+    });
+
+    match plan.intent {
+        crate::nl_automation::IntentType::FlightSearch => {
+            let required = [
+                ("from", slot_value(plan, "from")),
+                ("to", slot_value(plan, "to")),
+                ("date_start", slot_value(plan, "date_start")),
+            ];
+            for (key, value) in required {
+                if let Some(v) = value {
+                    let summary_ok = summary_contains_token(summary_text, &v);
+                    let log_ok = joined_logs.contains(&format!("auto fill succeeded for {}", key))
+                        || joined_logs.contains(&format!("filled {}=", key))
+                        || joined_logs.contains(&format!("slot {}=", key));
+                    if !summary_ok && !log_ok {
+                        issues.push(format!("contract_missing_{}={}", key, v));
+                    }
+                }
+            }
+        }
+        crate::nl_automation::IntentType::ShoppingCompare => {
+            if let Some(product) = slot_value(plan, "product_name") {
+                if !summary_contains_token(summary_text, &product) {
+                    issues.push(format!("contract_missing_product_name={}", product));
+                }
+            }
+            if summary_text.to_lowercase().contains("unknown") {
+                issues.push("shopping_summary_contains_unknown".to_string());
+            }
+        }
+        crate::nl_automation::IntentType::FormFill => {
+            if let Some(purpose) = slot_value(plan, "form_purpose") {
+                if !summary_contains_token(summary_text, &purpose) {
+                    issues.push(format!("contract_missing_form_purpose={}", purpose));
+                }
+            }
+            let has_fill_signal = joined_logs.contains("auto fill succeeded")
+                || joined_logs.contains("auto input attempted")
+                || joined_logs.contains("manual input required");
+            if !has_fill_signal {
+                issues.push("form_fill_execution_signal_missing".to_string());
+            }
+        }
+        crate::nl_automation::IntentType::GenericTask => {
+            let has_meaningful_summary = !summary_text.trim().is_empty();
+            let has_step_signal = joined_logs.contains("step 1:")
+                || joined_logs.contains("run_attempt|phase=execution_start");
+            if !has_meaningful_summary && !has_step_signal {
+                issues.push("generic_execution_signal_missing".to_string());
+            }
+
+            let mail_send_required =
+                (contains_any(&plan_text_lower, &["mail", "email", "메일", "이메일"])
+                    && contains_any(&plan_text_lower, &["send", "보내", "발송", "전송"]))
+                    || data_contains_any(&["mail_send", "gmail_send", "\"action\":\"mail_send\""]);
+            if mail_send_required {
+                let mail_structured = latest_evidence_fields(logs, "mail", "send");
+                let mail_sent_confirmed = logs_have_evidence_fields(
+                    logs,
+                    &[
+                        ("target", "mail"),
+                        ("event", "send"),
+                        ("status", "sent_confirmed"),
+                    ],
+                ) || (mail_structured.is_none()
+                    && contains_any(
+                        &joined_logs,
+                        &[
+                            "mail_send_proof|status=sent_confirmed",
+                            "mail send completed",
+                            "(mail sent)",
+                            "mail sent",
+                        ],
+                    ));
+                if !mail_sent_confirmed {
+                    issues.push("contract_missing_mail_send_confirmation".to_string());
+                }
+
+                let mail_recipient = latest_evidence_field(logs, "mail", "send", "recipient")
+                    .or_else(|| latest_legacy_mail_send_field(logs, "recipient"))
+                    .unwrap_or_default();
+                if mail_sent_confirmed && mail_recipient.trim().is_empty() {
+                    issues.push("contract_missing_mail_recipient_evidence".to_string());
+                }
+
+                for recipient in &expected_recipients {
+                    let needle = recipient.to_lowercase();
+                    if !joined_logs.contains(&needle)
+                        && !summary_text.to_lowercase().contains(&needle)
+                    {
+                        issues.push(format!("contract_missing_mail_recipient={}", recipient));
+                    }
+                }
+
+                if mail_sent_confirmed && matches!(mail_body_len, Some(len) if len <= 2) {
+                    issues.push("contract_mail_body_empty".to_string());
+                }
+            }
+
+            let notes_write_required = step_matches(
+                &["notes", "note", "메모"],
+                &["write", "append", "type", "작성", "입력", "기록", "붙여넣"],
+            ) || data_contains_any(&[
+                "notes_write_text",
+                "\"action\":\"notes_write\"",
+                "\"target\":\"notes\"",
+            ]);
+            if notes_write_required {
+                let notes_structured = latest_evidence_fields(logs, "notes", "write");
+                let notes_write_confirmed = logs_have_evidence_fields(
+                    logs,
+                    &[
+                        ("target", "notes"),
+                        ("event", "write"),
+                        ("status", "confirmed"),
+                    ],
+                ) || (notes_structured.is_none()
+                    && contains_any(
+                        &joined_logs,
+                        &[
+                            "notes_write_confirmed",
+                            "notes_write_text",
+                            "(notes body)",
+                            "notes appended",
+                        ],
+                    ));
+                if !notes_write_confirmed {
+                    issues.push("contract_missing_notes_write_confirmation".to_string());
+                }
+                if notes_write_confirmed && notes_structured.is_some() {
+                    let note_id = latest_evidence_field(logs, "notes", "write", "note_id")
+                        .unwrap_or_default();
+                    if note_id.trim().is_empty() {
+                        issues.push("contract_missing_notes_note_id".to_string());
+                    }
+                }
+                let notes_body_len = latest_evidence_int(logs, "notes", "write", "body_len");
+                if notes_write_confirmed && matches!(notes_body_len, Some(len) if len <= 2) {
+                    issues.push("contract_notes_body_empty".to_string());
+                }
+            }
+
+            let textedit_write_required = step_matches(
+                &["textedit", "텍스트편집", "text edit"],
+                &["write", "append", "type", "작성", "입력", "기록", "붙여넣"],
+            ) || data_contains_any(&[
+                "textedit_append_text",
+                "\"action\":\"textedit_append_text\"",
+                "\"target\":\"textedit\"",
+            ]);
+            if textedit_write_required {
+                let textedit_structured = latest_evidence_fields(logs, "textedit", "write");
+                let textedit_write_confirmed = logs_have_evidence_fields(
+                    logs,
+                    &[
+                        ("target", "textedit"),
+                        ("event", "write"),
+                        ("status", "confirmed"),
+                    ],
+                ) || (textedit_structured.is_none()
+                    && contains_any(
+                        &joined_logs,
+                        &[
+                            "textedit_write_confirmed",
+                            "textedit_append_text",
+                            "(textedit body)",
+                            "shared via textedit",
+                        ],
+                    ));
+                if !textedit_write_confirmed {
+                    issues.push("contract_missing_textedit_write_confirmation".to_string());
+                }
+                if textedit_write_confirmed && textedit_structured.is_some() {
+                    let doc_id = latest_evidence_field(logs, "textedit", "write", "doc_id")
+                        .unwrap_or_default();
+                    if doc_id.trim().is_empty() {
+                        issues.push("contract_missing_textedit_doc_id".to_string());
+                    }
+                }
+                let textedit_body_len = latest_evidence_int(logs, "textedit", "write", "body_len");
+                if textedit_write_confirmed && matches!(textedit_body_len, Some(len) if len <= 2) {
+                    issues.push("contract_textedit_body_empty".to_string());
+                }
+            }
+
+            let notion_write_required = (contains_any(&plan_text_lower, &["notion", "노션"])
+                && contains_any(
+                    &plan_text_lower,
+                    &[
+                        "write",
+                        "create",
+                        "append",
+                        "작성",
+                        "기록",
+                        "저장",
+                        "업데이트",
+                    ],
+                ))
+                || data_contains_any(&[
+                    "notion_create",
+                    "notion_write",
+                    "\"action\":\"notion_create\"",
+                    "\"action\":\"notion_write\"",
+                ]);
+            if notion_write_required {
+                let notion_structured = latest_evidence_fields(logs, "notion", "write");
+                let notion_write_confirmed = logs_have_evidence_fields(
+                    logs,
+                    &[
+                        ("target", "notion"),
+                        ("event", "write"),
+                        ("status", "confirmed"),
+                    ],
+                ) || (notion_structured.is_none()
+                    && contains_any(
+                        &joined_logs,
+                        &[
+                            "notion: https://www.notion.so",
+                            "notion page created",
+                            "notion_write_confirmed",
+                        ],
+                    ));
+                if !notion_write_confirmed {
+                    issues.push("contract_missing_notion_write_confirmation".to_string());
+                }
+                if notion_write_confirmed && notion_structured.is_some() {
+                    let notion_page_id = latest_evidence_field(logs, "notion", "write", "page_id")
+                        .unwrap_or_default();
+                    if notion_page_id.trim().is_empty() {
+                        issues.push("contract_missing_notion_page_id".to_string());
+                    }
+                }
+            }
+
+            let telegram_send_required =
+                (contains_any(&plan_text_lower, &["telegram", "텔레그램"])
+                    && contains_any(&plan_text_lower, &["send", "보내", "발송", "전송"]))
+                    || data_contains_any(&[
+                        "telegram_send",
+                        "\"action\":\"telegram_send\"",
+                        "\"type\":\"telegram\"",
+                    ]);
+            if telegram_send_required {
+                let telegram_structured = latest_evidence_fields(logs, "telegram", "send");
+                let telegram_send_confirmed = logs_have_evidence_fields(
+                    logs,
+                    &[
+                        ("target", "telegram"),
+                        ("event", "send"),
+                        ("status", "sent"),
+                    ],
+                ) || (telegram_structured.is_none()
+                    && contains_any(
+                        &joined_logs,
+                        &[
+                            "telegram: sent",
+                            "telegram sent",
+                            "telegram_message_sent",
+                            "telegram_send",
+                        ],
+                    ));
+                if !telegram_send_confirmed {
+                    issues.push("contract_missing_telegram_send_confirmation".to_string());
+                }
+                if telegram_send_confirmed && telegram_structured.is_some() {
+                    let message_id = latest_evidence_field(logs, "telegram", "send", "message_id")
+                        .unwrap_or_default();
+                    if message_id.trim().is_empty() {
+                        issues.push("contract_missing_telegram_message_id".to_string());
+                    }
+                }
+            }
+
+            let textedit_save_required =
+                (contains_any(&plan_text_lower, &["textedit", "텍스트편집", "text edit"])
+                    && contains_any(&plan_text_lower, &["save", "저장"]))
+                    || data_contains_any(&[
+                        "textedit_save",
+                        "textedit_save_confirmed",
+                        "\"app\":\"textedit\"",
+                    ]);
+            if textedit_save_required {
+                let textedit_save_confirmed = logs_have_evidence_fields(
+                    logs,
+                    &[
+                        ("target", "textedit"),
+                        ("event", "save"),
+                        ("status", "confirmed"),
+                    ],
+                ) || contains_any(
+                    &joined_logs,
+                    &[
+                        "textedit_save_confirmed",
+                        "saved in textedit",
+                        "cmd+s",
+                        "shortcut 's' + [\"command\"]",
+                    ],
+                );
+                if !textedit_save_confirmed {
+                    issues.push("contract_missing_textedit_save_confirmation".to_string());
+                }
+            }
+        }
+    }
+
+    let mut explicit_assertions = crate::semantic_contract::extract_required_assertions(&plan_text);
+    for slot_value in plan.slots.values() {
+        for key in crate::semantic_contract::extract_required_assertions(slot_value) {
+            if !explicit_assertions
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&key))
+            {
+                explicit_assertions.push(key);
+            }
+        }
+    }
+    if !explicit_assertions.is_empty() {
+        let assertion_map: HashMap<String, bool> = detect_artifact_evidence_assertions(plan, logs)
+            .into_iter()
+            .map(|assertion| {
+                let actual_true = assertion.actual.eq_ignore_ascii_case("true");
+                (assertion.key.to_ascii_lowercase(), actual_true)
+            })
+            .collect();
+        for required_key in explicit_assertions {
+            let normalized = required_key.to_ascii_lowercase();
+            match assertion_map.get(&normalized) {
+                Some(true) => {}
+                Some(false) => issues.push(format!(
+                    "contract_required_assertion_failed={}",
+                    required_key
+                )),
+                None => issues.push(format!(
+                    "contract_required_assertion_unknown={}",
+                    required_key
+                )),
+            }
+        }
+    }
+
+    issues
+}
+
+fn completion_score_pass_threshold() -> u8 {
+    std::env::var("STEER_COMPLETION_SCORE_PASS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u8>().ok())
+        .map(|v| v.min(100))
+        .unwrap_or(75)
+}
+
+fn compute_completion_score(
+    status: &str,
+    planner_complete: bool,
+    execution_complete: bool,
+    business_complete: bool,
+    verification_ok: bool,
+    evidence_ok: bool,
+    verify_issue_count: usize,
+    manual_step_count: usize,
+) -> AgentCompletionScore {
+    let mut score: i32 = 0;
+    let mut reasons: Vec<String> = Vec::new();
+
+    if planner_complete {
+        score += 15;
+    } else {
+        reasons.push("planner_incomplete".to_string());
+    }
+    if execution_complete {
+        score += 20;
+    } else {
+        reasons.push("execution_incomplete".to_string());
+    }
+    if verification_ok {
+        score += 20;
+    } else {
+        reasons.push("verification_failed".to_string());
+    }
+    if evidence_ok {
+        score += 15;
+    } else {
+        reasons.push("business_evidence_failed".to_string());
+    }
+    if business_complete {
+        score += 20;
+    } else {
+        reasons.push("business_incomplete".to_string());
+    }
+    if matches!(status, "completed" | "success") {
+        score += 10;
+    } else {
+        reasons.push(format!("final_status={}", status));
+        if matches!(status, "error" | "failed" | "blocked") {
+            score -= 10;
+        }
+    }
+
+    if verify_issue_count > 0 {
+        let penalty = (verify_issue_count as i32).min(5) * 2;
+        score -= penalty;
+        reasons.push(format!("verify_issues={}", verify_issue_count));
+    }
+    if manual_step_count > 0 {
+        let penalty = (manual_step_count as i32).min(5) * 2;
+        score -= penalty;
+        reasons.push(format!("manual_steps={}", manual_step_count));
+    }
+
+    score = score.clamp(0, 100);
+    let score_u8 = score as u8;
+    let label = if score_u8 >= 90 {
+        "Excellent"
+    } else if score_u8 >= 75 {
+        "Good"
+    } else if score_u8 >= 60 {
+        "Needs tuning"
+    } else {
+        "Risky"
+    };
+    let pass = score_u8 >= completion_score_pass_threshold();
+
+    AgentCompletionScore {
+        score: score_u8,
+        label: label.to_string(),
+        pass,
+        reasons,
+    }
 }
 
 fn is_meaningful_summary(plan: &crate::nl_automation::Plan, summary: &str) -> bool {
@@ -2636,6 +4769,24 @@ mod tests {
         }
     }
 
+    fn test_plan_with_descriptions(intent: IntentType, descriptions: &[&str]) -> Plan {
+        Plan {
+            plan_id: format!("plan-{}", uuid::Uuid::new_v4()),
+            intent,
+            slots: HashMap::new(),
+            steps: descriptions
+                .iter()
+                .enumerate()
+                .map(|(idx, desc)| PlanStep {
+                    step_id: format!("step-{}", idx + 1),
+                    step_type: StepType::Extract,
+                    description: (*desc).to_string(),
+                    data: json!({}),
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn business_evidence_accepts_meaningful_summary() {
         let plan = test_plan(IntentType::GenericTask);
@@ -2670,5 +4821,226 @@ mod tests {
         let (ok, detail) = evaluate_business_evidence(&plan, &logs);
         assert!(!ok);
         assert!(detail.contains("blocking signal present"));
+    }
+
+    #[test]
+    fn business_contract_rejects_missing_flight_slot_in_summary() {
+        let mut plan = test_plan(IntentType::FlightSearch);
+        plan.slots.insert("from".to_string(), "Seoul".to_string());
+        plan.slots.insert("to".to_string(), "Tokyo".to_string());
+        plan.slots
+            .insert("date_start".to_string(), "2026-03-01".to_string());
+        let logs = vec![
+            "Summary: search flights Seoul -> unknown on 2026-03-01".to_string(),
+            "Verification passed".to_string(),
+        ];
+        let (ok, detail) = evaluate_business_evidence(&plan, &logs);
+        assert!(!ok);
+        assert!(detail.contains("contract_missing_to=Tokyo"));
+    }
+
+    #[test]
+    fn business_contract_accepts_generic_execution_without_summary() {
+        let plan = test_plan(IntentType::GenericTask);
+        let logs = vec![
+            "RUN_ATTEMPT|phase=execution_start|status=running|details=ok|ts=now".to_string(),
+            "Step 1: Collect more details from user (Wait)".to_string(),
+        ];
+        let (ok, detail) = evaluate_business_evidence(&plan, &logs);
+        assert!(ok, "expected ok but got {}", detail);
+    }
+
+    #[test]
+    fn business_contract_rejects_missing_mail_notion_telegram_evidence() {
+        let plan = test_plan_with_descriptions(
+            IntentType::GenericTask,
+            &[
+                "Mail에서 qed4950@gmail.com으로 결과를 보내세요.",
+                "Notion에 요약을 작성하세요.",
+                "텔레그램으로 전송하세요.",
+            ],
+        );
+        let logs = vec![
+            "Step 1: Open app".to_string(),
+            "Summary: requested integrations done".to_string(),
+        ];
+
+        let (ok, detail) = evaluate_business_evidence(&plan, &logs);
+        assert!(!ok);
+        assert!(detail.contains("contract_missing_mail_send_confirmation"));
+        assert!(detail.contains("contract_missing_mail_recipient=qed4950@gmail.com"));
+        assert!(detail.contains("contract_missing_notion_write_confirmation"));
+        assert!(detail.contains("contract_missing_telegram_send_confirmation"));
+    }
+
+    #[test]
+    fn business_contract_accepts_mail_notion_telegram_evidence_markers() {
+        let plan = test_plan_with_descriptions(
+            IntentType::GenericTask,
+            &[
+                "Mail에서 qed4950@gmail.com으로 결과를 보내세요.",
+                "Notion에 요약을 작성하세요.",
+                "텔레그램으로 전송하세요.",
+            ],
+        );
+        let logs = vec![
+            "MAIL_SEND_PROOF|status=sent_confirmed|recipient=qed4950@gmail.com|subject=Digest"
+                .to_string(),
+            "Notion: https://www.notion.so/abcd1234".to_string(),
+            "telegram: sent".to_string(),
+            "Summary: integrations completed with artifacts".to_string(),
+        ];
+
+        let (ok, detail) = evaluate_business_evidence(&plan, &logs);
+        assert!(ok, "expected ok but got {}", detail);
+    }
+
+    #[test]
+    fn business_contract_accepts_structured_evidence_schema() {
+        let plan = test_plan_with_descriptions(
+            IntentType::GenericTask,
+            &[
+                "Mail에서 qed4950@gmail.com으로 결과를 보내세요.",
+                "Notion에 요약을 작성하세요.",
+                "텔레그램으로 전송하세요.",
+                "TextEdit에 저장하세요.",
+            ],
+        );
+        let logs = vec![
+            "EVIDENCE|target=mail|event=send|status=sent_confirmed|recipient=qed4950@gmail.com|subject=Digest|body_len=120".to_string(),
+            "EVIDENCE|target=notion|event=write|status=confirmed|page_id=abcd1234".to_string(),
+            "EVIDENCE|target=telegram|event=send|status=sent|message_id=123".to_string(),
+            "EVIDENCE|target=textedit|event=save|status=confirmed|doc_id=doc-1".to_string(),
+            "Summary: integrations completed with structured evidence".to_string(),
+        ];
+
+        let (ok, detail) = evaluate_business_evidence(&plan, &logs);
+        assert!(ok, "expected ok but got {}", detail);
+    }
+
+    #[test]
+    fn business_contract_rejects_structured_mail_without_recipient() {
+        let plan = test_plan_with_descriptions(
+            IntentType::GenericTask,
+            &["Mail에서 qed4950@gmail.com으로 결과를 보내세요."],
+        );
+        let logs = vec![
+            "EVIDENCE|target=mail|event=send|status=sent_confirmed|recipient=|subject=Digest|body_len=120".to_string(),
+            "Summary: mail send done".to_string(),
+        ];
+
+        let (ok, detail) = evaluate_business_evidence(&plan, &logs);
+        assert!(!ok);
+        assert!(detail.contains("contract_missing_mail_recipient_evidence"));
+    }
+
+    #[test]
+    fn business_contract_rejects_structured_notion_telegram_without_ids() {
+        let plan = test_plan_with_descriptions(
+            IntentType::GenericTask,
+            &["Notion에 요약을 작성하고 텔레그램으로 전송하세요."],
+        );
+        let logs = vec![
+            "EVIDENCE|target=notion|event=write|status=confirmed|page_id=".to_string(),
+            "EVIDENCE|target=telegram|event=send|status=sent|message_id=".to_string(),
+            "Summary: integrations completed".to_string(),
+        ];
+
+        let (ok, detail) = evaluate_business_evidence(&plan, &logs);
+        assert!(!ok);
+        assert!(detail.contains("contract_missing_notion_page_id"));
+        assert!(detail.contains("contract_missing_telegram_message_id"));
+    }
+
+    #[test]
+    fn business_contract_rejects_structured_notes_without_note_id() {
+        let plan =
+            test_plan_with_descriptions(IntentType::GenericTask, &["Notes에 TODO를 작성하세요."]);
+        let logs = vec![
+            "EVIDENCE|target=notes|event=write|status=confirmed|note_id=|body_len=20".to_string(),
+            "Summary: notes write completed".to_string(),
+        ];
+        let (ok, detail) = evaluate_business_evidence(&plan, &logs);
+        assert!(!ok);
+        assert!(detail.contains("contract_missing_notes_note_id"));
+    }
+
+    #[test]
+    fn business_contract_rejects_structured_textedit_without_doc_id() {
+        let plan = test_plan_with_descriptions(
+            IntentType::GenericTask,
+            &["TextEdit에 결과를 작성하세요."],
+        );
+        let logs = vec![
+            "EVIDENCE|target=textedit|event=write|status=confirmed|doc_id=|body_len=42".to_string(),
+            "Summary: textedit write completed".to_string(),
+        ];
+        let (ok, detail) = evaluate_business_evidence(&plan, &logs);
+        assert!(!ok);
+        assert!(detail.contains("contract_missing_textedit_doc_id"));
+    }
+
+    #[test]
+    fn business_contract_respects_explicit_semantic_assertions() {
+        let plan = test_plan_with_descriptions(
+            IntentType::GenericTask,
+            &["semantic_assertions: [artifact.mail_sent_confirmed]"],
+        );
+        let logs = vec!["Summary: generic task completed".to_string()];
+        let (ok, detail) = evaluate_business_evidence(&plan, &logs);
+        assert!(!ok);
+        assert!(detail.contains("contract_required_assertion_failed=artifact.mail_sent_confirmed"));
+    }
+
+    #[test]
+    fn business_contract_rejects_mail_send_with_empty_body_len() {
+        let plan = test_plan_with_descriptions(
+            IntentType::GenericTask,
+            &["Mail에서 qed4950@gmail.com으로 결과를 보내세요."],
+        );
+        let logs = vec![
+            "MAIL_SEND_PROOF|status=sent_confirmed|recipient=qed4950@gmail.com|subject=Digest|body_len=0".to_string(),
+            "Summary: mail send done".to_string(),
+        ];
+
+        let (ok, detail) = evaluate_business_evidence(&plan, &logs);
+        assert!(!ok);
+        assert!(detail.contains("contract_mail_body_empty"));
+    }
+
+    #[test]
+    fn business_contract_rejects_textedit_save_missing() {
+        let plan = test_plan_with_descriptions(
+            IntentType::GenericTask,
+            &["TextEdit에 결과를 작성하고 저장하세요."],
+        );
+        let logs = vec![
+            "TEXTEDIT_WRITE_CONFIRMED|len=42".to_string(),
+            "Summary: textedit write done".to_string(),
+        ];
+
+        let (ok, detail) = evaluate_business_evidence(&plan, &logs);
+        assert!(!ok);
+        assert!(detail.contains("contract_missing_textedit_save_confirmation"));
+    }
+
+    #[test]
+    fn completion_score_is_high_on_clean_success() {
+        let score = compute_completion_score("completed", true, true, true, true, true, 0, 0);
+        assert!(score.score >= 90, "score={}", score.score);
+        assert!(score.pass);
+        assert_eq!(score.label, "Excellent");
+    }
+
+    #[test]
+    fn completion_score_drops_on_failed_execution() {
+        let score = compute_completion_score("error", true, false, false, false, false, 4, 3);
+        assert!(score.score < 60, "score={}", score.score);
+        assert!(!score.pass);
+        assert_eq!(score.label, "Risky");
+        assert!(score
+            .reasons
+            .iter()
+            .any(|r| r.contains("final_status=error")));
     }
 }

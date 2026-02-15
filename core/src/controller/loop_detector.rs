@@ -5,6 +5,27 @@ use serde_json::Value;
 pub struct LoopDetector;
 
 impl LoopDetector {
+    fn is_high_risk_key(key: &str) -> bool {
+        key.starts_with("action:open_app:")
+            || key == "action:shortcut:command+n"
+            || key == "action:key:command+n"
+    }
+
+    pub fn detect_high_risk_repetition(history: &[String], current_action: &str) -> bool {
+        if history.is_empty() {
+            return false;
+        }
+        let current_key = Self::extract_action_key(current_action);
+        if !Self::is_high_risk_key(&current_key) {
+            return false;
+        }
+        history
+            .iter()
+            .rev()
+            .take(1)
+            .any(|entry| Self::extract_action_key(entry) == current_key)
+    }
+
     /// Detect if the same normalized action has been repeated 4+ times consecutively.
     pub fn detect_action_loop(history: &[String], current_action: &str) -> bool {
         if history.len() < 3 {
@@ -130,5 +151,26 @@ impl LoopDetector {
             return "unknown".to_string();
         }
         compact.chars().take(96).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LoopDetector;
+
+    #[test]
+    fn detects_high_risk_repetition_for_open_app_immediately() {
+        let history = vec![r#"{"action":"open_app","name":"Mail"}"#.to_string()];
+        let current = r#"{"action":"open_app","name":"Mail"}"#;
+        assert!(LoopDetector::detect_high_risk_repetition(&history, current));
+    }
+
+    #[test]
+    fn does_not_flag_non_high_risk_single_repeat() {
+        let history = vec![r#"{"action":"type","text":"hello"}"#.to_string()];
+        let current = r#"{"action":"type","text":"hello"}"#;
+        assert!(!LoopDetector::detect_high_risk_repetition(
+            &history, current
+        ));
     }
 }

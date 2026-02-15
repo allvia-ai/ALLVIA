@@ -1,7 +1,10 @@
+use crate::controller::planner::RunGoalOutcome;
 use crate::llm_gateway::LLMClient;
+use crate::telegram_transport;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 // Duplicate removed
@@ -115,37 +118,27 @@ impl TelegramBot {
                                             .await
                                         {
                                             Ok(outcome) => {
-                                                let summary = outcome
-                                                    .summary
-                                                    .clone()
-                                                    .unwrap_or_else(|| "n/a".to_string());
-                                                let reply = if outcome.business_complete {
-                                                    format!(
-                                                        "✅ Task Completed.\nrun_id={}\nstatus={}\nplanner_complete={}\nexecution_complete={}\nbusiness_complete={}\nsummary={}",
-                                                        outcome.run_id,
-                                                        outcome.status,
-                                                        outcome.planner_complete,
-                                                        outcome.execution_complete,
-                                                        outcome.business_complete,
-                                                        summary
+                                                let stage_runs = crate::db::list_task_stage_runs(
+                                                    &outcome.run_id,
+                                                )
+                                                .unwrap_or_default();
+                                                let assertions =
+                                                    crate::db::list_task_stage_assertions(
+                                                        &outcome.run_id,
                                                     )
-                                                } else {
-                                                    format!(
-                                                        "❌ Task Incomplete.\nrun_id={}\nstatus={}\nplanner_complete={}\nexecution_complete={}\nbusiness_complete={}\nsummary={}\n로그/증거를 확인하세요.",
-                                                        outcome.run_id,
-                                                        outcome.status,
-                                                        outcome.planner_complete,
-                                                        outcome.execution_complete,
-                                                        outcome.business_complete,
-                                                        summary
-                                                    )
-                                                };
-                                                let _ =
-                                                    bot_clone.send_message(chat_id, &reply).await;
+                                                    .unwrap_or_default();
+                                                let reply = Self::build_run_report(
+                                                    &outcome,
+                                                    &stage_runs,
+                                                    &assertions,
+                                                );
+                                                let _ = bot_clone
+                                                    .send_message_chunked(chat_id, &reply)
+                                                    .await;
                                             }
                                             Err(e) => {
                                                 let _ = bot_clone
-                                                    .send_message(
+                                                    .send_message_chunked(
                                                         chat_id,
                                                         &format!("❌ Task Failed: {}", e),
                                                     )
@@ -189,13 +182,150 @@ impl TelegramBot {
     }
 
     pub async fn send_message(&self, chat_id: i64, text: &str) -> Result<()> {
-        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.token);
-        let body = json!({
-            "chat_id": chat_id,
-            "text": text
+        telegram_transport::send_message_chunked(
+            &self.client,
+            &self.token,
+            &chat_id.to_string(),
+            text,
+            None,
+            telegram_transport::DEFAULT_MAX_SEND_ATTEMPTS,
+        )
+        .await
+    }
+
+    pub async fn send_message_chunked(&self, chat_id: i64, text: &str) -> Result<()> {
+        telegram_transport::send_message_chunked(
+            &self.client,
+            &self.token,
+            &chat_id.to_string(),
+            text,
+            None,
+            telegram_transport::DEFAULT_MAX_SEND_ATTEMPTS,
+        )
+        .await
+    }
+
+    fn build_run_report(
+        outcome: &RunGoalOutcome,
+        stage_runs: &[crate::db::TaskStageRunRecord],
+        assertions: &[crate::db::TaskStageAssertionRecord],
+    ) -> String {
+        fn truncate_chars(s: &str, max_chars: usize) -> String {
+            let mut out = String::new();
+            for (idx, ch) in s.chars().enumerate() {
+                if idx >= max_chars {
+                    out.push_str("...");
+                    break;
+                }
+                out.push(ch);
+            }
+            out
+        }
+
+        let summary = outcome.summary.clone().unwrap_or_else(|| "n/a".to_string());
+        let mut latest_stage_map: BTreeMap<(i64, String), crate::db::TaskStageRunRecord> =
+            BTreeMap::new();
+        for stage in stage_runs {
+            let key = (stage.stage_order, stage.stage_name.clone());
+            match latest_stage_map.get(&key) {
+                Some(prev) if prev.id >= stage.id => {}
+                _ => {
+                    latest_stage_map.insert(key, stage.clone());
+                }
+            }
+        }
+        let latest_stages: Vec<crate::db::TaskStageRunRecord> =
+            latest_stage_map.into_values().collect();
+        let stage_done_count = latest_stages
+            .iter()
+            .filter(|s| s.status.eq_ignore_ascii_case("completed"))
+            .count();
+        let stage_total = latest_stages.len();
+
+        let mut lines = Vec::new();
+        lines.push(if outcome.business_complete {
+            "상태: ✅ 성공".to_string()
+        } else {
+            "상태: ❌ 실패".to_string()
         });
-        let _ = self.client.post(&url).json(&body).send().await?;
-        Ok(())
+        lines.push(format!("run_id: {}", outcome.run_id));
+        lines.push(format!("요약: {}", summary));
+        lines.push("판정:".to_string());
+        lines.push(format!("- planner_complete={}", outcome.planner_complete));
+        lines.push(format!(
+            "- execution_complete={}",
+            outcome.execution_complete
+        ));
+        lines.push(format!("- business_complete={}", outcome.business_complete));
+        lines.push(format!("- final_status={}", outcome.status));
+
+        if !latest_stages.is_empty() {
+            lines.push(format!("단계: {}/{} 완료", stage_done_count, stage_total));
+            for stage in latest_stages.iter().take(8) {
+                let details = stage.details.clone().unwrap_or_default();
+                let short_details = if details.chars().count() > 120 {
+                    truncate_chars(&details, 120)
+                } else {
+                    details
+                };
+                if short_details.is_empty() {
+                    lines.push(format!(
+                        "- {}.{}={}",
+                        stage.stage_order, stage.stage_name, stage.status
+                    ));
+                } else {
+                    lines.push(format!(
+                        "- {}.{}={} ({})",
+                        stage.stage_order, stage.stage_name, stage.status, short_details
+                    ));
+                }
+            }
+        }
+
+        let failed_assertions: Vec<&crate::db::TaskStageAssertionRecord> =
+            assertions.iter().filter(|a| !a.passed).collect();
+        if assertions.is_empty() {
+            lines.push("검증: assertion 없음".to_string());
+        } else if failed_assertions.is_empty() {
+            lines.push(format!("검증: assertions 통과 ({})", assertions.len()));
+        } else {
+            lines.push(format!(
+                "검증: assertions 실패 {}/{}",
+                failed_assertions.len(),
+                assertions.len()
+            ));
+            lines.push("실패 근거:".to_string());
+            for assertion in failed_assertions.iter().take(6) {
+                let evidence = assertion.evidence.clone().unwrap_or_default();
+                let short_evidence = if evidence.chars().count() > 140 {
+                    truncate_chars(&evidence, 140)
+                } else {
+                    evidence
+                };
+                lines.push(format!(
+                    "- {}.{} expected={} actual={} evidence={}",
+                    assertion.stage_name,
+                    assertion.assertion_key,
+                    assertion.expected,
+                    assertion.actual,
+                    if short_evidence.is_empty() {
+                        "n/a".to_string()
+                    } else {
+                        short_evidence
+                    }
+                ));
+            }
+        }
+
+        lines.push("다음 조치:".to_string());
+        if outcome.business_complete {
+            lines.push("- 추가 요청 실행 가능".to_string());
+        } else {
+            lines.push("- 실패 근거 항목부터 보강 후 재실행".to_string());
+            lines.push("- 동일 요청 재실행 전 front 앱/입력 포커스 확인".to_string());
+        }
+
+        lines.join("\n")
     }
 
     pub async fn improve_message(&self, raw_text: &str) -> String {
@@ -247,22 +377,14 @@ impl TelegramBot {
 
     pub async fn send_smart_notification(&self, chat_id: i64, raw_text: &str) -> Result<()> {
         let refined_text = self.improve_message(raw_text).await;
-        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.token);
-        let body = json!({
-            "chat_id": chat_id,
-            "text": refined_text
-        });
-
-        let resp = self.client.post(&url).json(&body).send().await?;
-        if !resp.status().is_success() {
-            // Fallback to raw text if markdown parsing fails
-            let body_fallback = json!({
-                "chat_id": chat_id,
-                "text": format!("{}\n(Refined format failed, raw text sent)", raw_text)
-            });
-            let _ = self.client.post(&url).json(&body_fallback).send().await?;
+        if self
+            .send_message_chunked(chat_id, &refined_text)
+            .await
+            .is_ok()
+        {
+            return Ok(());
         }
-        Ok(())
+        self.send_message_chunked(chat_id, raw_text).await
     }
 
     fn is_allowed(&self, user: &Option<User>) -> bool {

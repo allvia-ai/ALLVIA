@@ -3,12 +3,22 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from 
 import { Activity, Cpu, HardDrive, RefreshCw, Lightbulb, ShieldCheck } from "lucide-react";
 import { AuditLog } from "@/components/AuditLog";
 import { useSystemStatus, useLogs, useRoutines, useRecommendations, useRecommendationMetrics, useQualityScore, useConsistencyCheck, useSemanticVerification, useReleaseGate, useVerificationRuns, useExecAllowlist, useExecResults, useExecApprovals, useRoutineRuns, useNlRuns, useNlRunMetrics, useApprovalPolicies } from "@/lib/hooks";
-import { approveRecommendation, rejectRecommendation, laterRecommendation, restoreRecommendation, sendFeedback, fetchCurrentGoal, addExecAllowlist, removeExecAllowlist, runExecResultsGuard, runRuntimeVerification, runPerformanceVerification, runVisualVerification, setReleaseBaseline, fetchSelectionContext, scanProject, runJudgment, approveExecApproval, rejectExecApproval, analyzePatterns, createRoutine, toggleRoutine, calculateQualityScore, executeGoal, agentIntent, agentPlan, agentExecute, agentVerify, agentApprove, removeApprovalPolicy } from "@/lib/api";
+import { approveRecommendation, rejectRecommendation, laterRecommendation, restoreRecommendation, sendFeedback, fetchCurrentGoal, addExecAllowlist, removeExecAllowlist, runExecResultsGuard, runRuntimeVerification, runPerformanceVerification, runVisualVerification, setReleaseBaseline, fetchSelectionContext, scanProject, runJudgment, approveExecApproval, rejectExecApproval, analyzePatterns, createRoutine, toggleRoutine, calculateQualityScore, executeGoal, agentIntent, agentPlan, agentExecute, agentVerify, agentApprove, removeApprovalPolicy, fetchTaskRunStages, fetchTaskRunAssertions } from "@/lib/api";
 import { format } from "date-fns";
 import { motion } from "framer-motion";
 import { useEffect, useState } from "react";
 import type { ReleaseGateOverrides } from "@/lib/api";
-import type { RuntimeVerifyResult, PerformanceVerification, VisualVerifyResult, ProjectScan, Judgment, ContextSelection } from "@/lib/types";
+import type {
+    RuntimeVerifyResult,
+    PerformanceVerification,
+    VisualVerifyResult,
+    ProjectScan,
+    Judgment,
+    ContextSelection,
+    ExecutionProfile,
+    TaskStageRun,
+    TaskStageAssertion,
+} from "@/lib/types";
 
 const containerVariants = {
     hidden: { opacity: 0 },
@@ -1704,6 +1714,32 @@ function NaturalLanguageAutomationCard() {
     const [summary, setSummary] = useState<string | null>(null);
     const [approvalHistory, setApprovalHistory] = useState<Array<{ time: string; action: string; result: string }>>([]);
     const [historyFilter, setHistoryFilter] = useState("");
+    const [executionProfile, setExecutionProfile] = useState<ExecutionProfile>("strict");
+    const [lastRunId, setLastRunId] = useState<string | null>(null);
+    const [stageRuns, setStageRuns] = useState<TaskStageRun[]>([]);
+    const [stageAssertions, setStageAssertions] = useState<TaskStageAssertion[]>([]);
+
+    const loadRunDiagnostics = async (runId?: string | null) => {
+        if (!runId) {
+            setStageRuns([]);
+            setStageAssertions([]);
+            return;
+        }
+        try {
+            const [stages, assertions] = await Promise.all([
+                fetchTaskRunStages(runId),
+                fetchTaskRunAssertions(runId),
+            ]);
+            setLastRunId(runId);
+            setStageRuns(stages);
+            setStageAssertions(assertions);
+        } catch (error) {
+            console.error("Failed to load dashboard run diagnostics", error);
+            setLastRunId(runId);
+            setStageRuns([]);
+            setStageAssertions([]);
+        }
+    };
 
     const parseSlots = (raw: string): Record<string, string> | undefined => {
         if (!raw.trim()) return undefined;
@@ -1773,11 +1809,13 @@ function NaturalLanguageAutomationCard() {
         setLoading(true);
         setError(null);
         try {
-            const res = await agentExecute(planId);
+            const res = await agentExecute(planId, executionProfile);
             setExecStatus(res.status);
             setExecLogs(res.logs);
+            setLastRunId(res.run_id ?? null);
             const summaryLine = res.logs.find((line) => line.startsWith("Summary: "));
             setSummary(summaryLine ? summaryLine.replace("Summary: ", "") : null);
+            await loadRunDiagnostics(res.run_id);
             setHistory((prev) => [
                 { time: format(new Date(), "HH:mm:ss"), prompt: prompt || "(no prompt)", status: res.status },
                 ...prev,
@@ -1876,11 +1914,13 @@ function NaturalLanguageAutomationCard() {
             setPlanSteps(planRes.steps.map((step) => `${step.step_type}: ${step.description}`));
             setMissingSlots(planRes.missing_slots);
 
-            const execRes = await agentExecute(planRes.plan_id);
+            const execRes = await agentExecute(planRes.plan_id, executionProfile);
             setExecStatus(execRes.status);
             setExecLogs(execRes.logs);
+            setLastRunId(execRes.run_id ?? null);
             const summaryLine = execRes.logs.find((line) => line.startsWith("Summary: "));
             setSummary(summaryLine ? summaryLine.replace("Summary: ", "") : null);
+            await loadRunDiagnostics(execRes.run_id);
             setHistory((prev) => [
                 { time: format(new Date(), "HH:mm:ss"), prompt: prompt || "(no prompt)", status: execRes.status },
                 ...prev,
@@ -1911,6 +1951,9 @@ function NaturalLanguageAutomationCard() {
         setVerifyStatus(null);
         setVerifyIssues([]);
         setSummary(null);
+        setLastRunId(null);
+        setStageRuns([]);
+        setStageAssertions([]);
         setError(null);
         setApprovalHistory([]);
         setApprovalRisk(null);
@@ -1990,6 +2033,38 @@ function NaturalLanguageAutomationCard() {
                     rows={2}
                     className="w-full rounded-md bg-white/5 border border-white/10 px-3 py-2 text-xs"
                 />
+                <div className="grid grid-cols-3 gap-2">
+                    <button
+                        onClick={() => setExecutionProfile("strict")}
+                        className={`text-[11px] py-1.5 rounded border transition-colors ${
+                            executionProfile === "strict"
+                                ? "bg-white/20 border-white/30 text-white"
+                                : "bg-white/5 border-white/10 text-white/70 hover:bg-white/10"
+                        }`}
+                    >
+                        정확(strict)
+                    </button>
+                    <button
+                        onClick={() => setExecutionProfile("test")}
+                        className={`text-[11px] py-1.5 rounded border transition-colors ${
+                            executionProfile === "test"
+                                ? "bg-white/20 border-white/30 text-white"
+                                : "bg-white/5 border-white/10 text-white/70 hover:bg-white/10"
+                        }`}
+                    >
+                        테스트(test)
+                    </button>
+                    <button
+                        onClick={() => setExecutionProfile("fast")}
+                        className={`text-[11px] py-1.5 rounded border transition-colors ${
+                            executionProfile === "fast"
+                                ? "bg-white/20 border-white/30 text-white"
+                                : "bg-white/5 border-white/10 text-white/70 hover:bg-white/10"
+                        }`}
+                    >
+                        빠름(fast)
+                    </button>
+                </div>
                 <div className="grid grid-cols-2 gap-2">
                     <button
                         onClick={handleIntent}
@@ -2165,11 +2240,38 @@ function NaturalLanguageAutomationCard() {
                         </div>
                     )}
                     {execStatus && <div>Execute: {execStatus}</div>}
+                    <div>Profile: {executionProfile}</div>
                     {execLogs.length > 0 && (
                         <div className="max-h-24 overflow-y-auto">
                             {execLogs.slice(0, 6).map((line, idx) => (
                                 <div key={`${line}-${idx}`}>• {line}</div>
                             ))}
+                        </div>
+                    )}
+                    {lastRunId && (
+                        <div className="rounded-md border border-white/10 bg-black/20 p-2 text-[11px]">
+                            <div className="font-semibold text-white/90 mb-1">Run diagnostics ({lastRunId})</div>
+                            {stageRuns.length > 0 && (
+                                <div className="space-y-0.5 text-white/80">
+                                    {stageRuns.slice(0, 6).map((stage) => (
+                                        <div key={`${stage.stage_name}-${stage.id}`}>
+                                            • {stage.stage_order}.{stage.stage_name}={stage.status}
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                            {stageAssertions.filter((a) => !a.passed).length > 0 && (
+                                <div className="mt-2 text-amber-200 space-y-0.5">
+                                    {stageAssertions
+                                        .filter((a) => !a.passed)
+                                        .slice(0, 6)
+                                        .map((assertion) => (
+                                            <div key={`${assertion.id}-${assertion.assertion_key}`}>
+                                                • {assertion.stage_name}.{assertion.assertion_key} expected={assertion.expected} actual={assertion.actual}
+                                            </div>
+                                        ))}
+                                </div>
+                            )}
                         </div>
                     )}
                     {verifyStatus && <div>Verify: {verifyStatus}</div>}

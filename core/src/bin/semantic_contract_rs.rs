@@ -34,6 +34,11 @@ fn main() {
                 println!("{recipient}");
             }
         }
+        "assertions" => {
+            for assertion in contract.assertions {
+                println!("{assertion}");
+            }
+        }
         _ => {
             println!(
                 "{}",

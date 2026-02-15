@@ -690,6 +690,19 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_evaluate_approval_default_fallback_is_deny() {
+        reset_decisions();
+        std::env::remove_var("STEER_APPROVAL_ASK_FALLBACK");
+        let plan = test_plan(&format!("plan-fallback-default-{}", uuid::Uuid::new_v4()));
+        let action = r#"{"action":"shell","command":"sudo apt install git"}"#;
+        let decision = evaluate_approval(action, &plan);
+        assert_eq!(decision.status, "denied");
+        assert!(decision.requires_approval);
+        assert_eq!(decision.policy, "ask_fallback_deny");
+    }
+
+    #[test]
+    #[serial]
     fn test_decision_persists_via_db() {
         if let Err(e) = crate::db::init() {
             eprintln!("skip: db init unavailable for persistence test: {}", e);
@@ -974,7 +987,7 @@ fn approval_ask_fallback_mode() -> String {
         .ok()
         .map(|v| v.trim().to_lowercase())
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "ask".to_string())
+        .unwrap_or_else(|| "deny".to_string())
 }
 
 fn apply_pending_ask_fallback(mut decision: ApprovalDecision) -> ApprovalDecision {

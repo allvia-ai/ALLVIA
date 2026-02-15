@@ -23,12 +23,16 @@ import {
     AgentExecuteResponseSchema,
     AgentVerifyResponseSchema,
     AgentApproveResponseSchema,
+    AgentPreflightResponseSchema,
+    AgentPreflightFixResponseSchema,
+    AgentRecoveryEventResponseSchema,
     ApprovalPolicySchema,
     NLRunMetricsSchema,
     NLRunSchema,
     TaskRunSchema,
     TaskStageRunSchema,
     TaskStageAssertionSchema,
+    TaskRunArtifactSchema,
     ContextSelectionSchema,
     ProjectScanSchema,
     JudgmentSchema,
@@ -52,15 +56,20 @@ import {
     type VerificationRun,
     type AgentIntentResponse,
     type AgentPlanResponse,
+    type ExecutionProfile,
     type AgentExecuteResponse,
     type AgentVerifyResponse,
     type AgentApproveResponse,
+    type AgentPreflightResponse,
+    type AgentPreflightFixResponse,
+    type AgentRecoveryEventResponse,
     type ApprovalPolicy,
     type NLRunMetrics,
     type NLRun,
     type TaskRun,
     type TaskStageRun,
     type TaskStageAssertion,
+    type TaskRunArtifact,
     type ContextSelection,
     type ProjectScan,
     type Judgment,
@@ -301,8 +310,15 @@ export async function agentPlan(
     return AgentPlanResponseSchema.parse(data);
 }
 
-export async function agentExecute(planId: string): Promise<AgentExecuteResponse> {
-    const { data } = await api.post("/agent/execute", { plan_id: planId });
+export async function agentExecute(
+    planId: string,
+    profile?: ExecutionProfile
+): Promise<AgentExecuteResponse> {
+    const payload: Record<string, unknown> = { plan_id: planId };
+    if (profile) {
+        payload.profile = profile;
+    }
+    const { data } = await api.post("/agent/execute", payload);
     return AgentExecuteResponseSchema.parse(data);
 }
 
@@ -318,6 +334,46 @@ export async function agentApprove(
 ): Promise<AgentApproveResponse> {
     const { data } = await api.post("/agent/approve", { plan_id: planId, action, decision });
     return AgentApproveResponseSchema.parse(data);
+}
+
+export async function fetchAgentPreflight(): Promise<AgentPreflightResponse> {
+    const { data } = await api.get("/agent/preflight");
+    return AgentPreflightResponseSchema.parse(data);
+}
+
+export type AgentPreflightFixOptions = {
+    run_id?: string | null;
+    stage_name?: string;
+    assertion_key?: string;
+};
+
+export async function runAgentPreflightFix(
+    action: string,
+    options?: AgentPreflightFixOptions
+): Promise<AgentPreflightFixResponse> {
+    const payload: Record<string, unknown> = { action };
+    if (options?.run_id) payload.run_id = options.run_id;
+    if (options?.stage_name) payload.stage_name = options.stage_name;
+    if (options?.assertion_key) payload.assertion_key = options.assertion_key;
+    const { data } = await api.post("/agent/preflight/fix", payload);
+    return AgentPreflightFixResponseSchema.parse(data);
+}
+
+export type AgentRecoveryEventRequest = {
+    run_id: string;
+    action_key: string;
+    status: string;
+    details?: string;
+    stage_name?: string;
+    expected?: string;
+    actual?: string;
+};
+
+export async function recordAgentRecoveryEvent(
+    payload: AgentRecoveryEventRequest
+): Promise<AgentRecoveryEventResponse> {
+    const { data } = await api.post("/agent/recovery-event", payload);
+    return AgentRecoveryEventResponseSchema.parse(data);
 }
 
 export async function fetchNlRuns(limit: number = 20): Promise<NLRun[]> {
@@ -351,6 +407,15 @@ export async function fetchTaskRunStages(runId: string): Promise<TaskStageRun[]>
 export async function fetchTaskRunAssertions(runId: string): Promise<TaskStageAssertion[]> {
     const { data } = await api.get(`/agent/task-runs/${encodeURIComponent(runId)}/assertions`);
     return z.array(TaskStageAssertionSchema).parse(data);
+}
+
+export async function fetchTaskRunArtifacts(runId: string): Promise<TaskRunArtifact[]> {
+    const { data } = await api.get(`/agent/task-runs/${encodeURIComponent(runId)}/artifacts`);
+    return z
+        .object({
+            artifacts: z.array(TaskRunArtifactSchema),
+        })
+        .parse(data).artifacts;
 }
 
 export async function fetchApprovalPolicies(limit: number = 20): Promise<ApprovalPolicy[]> {

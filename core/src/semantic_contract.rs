@@ -5,12 +5,15 @@ use std::collections::HashSet;
 pub struct SemanticContract {
     pub tokens: Vec<String>,
     pub recipients: Vec<String>,
+    #[serde(default)]
+    pub assertions: Vec<String>,
 }
 
 pub fn parse_contract(source: &str) -> SemanticContract {
     SemanticContract {
         tokens: extract_expected_tokens(source),
         recipients: extract_expected_recipients(source),
+        assertions: extract_required_assertions(source),
     }
 }
 
@@ -139,6 +142,41 @@ pub fn extract_expected_recipients(source: &str) -> Vec<String> {
     out
 }
 
+pub fn extract_required_assertions(source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let text = source.trim();
+    if text.is_empty() {
+        return out;
+    }
+
+    if let Ok(re_assertion_list) = Regex::new(
+        r#"(?i)(?:semantic[_ -]?assertions?|assertions?|필수(?:검증)?(?:항목|assertions?))\s*[:=]\s*\[([^\]]+)\]"#,
+    ) {
+        for cap in re_assertion_list.captures_iter(text) {
+            if let Some(m) = cap.get(1) {
+                for part in m.as_str().split([',', '|']) {
+                    push_assertion(&mut out, &mut seen, part);
+                }
+            }
+        }
+    }
+
+    if let Ok(re_assertion_inline) = Regex::new(
+        r#"(?i)(?:semantic[_ -]?assertions?|assertions?|필수(?:검증)?(?:항목|assertions?))\s*[:=]\s*([^\n]+)"#,
+    ) {
+        for cap in re_assertion_inline.captures_iter(text) {
+            if let Some(m) = cap.get(1) {
+                for part in m.as_str().split([',', '|']) {
+                    push_assertion(&mut out, &mut seen, part);
+                }
+            }
+        }
+    }
+
+    out
+}
+
 fn normalize_email_candidate(raw: &str) -> String {
     let mut s = normalize_text(raw).to_lowercase();
     s = s
@@ -163,6 +201,16 @@ fn normalize_text(raw: &str) -> String {
         .to_string()
 }
 
+fn normalize_assertion_key(raw: &str) -> String {
+    normalize_text(raw)
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || ['.', '_', '-', ':'].contains(c))
+        .collect::<String>()
+        .trim_matches(['.', '_', '-', ':'])
+        .to_string()
+}
+
 fn push_token(out: &mut Vec<String>, seen: &mut HashSet<String>, candidate: &str) {
     let token = normalize_text(candidate);
     if token.len() < 3 || token.len() > 120 {
@@ -173,6 +221,16 @@ fn push_token(out: &mut Vec<String>, seen: &mut HashSet<String>, candidate: &str
     }
     if seen.insert(token.clone()) {
         out.push(token);
+    }
+}
+
+fn push_assertion(out: &mut Vec<String>, seen: &mut HashSet<String>, candidate: &str) {
+    let assertion = normalize_assertion_key(candidate);
+    if assertion.len() < 3 || assertion.len() > 96 {
+        return;
+    }
+    if seen.insert(assertion.clone()) {
+        out.push(assertion);
     }
 }
 
@@ -224,5 +282,31 @@ mod tests {
             .any(|t| t.eq_ignore_ascii_case("status: in-progress")));
         assert!(tokens.iter().any(|t| t == "in-progress"));
         assert!(tokens.iter().any(|t| t == "Done"));
+    }
+
+    #[test]
+    fn assertions_extract_list_and_inline() {
+        let source = r#"semantic_assertions: [artifact.mail_sent_confirmed, artifact.notes_note_id_present]
+assertions=artifact.textedit_doc_id_present"#;
+        let assertions = extract_required_assertions(source);
+        assert!(assertions
+            .iter()
+            .any(|v| v == "artifact.mail_sent_confirmed"));
+        assert!(assertions
+            .iter()
+            .any(|v| v == "artifact.notes_note_id_present"));
+        assert!(assertions
+            .iter()
+            .any(|v| v == "artifact.textedit_doc_id_present"));
+    }
+
+    #[test]
+    fn parse_contract_includes_assertions() {
+        let source = r#"semantic_assertions: [artifact.telegram_message_id_present]"#;
+        let contract = parse_contract(source);
+        assert_eq!(
+            contract.assertions,
+            vec!["artifact.telegram_message_id_present".to_string()]
+        );
     }
 }
