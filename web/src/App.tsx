@@ -44,7 +44,14 @@ function App() {
 
   useEffect(() => {
     document.documentElement.style.backgroundColor = 'transparent'
+    document.documentElement.style.setProperty('background', 'transparent', 'important')
     document.body.style.backgroundColor = 'transparent'
+    document.body.style.setProperty('background', 'transparent', 'important')
+    const root = document.getElementById('root')
+    if (root) {
+      root.style.backgroundColor = 'transparent'
+      root.style.setProperty('background', 'transparent', 'important')
+    }
   }, [isWidget]);
 
   return (

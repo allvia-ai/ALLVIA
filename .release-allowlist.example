@@ -1,0 +1,14 @@
+# Release allowlist example
+# - one path per line (workspace-relative)
+# - comments and blank lines are ignored
+
+README.md
+core/src/api_server.rs
+core/src/controller/actions.rs
+core/src/macos/accessibility.rs
+core/src/n8n_api.rs
+core/src/outbound_policy.rs
+run_complex_scenarios.sh
+run_nl_request_with_telegram.sh
+docs/openclaw_moltbot_upgrade_plan.md
+scripts/check_release_worktree.sh

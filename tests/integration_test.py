@@ -29,6 +29,15 @@ def _http_get(url: str) -> str:
         return resp.read().decode("utf-8")
 
 
+def _collect_output(process: subprocess.Popen, timeout: int = 5) -> tuple[str, str]:
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, stderr = process.communicate()
+    return stdout, stderr
+
+
 def _wait_for_health(port: int, timeout_sec: float = 15.0) -> bool:
     start = time.time()
     url = f"http://127.0.0.1:{port}/api/health"
@@ -45,8 +54,12 @@ def _wait_for_health(port: int, timeout_sec: float = 15.0) -> bool:
 def test_integration():
     port = _find_free_port()
     env = os.environ.copy()
+    env["STEER_TEST_MODE"] = "1"
     env["STEER_LOCK_DISABLED"] = "1"
     env["STEER_DISABLE_EVENT_TAP"] = "1"
+    env["STEER_DISABLE_DOWNLOAD_WATCHER"] = "1"
+    env["STEER_DISABLE_APP_WATCHER"] = "1"
+    env["STEER_API_ALLOW_NO_KEY"] = "1"
     env["STEER_API_PORT"] = str(port)
 
     process = subprocess.Popen(
@@ -63,7 +76,9 @@ def test_integration():
     try:
         healthy = _wait_for_health(port)
         if not healthy:
-            stdout, stderr = process.communicate(timeout=5)
+            if process.poll() is None:
+                process.terminate()
+            stdout, stderr = _collect_output(process, timeout=5)
             raise AssertionError(f"API health check failed\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}")
 
         raw = _http_get(f"http://127.0.0.1:{port}/api/status")
@@ -74,17 +89,15 @@ def test_integration():
     finally:
         if process.poll() is None and process.stdin is not None:
             try:
+                if process.stdin.closed:
+                    raise ValueError("stdin already closed")
                 process.stdin.write("exit\n")
                 process.stdin.flush()
-            except BrokenPipeError:
+            except (BrokenPipeError, ValueError):
                 pass
         if process.poll() is None:
             process.terminate()
-        try:
-            process.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.communicate()
+            _collect_output(process, timeout=5)
 
 if __name__ == "__main__":
     test_integration()

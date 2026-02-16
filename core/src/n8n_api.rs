@@ -1,10 +1,11 @@
 #![allow(dead_code)]
 use anyhow::Result;
-use reqwest::Client;
+use reqwest::{Client, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,16 +54,24 @@ impl N8nRuntime {
             .unwrap_or_else(|_| "docker".to_string())
             .trim()
             .to_lowercase();
+        let test_context =
+            parse_bool_env_with_default("STEER_TEST_MODE", false) || parse_bool_env_with_default("CI", false);
         match raw.as_str() {
             "npx" => {
-                if parse_bool_env_with_default("STEER_N8N_ENABLE_NPX_RUNTIME", false) {
-                    Self::Npx
-                } else {
+                if !parse_bool_env_with_default("STEER_N8N_ENABLE_NPX_RUNTIME", false) {
                     eprintln!(
                         "⚠️ STEER_N8N_RUNTIME=npx ignored: set STEER_N8N_ENABLE_NPX_RUNTIME=1 to opt in."
                     );
-                    Self::Docker
+                    return Self::Docker;
                 }
+                if !test_context && !parse_bool_env_with_default("STEER_N8N_ALLOW_NPX_NON_TEST", false) {
+                    eprintln!(
+                        "⚠️ STEER_N8N_RUNTIME=npx ignored outside test mode. \
+Set STEER_N8N_ALLOW_NPX_NON_TEST=1 to force npx runtime."
+                    );
+                    return Self::Docker;
+                }
+                Self::Npx
             }
             "manual" | "none" => Self::Manual,
             _ => Self::Docker,
@@ -90,6 +99,42 @@ fn parse_bool_env_with_default(key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn parse_u32_env_with_default(key: &str, default: u32, min: u32, max: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map(|v| v.clamp(min, max))
+        .unwrap_or(default.clamp(min, max))
+}
+
+fn parse_u64_env_with_default(key: &str, default: u64, min: u64, max: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.clamp(min, max))
+        .unwrap_or(default.clamp(min, max))
+}
+
+fn retry_after_ms_from_status_and_body(status: StatusCode, body: &str) -> Option<u64> {
+    if status != StatusCode::TOO_MANY_REQUESTS && !status.is_server_error() {
+        return None;
+    }
+    crate::retry_policy::parse_retry_after_ms(body)
+}
+
+fn parse_f64_env_with_default(key: &str, default: f64, min: f64, max: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .map(|v| v.clamp(min, max))
+        .unwrap_or(default.clamp(min, max))
+}
+
+fn n8n_test_context() -> bool {
+    parse_bool_env_with_default("STEER_TEST_MODE", false)
+        || parse_bool_env_with_default("CI", false)
+}
+
 impl N8nApi {
     fn n8n_cli_binary_available() -> bool {
         Command::new("n8n")
@@ -108,6 +153,24 @@ impl N8nApi {
 
         let allow_npx_cli = parse_bool_env_with_default("STEER_N8N_ALLOW_NPX_CLI", false);
         if allow_npx_cli || matches!(self.runtime_mode(), N8nRuntime::Npx) {
+            let test_context = n8n_test_context();
+            if allow_npx_cli
+                && !test_context
+                && !parse_bool_env_with_default("STEER_N8N_ALLOW_NPX_CLI_NON_TEST", false)
+                && !matches!(self.runtime_mode(), N8nRuntime::Npx)
+            {
+                return Err(anyhow::anyhow!(
+                    "npx CLI fallback is test/CI-only by default. \
+Set STEER_N8N_ALLOW_NPX_CLI_NON_TEST=1 to allow outside test mode."
+                ));
+            }
+            if !self.local_target()
+                && !parse_bool_env_with_default("STEER_N8N_ALLOW_NPX_CLI_REMOTE", false)
+            {
+                return Err(anyhow::anyhow!(
+                    "npx CLI fallback is blocked for remote N8N_API_URL (set STEER_N8N_ALLOW_NPX_CLI_REMOTE=1 to override)."
+                ));
+            }
             if !parse_bool_env_with_default("STEER_N8N_ENABLE_NPX_RUNTIME", false) && !allow_npx_cli
             {
                 return Err(anyhow::anyhow!(
@@ -185,6 +248,103 @@ Set STEER_N8N_ALLOW_NPX_CLI=1 (or enable npx runtime explicitly)."
         let root_trimmed = root_url.trim_end_matches('/');
         let healthz = format!("{}/healthz", root_trimmed);
         (healthz, format!("{}/", root_trimmed))
+    }
+
+    fn http_retry_attempts(&self) -> u32 {
+        parse_u32_env_with_default("STEER_N8N_HTTP_RETRY_ATTEMPTS", 4, 1, 8)
+    }
+
+    fn http_retry_min_backoff_ms(&self) -> u64 {
+        parse_u64_env_with_default("STEER_N8N_HTTP_RETRY_MIN_BACKOFF_MS", 400, 100, 60_000)
+    }
+
+    fn http_retry_max_backoff_ms(&self) -> u64 {
+        parse_u64_env_with_default("STEER_N8N_HTTP_RETRY_MAX_BACKOFF_MS", 10_000, 500, 120_000)
+    }
+
+    fn http_retry_jitter(&self) -> f64 {
+        parse_f64_env_with_default("STEER_N8N_HTTP_RETRY_JITTER", 0.1, 0.0, 0.5)
+    }
+
+    async fn send_with_retry<F>(&self, label: &str, mut build: F) -> Result<Response>
+    where
+        F: FnMut() -> reqwest::RequestBuilder,
+    {
+        let policy = crate::retry_policy::RetryPolicy::new(
+            self.http_retry_attempts(),
+            self.http_retry_min_backoff_ms(),
+            self.http_retry_max_backoff_ms(),
+            self.http_retry_jitter(),
+        );
+
+        for attempt in 1..=policy.attempts {
+            match build().send().await {
+                Ok(resp) => {
+                    if resp.status().is_success() {
+                        return Ok(resp);
+                    }
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    let retryable = crate::retry_policy::retryable_http_status(status);
+                    if retryable && attempt < policy.attempts {
+                        let retry_after = retry_after_ms_from_status_and_body(status, &body);
+                        let delay = crate::retry_policy::compute_backoff_delay_ms(
+                            policy,
+                            attempt - 1,
+                            retry_after,
+                            label,
+                        );
+                        crate::diagnostic_events::emit(
+                            "n8n.http.retry",
+                            json!({
+                                "label": label,
+                                "attempt": attempt,
+                                "status": status.as_u16(),
+                                "delay_ms": delay,
+                                "retry_after_ms": retry_after
+                            }),
+                        );
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        continue;
+                    }
+                    return Err(anyhow::anyhow!(
+                        "{} failed (status={}): {}",
+                        label,
+                        status,
+                        body
+                    ));
+                }
+                Err(err) => {
+                    let retryable = err.is_timeout() || err.is_connect() || err.is_request();
+                    if retryable && attempt < policy.attempts {
+                        let delay = crate::retry_policy::compute_backoff_delay_ms(
+                            policy,
+                            attempt - 1,
+                            None,
+                            label,
+                        );
+                        crate::diagnostic_events::emit(
+                            "n8n.http.retry",
+                            json!({
+                                "label": label,
+                                "attempt": attempt,
+                                "error": err.to_string(),
+                                "delay_ms": delay
+                            }),
+                        );
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        continue;
+                    }
+                    return Err(anyhow::anyhow!("{} request failed: {}", label, err));
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "{} failed after {} attempt(s)",
+            label,
+            policy.attempts
+        ))
     }
 
     async fn is_server_reachable(&self, healthz: &str, root: &str) -> bool {
@@ -289,11 +449,36 @@ Set STEER_N8N_ALLOW_NPX_CLI=1 (or enable npx runtime explicitly)."
                 "npx runtime is disabled by default. Set STEER_N8N_ENABLE_NPX_RUNTIME=1 to enable."
             ));
         }
+        let test_context = n8n_test_context();
+        let requested_tunnel = crate::env_flag("STEER_N8N_USE_TUNNEL");
+        if requested_tunnel
+            && !test_context
+            && !parse_bool_env_with_default("STEER_N8N_ALLOW_NPX_TUNNEL_NON_TEST", false)
+        {
+            crate::diagnostic_events::emit(
+                "n8n.runtime.npx.blocked",
+                json!({
+                    "reason": "tunnel_non_test_blocked",
+                    "test_context": test_context
+                }),
+            );
+            return Err(anyhow::anyhow!(
+                "npx --tunnel is test/CI-only by default. \
+Set STEER_N8N_ALLOW_NPX_TUNNEL_NON_TEST=1 to override."
+            ));
+        }
         println!("⚠️  Starting n8n with npx fallback runtime...");
         let mut args = vec!["-y", "n8n", "start"];
-        if crate::env_flag("STEER_N8N_USE_TUNNEL") {
+        if requested_tunnel {
             args.push("--tunnel");
         }
+        crate::diagnostic_events::emit(
+            "n8n.runtime.npx.start",
+            json!({
+                "tunnel": requested_tunnel,
+                "test_context": test_context
+            }),
+        );
 
         Command::new("npx")
             .args(args)
@@ -438,11 +623,12 @@ Set STEER_N8N_ALLOW_NPX_CLI=1 (or enable npx runtime explicitly)."
         let url = format!("{}/workflows?limit=1", self.base_url);
 
         let resp = self
-            .client
-            .get(&url)
-            .header("X-N8N-API-KEY", &self.api_key)
-            .timeout(std::time::Duration::from_secs(3))
-            .send()
+            .send_with_retry("n8n verify_auth", || {
+                self.client
+                    .get(&url)
+                    .header("X-N8N-API-KEY", &self.api_key)
+                    .timeout(std::time::Duration::from_secs(3))
+            })
             .await?;
 
         if resp.status().is_success() {
@@ -471,10 +657,9 @@ Set STEER_N8N_ALLOW_NPX_CLI=1 (or enable npx runtime explicitly)."
 
         let url = format!("{}/credentials", self.base_url);
         let resp = self
-            .client
-            .get(&url)
-            .header("X-N8N-API-KEY", &self.api_key)
-            .send()
+            .send_with_retry("n8n list_credentials", || {
+                self.client.get(&url).header("X-N8N-API-KEY", &self.api_key)
+            })
             .await?;
 
         if !resp.status().is_success() {
@@ -623,12 +808,14 @@ Set STEER_N8N_ALLOW_NPX_CLI=1 (or enable npx runtime explicitly)."
         // NOTE: Some n8n versions reject `active` as read-only on create.
         // We always create inactive here; activation can be done via a separate endpoint if needed.
 
+        let body_for_req = body.clone();
         let resp = self
-            .client
-            .post(&url)
-            .header("X-N8N-API-KEY", &self.api_key)
-            .json(&body)
-            .send()
+            .send_with_retry("n8n create_workflow", || {
+                self.client
+                    .post(&url)
+                    .header("X-N8N-API-KEY", &self.api_key)
+                    .json(&body_for_req)
+            })
             .await?;
 
         if !resp.status().is_success() {
@@ -656,12 +843,14 @@ Set STEER_N8N_ALLOW_NPX_CLI=1 (or enable npx runtime explicitly)."
 
     async fn update_workflow_active(&self, id: &str, active: bool) -> Result<()> {
         let url = format!("{}/workflows/{}", self.base_url, id);
+        let active_body = json!({ "active": active });
         let resp = self
-            .client
-            .patch(&url)
-            .header("X-N8N-API-KEY", &self.api_key)
-            .json(&json!({ "active": active }))
-            .send()
+            .send_with_retry("n8n update_workflow_active", || {
+                self.client
+                    .patch(&url)
+                    .header("X-N8N-API-KEY", &self.api_key)
+                    .json(&active_body)
+            })
             .await?;
         if !resp.status().is_success() {
             let error_text = resp.text().await?;
@@ -907,12 +1096,12 @@ Set STEER_N8N_ALLOW_NAME_ID_FALLBACK=1 to allow name-based fallback.",
     /// Activate a workflow
     pub async fn activate_workflow(&self, id: &str) -> Result<()> {
         let url = format!("{}/workflows/{}/activate", self.base_url, id);
-
         let resp = self
-            .client
-            .post(&url)
-            .header("X-N8N-API-KEY", &self.api_key)
-            .send()
+            .send_with_retry("n8n activate_workflow", || {
+                self.client
+                    .post(&url)
+                    .header("X-N8N-API-KEY", &self.api_key)
+            })
             .await?;
 
         if !resp.status().is_success() {
@@ -925,12 +1114,12 @@ Set STEER_N8N_ALLOW_NAME_ID_FALLBACK=1 to allow name-based fallback.",
     /// Deactivate a workflow
     pub async fn deactivate_workflow(&self, id: &str) -> Result<()> {
         let url = format!("{}/workflows/{}/deactivate", self.base_url, id);
-
         let resp = self
-            .client
-            .post(&url)
-            .header("X-N8N-API-KEY", &self.api_key)
-            .send()
+            .send_with_retry("n8n deactivate_workflow", || {
+                self.client
+                    .post(&url)
+                    .header("X-N8N-API-KEY", &self.api_key)
+            })
             .await?;
 
         if !resp.status().is_success() {
@@ -943,12 +1132,10 @@ Set STEER_N8N_ALLOW_NAME_ID_FALLBACK=1 to allow name-based fallback.",
     /// Get workflow status
     pub async fn get_workflow(&self, id: &str) -> Result<WorkflowStatus> {
         let url = format!("{}/workflows/{}", self.base_url, id);
-
         let resp = self
-            .client
-            .get(&url)
-            .header("X-N8N-API-KEY", &self.api_key)
-            .send()
+            .send_with_retry("n8n get_workflow", || {
+                self.client.get(&url).header("X-N8N-API-KEY", &self.api_key)
+            })
             .await?;
 
         if !resp.status().is_success() {
@@ -969,12 +1156,10 @@ Set STEER_N8N_ALLOW_NAME_ID_FALLBACK=1 to allow name-based fallback.",
     /// List all workflows
     pub async fn list_workflows(&self) -> Result<Vec<WorkflowStatus>> {
         let url = format!("{}/workflows", self.base_url);
-
         let resp = self
-            .client
-            .get(&url)
-            .header("X-N8N-API-KEY", &self.api_key)
-            .send()
+            .send_with_retry("n8n list_workflows", || {
+                self.client.get(&url).header("X-N8N-API-KEY", &self.api_key)
+            })
             .await?;
 
         if !resp.status().is_success() {
@@ -1004,13 +1189,14 @@ Set STEER_N8N_ALLOW_NAME_ID_FALLBACK=1 to allow name-based fallback.",
     /// Execute a workflow manually
     pub async fn execute_workflow(&self, id: &str) -> Result<ExecutionResult> {
         let url = format!("{}/workflows/{}/run", self.base_url, id);
-
+        let run_body = json!({});
         let resp = self
-            .client
-            .post(&url)
-            .header("X-N8N-API-KEY", &self.api_key)
-            .json(&json!({}))
-            .send()
+            .send_with_retry("n8n execute_workflow", || {
+                self.client
+                    .post(&url)
+                    .header("X-N8N-API-KEY", &self.api_key)
+                    .json(&run_body)
+            })
             .await?;
 
         if !resp.status().is_success() {
@@ -1040,10 +1226,9 @@ Set STEER_N8N_ALLOW_NAME_ID_FALLBACK=1 to allow name-based fallback.",
         );
 
         let resp = self
-            .client
-            .get(&url)
-            .header("X-N8N-API-KEY", &self.api_key)
-            .send()
+            .send_with_retry("n8n list_executions", || {
+                self.client.get(&url).header("X-N8N-API-KEY", &self.api_key)
+            })
             .await?;
 
         if !resp.status().is_success() {
@@ -1073,12 +1258,12 @@ Set STEER_N8N_ALLOW_NAME_ID_FALLBACK=1 to allow name-based fallback.",
     /// Delete a workflow
     pub async fn delete_workflow(&self, id: &str) -> Result<()> {
         let url = format!("{}/workflows/{}", self.base_url, id);
-
         let resp = self
-            .client
-            .delete(&url)
-            .header("X-N8N-API-KEY", &self.api_key)
-            .send()
+            .send_with_retry("n8n delete_workflow", || {
+                self.client
+                    .delete(&url)
+                    .header("X-N8N-API-KEY", &self.api_key)
+            })
             .await?;
 
         if !resp.status().is_success() {

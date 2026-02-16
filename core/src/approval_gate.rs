@@ -679,12 +679,49 @@ mod tests {
     fn test_evaluate_approval_ask_fallback_allow_once() {
         reset_decisions();
         std::env::set_var("STEER_APPROVAL_ASK_FALLBACK", "allow-once");
+        std::env::set_var("STEER_TEST_MODE", "1");
         let plan = test_plan(&format!("plan-fallback-allow-{}", uuid::Uuid::new_v4()));
         let action = r#"{"action":"shell","command":"sudo apt install git"}"#;
         let decision = evaluate_approval(action, &plan);
         assert_eq!(decision.status, "approved");
         assert!(!decision.requires_approval);
         assert_eq!(decision.policy, "ask_fallback_allow_once");
+        std::env::remove_var("STEER_TEST_MODE");
+        std::env::remove_var("STEER_APPROVAL_ASK_FALLBACK");
+    }
+
+    #[test]
+    #[serial]
+    fn test_evaluate_approval_allow_once_blocked_outside_test() {
+        reset_decisions();
+        std::env::set_var("STEER_APPROVAL_ASK_FALLBACK", "allow-once");
+        std::env::remove_var("STEER_TEST_MODE");
+        std::env::remove_var("CI");
+        std::env::remove_var("STEER_APPROVAL_ALLOW_ONCE_NON_TEST");
+        let plan = test_plan(&format!("plan-fallback-allow-blocked-{}", uuid::Uuid::new_v4()));
+        let action = r#"{"action":"shell","command":"sudo apt install git"}"#;
+        let decision = evaluate_approval(action, &plan);
+        assert_eq!(decision.status, "denied");
+        assert!(decision.requires_approval);
+        assert_eq!(decision.policy, "ask_fallback_allow_once_blocked_non_test");
+        std::env::remove_var("STEER_APPROVAL_ASK_FALLBACK");
+    }
+
+    #[test]
+    #[serial]
+    fn test_evaluate_approval_allow_once_non_test_override() {
+        reset_decisions();
+        std::env::set_var("STEER_APPROVAL_ASK_FALLBACK", "allow-once");
+        std::env::remove_var("STEER_TEST_MODE");
+        std::env::remove_var("CI");
+        std::env::set_var("STEER_APPROVAL_ALLOW_ONCE_NON_TEST", "1");
+        let plan = test_plan(&format!("plan-fallback-allow-non-test-{}", uuid::Uuid::new_v4()));
+        let action = r#"{"action":"shell","command":"sudo apt install git"}"#;
+        let decision = evaluate_approval(action, &plan);
+        assert_eq!(decision.status, "approved");
+        assert!(!decision.requires_approval);
+        assert_eq!(decision.policy, "ask_fallback_allow_once");
+        std::env::remove_var("STEER_APPROVAL_ALLOW_ONCE_NON_TEST");
         std::env::remove_var("STEER_APPROVAL_ASK_FALLBACK");
     }
 
@@ -990,6 +1027,11 @@ fn approval_ask_fallback_mode() -> String {
         .unwrap_or_else(|| "deny".to_string())
 }
 
+fn approval_ask_fallback_allow_once_permitted() -> bool {
+    let in_test_context = crate::env_flag("STEER_TEST_MODE") || crate::env_flag("CI");
+    in_test_context || crate::env_flag("STEER_APPROVAL_ALLOW_ONCE_NON_TEST")
+}
+
 fn apply_pending_ask_fallback(mut decision: ApprovalDecision) -> ApprovalDecision {
     if !(decision.requires_approval && decision.status == "pending") {
         return decision;
@@ -997,10 +1039,38 @@ fn apply_pending_ask_fallback(mut decision: ApprovalDecision) -> ApprovalDecisio
     match approval_ask_fallback_mode().as_str() {
         "ask" | "pending" => decision,
         "allow" | "allow-once" | "allow_once" | "allow-once-only" => {
-            decision.status = "approved".to_string();
-            decision.requires_approval = false;
-            decision.policy = "ask_fallback_allow_once".to_string();
-            decision.message = format!("{} [ask_fallback=allow-once]", decision.message);
+            if approval_ask_fallback_allow_once_permitted() {
+                decision.status = "approved".to_string();
+                decision.requires_approval = false;
+                decision.policy = "ask_fallback_allow_once".to_string();
+                decision.message = format!("{} [ask_fallback=allow-once]", decision.message);
+                crate::diagnostic_events::emit(
+                    "approval.ask_fallback",
+                    serde_json::json!({
+                        "mode": "allow_once",
+                        "policy": decision.policy,
+                        "status": decision.status,
+                        "requires_approval": decision.requires_approval
+                    }),
+                );
+                return decision;
+            }
+            decision.status = "denied".to_string();
+            decision.requires_approval = true;
+            decision.policy = "ask_fallback_allow_once_blocked_non_test".to_string();
+            decision.message = format!(
+                "{} [ask_fallback=allow-once blocked outside test mode]",
+                decision.message
+            );
+            crate::diagnostic_events::emit(
+                "approval.ask_fallback",
+                serde_json::json!({
+                    "mode": "allow_once",
+                    "policy": decision.policy,
+                    "status": decision.status,
+                    "requires_approval": decision.requires_approval
+                }),
+            );
             decision
         }
         _ => {
@@ -1008,6 +1078,15 @@ fn apply_pending_ask_fallback(mut decision: ApprovalDecision) -> ApprovalDecisio
             decision.requires_approval = true;
             decision.policy = "ask_fallback_deny".to_string();
             decision.message = format!("{} [ask_fallback=deny]", decision.message);
+            crate::diagnostic_events::emit(
+                "approval.ask_fallback",
+                serde_json::json!({
+                    "mode": "deny",
+                    "policy": decision.policy,
+                    "status": decision.status,
+                    "requires_approval": decision.requires_approval
+                }),
+            );
             decision
         }
     }

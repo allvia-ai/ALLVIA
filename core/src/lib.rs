@@ -13,6 +13,7 @@ pub mod mcp_client;
 pub mod monitor;
 pub mod n8n_api;
 pub mod notifier;
+pub mod outbound_policy;
 pub mod peekaboo_cli;
 pub mod permission_manager;
 pub mod policy;
@@ -46,7 +47,9 @@ pub mod workflow_schema;
 pub mod collector_pipeline;
 pub mod command_queue;
 pub mod context_pruning;
+pub mod diagnostic_events;
 pub mod project_scanner;
+pub mod retry_policy;
 pub mod runtime_verification;
 pub mod tool_policy;
 

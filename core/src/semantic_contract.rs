@@ -42,6 +42,13 @@ pub fn extract_expected_tokens(source: &str) -> Vec<String> {
         }
     }
 
+    // Keep explicit email-like payloads as semantic tokens too, not only recipients.
+    if let Ok(re_email) = Regex::new(r#"(?i)[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"#) {
+        for m in re_email.find_iter(text) {
+            push_token(&mut out, &mut seen, m.as_str());
+        }
+    }
+
     if let Ok(re_semantic_list) =
         Regex::new(r#"(?i)(?:semantic[_ -]?tokens?|의미(?:검증)?(?:토큰)?)\s*[:=]\s*\[([^\]]+)\]"#)
     {
@@ -201,6 +208,25 @@ fn normalize_text(raw: &str) -> String {
         .to_string()
 }
 
+fn normalize_token_candidate(raw: &str) -> String {
+    let mut token = normalize_text(raw);
+    // Korean postpositions can be attached to emails in natural prompts, e.g. qed@gmail.com"를.
+    // Preserve non-email tokens as-is, but normalize email-like tokens strictly.
+    if token.contains('@') {
+        if let Ok(re_email) = Regex::new(r#"(?i)[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"#)
+        {
+            if let Some(m) = re_email.find(&token) {
+                token = normalize_email_candidate(m.as_str());
+            } else {
+                token = normalize_email_candidate(&token);
+            }
+        } else {
+            token = normalize_email_candidate(&token);
+        }
+    }
+    token
+}
+
 fn normalize_assertion_key(raw: &str) -> String {
     normalize_text(raw)
         .to_lowercase()
@@ -212,7 +238,7 @@ fn normalize_assertion_key(raw: &str) -> String {
 }
 
 fn push_token(out: &mut Vec<String>, seen: &mut HashSet<String>, candidate: &str) {
-    let token = normalize_text(candidate);
+    let token = normalize_token_candidate(candidate);
     if token.len() < 3 || token.len() > 120 {
         return;
     }
@@ -282,6 +308,14 @@ mod tests {
             .any(|t| t.eq_ignore_ascii_case("status: in-progress")));
         assert!(tokens.iter().any(|t| t == "in-progress"));
         assert!(tokens.iter().any(|t| t == "Done"));
+    }
+
+    #[test]
+    fn tokens_strip_korean_particle_from_email_token() {
+        let source = r#"받는 사람에 qed4950@gmail.com를 입력하고 기록 토큰에도 qed4950@gmail.com를 포함"#;
+        let tokens = extract_expected_tokens(source);
+        assert!(tokens.iter().any(|t| t == "qed4950@gmail.com"));
+        assert!(!tokens.iter().any(|t| t.contains("gmail.com를")));
     }
 
     #[test]

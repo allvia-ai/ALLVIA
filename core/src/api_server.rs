@@ -155,6 +155,10 @@ pub struct AgentPlanResponse {
 pub struct AgentExecuteRequest {
     pub plan_id: String,
     pub profile: Option<AgentExecutionProfile>,
+    #[serde(default)]
+    pub resume_from: Option<usize>,
+    #[serde(default)]
+    pub resume_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -237,6 +241,44 @@ pub struct AgentStageDodCheck {
     pub passed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedResumeToken {
+    plan_id: String,
+    step_index: usize,
+    reason: String,
+}
+
+fn parse_resume_token(raw: &str) -> Result<ParsedResumeToken, String> {
+    let token = raw.trim();
+    if token.is_empty() {
+        return Err("resume_token is empty".to_string());
+    }
+    let parts: Vec<&str> = token.splitn(5, ':').collect();
+    if parts.len() < 5 {
+        return Err("resume_token format invalid".to_string());
+    }
+    if parts[0] != "resume" {
+        return Err("resume_token prefix invalid".to_string());
+    }
+    let plan_id = parts[1].trim();
+    if plan_id.is_empty() {
+        return Err("resume_token plan_id is empty".to_string());
+    }
+    let step_index = parts[2]
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| "resume_token step index invalid".to_string())?;
+    let reason = parts[3].trim();
+    if reason.is_empty() {
+        return Err("resume_token reason is empty".to_string());
+    }
+    Ok(ParsedResumeToken {
+        plan_id: plan_id.to_string(),
+        step_index,
+        reason: reason.to_string(),
+    })
 }
 
 #[derive(Deserialize)]
@@ -432,6 +474,15 @@ pub struct RuntimeDbPathsResponse {
     pub allow_mismatch: bool,
 }
 
+#[derive(Serialize)]
+pub struct LockMetricsResponse {
+    pub acquired: u64,
+    pub bypassed: u64,
+    pub blocked: u64,
+    pub stale_recovered: u64,
+    pub rejected: u64,
+}
+
 #[derive(Deserialize)]
 pub struct RuntimeVerifyRequest {
     pub workdir: Option<String>,
@@ -520,6 +571,8 @@ async fn auth_middleware(
     }
 
     let api_key = std::env::var("STEER_API_KEY").unwrap_or_default();
+    let request_path = req.uri().path().to_string();
+    let request_method = req.method().to_string();
 
     // Require explicit opt-in for no-key local development mode.
     if api_key.is_empty() {
@@ -546,22 +599,47 @@ async fn auth_middleware(
                 || origin.starts_with("http://127.0.0.1")
                 || origin.starts_with("https://localhost")
                 || origin.starts_with("https://127.0.0.1");
-            let dev_header_required = std::env::var("STEER_API_DEV_HEADER_VALUE")
+            // No-key dev mode requires an explicit, user-provided local header secret.
+            let dev_header_expected = std::env::var("STEER_API_DEV_HEADER_VALUE")
                 .ok()
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty());
-            let dev_header_ok = if let Some(expected) = dev_header_required.as_ref() {
-                req.headers()
-                    .get("x-steer-dev")
-                    .and_then(|h| h.to_str().ok())
-                    .map(|provided| provided == expected)
-                    .unwrap_or(false)
-            } else {
-                true
-            };
+            let dev_header_configured = dev_header_expected.is_some();
+            let dev_header_ok = req
+                .headers()
+                .get("x-steer-dev")
+                .and_then(|h| h.to_str().ok())
+                .map(|provided| {
+                    dev_header_expected
+                        .as_ref()
+                        .map(|expected| provided.trim() == expected)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
             if localhost_only && origin_ok && dev_header_ok {
                 return Ok(next.run(req).await);
             }
+            crate::diagnostic_events::emit(
+                "api.auth.denied",
+                serde_json::json!({
+                    "reason": "no_key_dev_policy_failed",
+                    "path": request_path,
+                    "method": request_method,
+                    "localhost_only": localhost_only,
+                    "origin_ok": origin_ok,
+                    "dev_header_configured": dev_header_configured,
+                    "dev_header_ok": dev_header_ok
+                }),
+            );
+        } else {
+            crate::diagnostic_events::emit(
+                "api.auth.denied",
+                serde_json::json!({
+                    "reason": "no_key_mode_not_allowed",
+                    "path": request_path,
+                    "method": request_method
+                }),
+            );
         }
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -581,7 +659,17 @@ async fn auth_middleware(
 
     match auth_header.or(x_api_key) {
         Some(key) if key == api_key => Ok(next.run(req).await),
-        _ => Err(StatusCode::UNAUTHORIZED),
+        _ => {
+            crate::diagnostic_events::emit(
+                "api.auth.denied",
+                serde_json::json!({
+                    "reason": "api_key_mismatch_or_missing",
+                    "path": request_path,
+                    "method": request_method
+                }),
+            );
+            Err(StatusCode::UNAUTHORIZED)
+        }
     }
 }
 
@@ -707,6 +795,7 @@ pub async fn start_api_server(
             get(list_collector_handoff_receipts_handler),
         )
         .route("/api/system/db-paths", get(runtime_db_paths_handler))
+        .route("/api/system/lock-metrics", get(lock_metrics_handler))
         .route(
             "/api/workflow/provision-ops",
             get(list_workflow_provision_ops_handler),
@@ -802,7 +891,7 @@ async fn health_check() -> &'static str {
 async fn get_system_status() -> Json<SystemStatus> {
     let mut sys = System::new_all();
     sys.refresh_cpu(); // First refresh just gathers data
-    std::thread::sleep(std::time::Duration::from_millis(200)); // Sleep minimal amount for CPU calculation
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await; // Non-blocking wait for CPU delta
     sys.refresh_cpu(); // Second refresh calculates usage
     sys.refresh_memory();
 
@@ -817,26 +906,63 @@ async fn get_system_status() -> Json<SystemStatus> {
     })
 }
 
-async fn get_recent_logs() -> Json<Vec<LogEntry>> {
-    // Fetch routines from DB and convert last_run to LogEntry
-    match crate::db::get_all_routines() {
-        Ok(routines) => {
-            let mut logs = Vec::new();
-            for r in routines {
-                if let Some(last) = r.last_run {
-                    logs.push(LogEntry {
-                        timestamp: last,
-                        level: "INFO".to_string(),
-                        message: format!("Routine Executed: {}", r.name),
-                    });
-                }
-            }
-            // Sort by timestamp desc
-            logs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-            Json(logs)
-        }
-        Err(_) => Json(vec![]),
+fn truncate_log_message(raw: &str, max_chars: usize) -> String {
+    if raw.chars().count() <= max_chars {
+        return raw.to_string();
     }
+    let mut out = String::new();
+    for ch in raw.chars().take(max_chars.saturating_sub(1)) {
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
+async fn get_recent_logs() -> Json<Vec<LogEntry>> {
+    let mut logs: Vec<LogEntry> = Vec::new();
+
+    if let Ok(task_runs) = crate::db::list_task_runs(40, None) {
+        for run in task_runs {
+            let level = match run.status.as_str() {
+                "failed" | "blocked" | "error" => "ERROR",
+                "manual_required" | "approval_required" => "WARN",
+                _ => "INFO",
+            };
+            let summary = run.summary.unwrap_or_else(|| "-".to_string());
+            let message = format!(
+                "task_run status={} intent={} run_id={} summary={}",
+                run.status,
+                run.intent,
+                run.run_id,
+                truncate_log_message(&summary, 180)
+            );
+            logs.push(LogEntry {
+                timestamp: run.created_at,
+                level: level.to_string(),
+                message,
+            });
+        }
+    }
+
+    if let Ok(verification_runs) = crate::db::list_verification_runs(20) {
+        for verification in verification_runs {
+            logs.push(LogEntry {
+                timestamp: verification.created_at,
+                level: if verification.ok { "INFO" } else { "WARN" }.to_string(),
+                message: truncate_log_message(
+                    &format!(
+                        "verification kind={} ok={} summary={}",
+                        verification.kind, verification.ok, verification.summary
+                    ),
+                    200,
+                ),
+            });
+        }
+    }
+
+    logs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    logs.truncate(80);
+    Json(logs)
 }
 
 async fn get_system_health() -> Json<crate::dependency_check::SystemHealth> {
@@ -1034,6 +1160,65 @@ async fn agent_preflight_handler() -> Json<AgentPreflightResponse> {
                 message: format!("Accessibility unavailable: {}", err),
             });
         }
+    }
+
+    if env_truthy_default("STEER_PREFLIGHT_AX_SNAPSHOT", true) {
+        let snapshot = crate::macos::accessibility::snapshot(None);
+        let warning = snapshot
+            .get("warning")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let error = snapshot
+            .get("error")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let app_title = snapshot
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let strict_mode = snapshot
+            .get("strict_mode")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let snap_ok = warning.is_none() && error.is_none();
+        if !snap_ok {
+            all_ok = false;
+        }
+        let mut message = if snap_ok {
+            "Accessibility snapshot ready".to_string()
+        } else if let Some(err) = error.clone() {
+            format!("Accessibility snapshot blocked: {}", err)
+        } else {
+            format!(
+                "Accessibility snapshot warning: {}",
+                warning.clone().unwrap_or_else(|| "unknown".to_string())
+            )
+        };
+        if strict_mode {
+            message.push_str(" (strict)");
+        }
+        checks.push(AgentPreflightCheckItem {
+            key: "accessibility_snapshot".to_string(),
+            label: "Accessibility Snapshot".to_string(),
+            ok: snap_ok,
+            expected: Some("focused app + focused window".to_string()),
+            actual: if app_title.is_empty() {
+                warning.clone().or(error.clone())
+            } else {
+                Some(app_title)
+            },
+            message,
+        });
+    } else {
+        checks.push(AgentPreflightCheckItem {
+            key: "accessibility_snapshot".to_string(),
+            label: "Accessibility Snapshot".to_string(),
+            ok: true,
+            expected: Some("focused app + focused window".to_string()),
+            actual: Some("skipped".to_string()),
+            message: "Snapshot check disabled by env".to_string(),
+        });
     }
 
     let shot_path = format!("/tmp/steer_agent_preflight_{}.png", std::process::id());
@@ -2432,6 +2617,17 @@ async fn runtime_db_paths_handler() -> Json<RuntimeDbPathsResponse> {
     })
 }
 
+async fn lock_metrics_handler() -> Json<LockMetricsResponse> {
+    let snapshot = crate::singleton_lock::lock_metrics_snapshot();
+    Json(LockMetricsResponse {
+        acquired: snapshot.acquired,
+        bypassed: snapshot.bypassed,
+        blocked: snapshot.blocked,
+        stale_recovered: snapshot.stale_recovered,
+        rejected: snapshot.rejected,
+    })
+}
+
 async fn list_workflow_provision_ops_handler(
     Query(query): Query<WorkflowProvisionOpsQuery>,
 ) -> Json<Vec<db::WorkflowProvisionOpRecord>> {
@@ -2873,8 +3069,85 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
         }
     }
 
-    let mut resume_from = nl_store::get_plan_progress(&plan.plan_id).unwrap_or(0);
+    let mut resume_from = payload
+        .resume_from
+        .unwrap_or_else(|| nl_store::get_plan_progress(&plan.plan_id).unwrap_or(0));
+    let mut resume_hint: Option<String> = payload
+        .resume_from
+        .map(|idx| format!("resume_from_override={}", idx));
+
+    if let Some(raw_token) = payload
+        .resume_token
+        .as_ref()
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+    {
+        match parse_resume_token(raw_token) {
+            Ok(parsed) => {
+                if parsed.plan_id != plan.plan_id {
+                    crate::diagnostic_events::emit(
+                        "agent.resume_token.invalid",
+                        json!({
+                            "reason": "plan_id_mismatch",
+                            "request_plan_id": plan.plan_id,
+                            "token_plan_id": parsed.plan_id
+                        }),
+                    );
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": "resume_token_plan_mismatch",
+                            "plan_id": plan.plan_id
+                        })),
+                    )
+                        .into_response();
+                }
+                resume_from = parsed.step_index;
+                resume_hint = Some(format!(
+                    "resume_token(reason={}, step={})",
+                    parsed.reason, parsed.step_index
+                ));
+            }
+            Err(err) => {
+                crate::diagnostic_events::emit(
+                    "agent.resume_token.invalid",
+                    json!({
+                        "reason": "parse_error",
+                        "detail": err
+                    }),
+                );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "resume_token_invalid",
+                        "detail": err
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     if resume_from >= plan.steps.len() {
+        if payload.resume_from.is_some() || payload.resume_token.is_some() {
+            crate::diagnostic_events::emit(
+                "agent.resume_token.invalid",
+                json!({
+                    "reason": "step_out_of_range",
+                    "step_index": resume_from,
+                    "plan_steps": plan.steps.len()
+                }),
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "resume_step_out_of_range",
+                    "step_index": resume_from,
+                    "plan_steps": plan.steps.len()
+                })),
+            )
+                .into_response();
+        }
         nl_store::clear_plan_progress(&plan.plan_id);
         resume_from = 0;
     }
@@ -2888,6 +3161,9 @@ async fn agent_execute_handler(Json(payload): Json<AgentExecuteRequest>) -> impl
         execution_profile.as_str(),
         execution_options.input_collision_policy.as_str()
     ));
+    if let Some(hint) = resume_hint {
+        result.logs.push(format!("Resume hint: {}", hint));
+    }
     if resume_from > 0 {
         result
             .logs
@@ -5042,5 +5318,35 @@ mod tests {
             .reasons
             .iter()
             .any(|r| r.contains("final_status=error")));
+    }
+
+    #[test]
+    fn parse_resume_token_accepts_valid_shape() {
+        let parsed = parse_resume_token("resume:plan-123:2:user_approved:1700000000")
+            .expect("resume token should parse");
+        assert_eq!(parsed.plan_id, "plan-123");
+        assert_eq!(parsed.step_index, 2);
+        assert_eq!(parsed.reason, "user_approved");
+    }
+
+    #[test]
+    fn parse_resume_token_rejects_invalid_prefix() {
+        let err = parse_resume_token("token:plan-123:2:user_approved:1700000000")
+            .expect_err("invalid prefix must fail");
+        assert!(err.contains("prefix invalid"));
+    }
+
+    #[test]
+    fn parse_resume_token_rejects_invalid_step() {
+        let err = parse_resume_token("resume:plan-123:x:user_approved:1700000000")
+            .expect_err("non-numeric step must fail");
+        assert!(err.contains("step index invalid"));
+    }
+
+    #[test]
+    fn parse_resume_token_rejects_empty_reason() {
+        let err = parse_resume_token("resume:plan-123:2::1700000000")
+            .expect_err("empty reason must fail");
+        assert!(err.contains("reason is empty"));
     }
 }

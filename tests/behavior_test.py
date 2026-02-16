@@ -1,7 +1,10 @@
 import os
+import selectors
 import socket
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 
@@ -21,12 +24,17 @@ def _ensure_core_binary() -> str:
     return "./target/debug/local_os_agent"
 
 
-def _spawn_core() -> subprocess.Popen:
+def _spawn_core() -> tuple[subprocess.Popen, int]:
     env = os.environ.copy()
+    env["STEER_TEST_MODE"] = "1"
     env["STEER_LOCK_DISABLED"] = "1"
     env["STEER_DISABLE_EVENT_TAP"] = "1"
-    env["STEER_API_PORT"] = str(_find_free_port())
-    return subprocess.Popen(
+    env["STEER_DISABLE_DOWNLOAD_WATCHER"] = "1"
+    env["STEER_DISABLE_APP_WATCHER"] = "1"
+    env["STEER_API_ALLOW_NO_KEY"] = "1"
+    port = _find_free_port()
+    env["STEER_API_PORT"] = str(port)
+    process = subprocess.Popen(
         [_ensure_core_binary()],
         cwd="./core",
         stdin=subprocess.PIPE,
@@ -36,10 +44,86 @@ def _spawn_core() -> subprocess.Popen:
         bufsize=1,
         env=env,
     )
+    return process, port
+
+
+def _wait_for_health(port: int, timeout_sec: float = 15.0) -> bool:
+    start = time.time()
+    url = f"http://127.0.0.1:{port}/api/health"
+    while time.time() - start < timeout_sec:
+        try:
+            with urllib.request.urlopen(url, timeout=2) as resp:
+                if resp.read().decode("utf-8").strip() == "ok":
+                    return True
+        except (urllib.error.URLError, TimeoutError):
+            pass
+        time.sleep(0.3)
+    return False
+
+
+def _collect_output(process: subprocess.Popen, timeout: int = 5) -> tuple[str, str]:
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, stderr = process.communicate()
+    return stdout, stderr
+
+
+def _drain_stdout_nonblocking(process: subprocess.Popen, timeout_sec: float = 0.3) -> str:
+    if process.stdout is None:
+        return ""
+    collected: list[str] = []
+    fd = process.stdout.fileno()
+    try:
+        os.set_blocking(fd, False)
+    except OSError:
+        pass
+    selector = selectors.DefaultSelector()
+    try:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        end = time.time() + timeout_sec
+        while time.time() < end:
+            events = selector.select(timeout=0.1)
+            if not events:
+                continue
+            for _key, _ in events:
+                try:
+                    chunk = os.read(fd, 4096)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    continue
+                collected.append(chunk.decode("utf-8", errors="replace"))
+    finally:
+        selector.close()
+    return "".join(collected)
+
+
+def _wait_for_stdout_pattern(
+    process: subprocess.Popen,
+    pattern: str,
+    timeout_sec: float = 8.0,
+) -> tuple[bool, str]:
+    start = time.time()
+    collected = ""
+    while time.time() - start < timeout_sec:
+        collected += _drain_stdout_nonblocking(process, timeout_sec=0.25)
+        if pattern in collected:
+            return True, collected
+        if process.poll() is not None:
+            break
+        time.sleep(0.05)
+    return pattern in collected, collected
 
 def test_behavior_analysis():
-    process = _spawn_core()
-    time.sleep(2)
+    process, port = _spawn_core()
+    streamed_stdout = ""
+    if not _wait_for_health(port, timeout_sec=20):
+        if process.poll() is None:
+            process.terminate()
+        stdout, stderr = _collect_output(process, timeout=5)
+        raise AssertionError(f"core failed to become healthy\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}")
 
     if process.poll() is not None:
         stdout, stderr = process.communicate()
@@ -48,20 +132,26 @@ def test_behavior_analysis():
     assert process.stdin is not None
     process.stdin.write("unlock\n")
     process.stdin.flush()
-    time.sleep(1)
+    _wait_for_stdout_pattern(process, "Agent unlocked", timeout_sec=3)
 
     for _ in range(25):
         process.stdin.write("fake_log\n")
         process.stdin.flush()
-        time.sleep(0.1)
+    matched, streamed_stdout = _wait_for_stdout_pattern(
+        process,
+        "Simulated Log Sent",
+        timeout_sec=10,
+    )
+    if not matched:
+        streamed_stdout += _drain_stdout_nonblocking(process, timeout_sec=0.4)
 
-    time.sleep(2)
     process.terminate()
     try:
         stdout, stderr = process.communicate(timeout=10)
     except subprocess.TimeoutExpired:
         process.kill()
         stdout, stderr = process.communicate()
+    stdout = f"{streamed_stdout}{stdout}"
 
     with open("behavior_test_output.txt", "w") as file:
         file.write(stdout)

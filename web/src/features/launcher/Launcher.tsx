@@ -28,10 +28,12 @@ import {
     fetchTaskRunStages,
     fetchTaskRunAssertions,
     fetchTaskRunArtifacts,
+    fetchLockMetrics,
 } from "@/lib/api";
 import type {
     AgentPreflightCheck,
     ExecutionProfile,
+    LockMetrics,
     TaskRunArtifact,
     TaskStageAssertion,
     TaskStageRun,
@@ -73,6 +75,7 @@ type RunPhase =
 type ExecutionSnapshot = {
     status: string;
     runId: string | null;
+    resumeToken: string | null;
     plannerComplete: boolean;
     executionComplete: boolean;
     businessComplete: boolean;
@@ -264,11 +267,7 @@ export default function Launcher() {
         const raw = window.localStorage.getItem("steer.compact_layout_mode");
         return raw == null ? true : raw === "1";
     });
-    const [showAdvancedControls, setShowAdvancedControls] = useState<boolean>(() => {
-        if (typeof window === "undefined") return false;
-        const raw = window.localStorage.getItem("steer.launcher_show_advanced");
-        return raw === "1";
-    });
+    const [showAdvancedControls, setShowAdvancedControls] = useState<boolean>(false);
     const [showDetailPanel, setShowDetailPanel] = useState(false);
     const [results, setResults] = useState<LauncherResult[]>([]);
     const [loading, setLoading] = useState(false);
@@ -321,6 +320,8 @@ export default function Launcher() {
     const [preflightFixBusy, setPreflightFixBusy] = useState<string | null>(null);
     const [preflightFixMessage, setPreflightFixMessage] = useState<string | null>(null);
     const [showDiagnostics, setShowDiagnostics] = useState(false);
+    const [lockMetrics, setLockMetrics] = useState<LockMetrics | null>(null);
+    const [lockMetricsError, setLockMetricsError] = useState<string | null>(null);
     const [artifactOpenBusy, setArtifactOpenBusy] = useState<string | null>(null);
     const [artifactActionMessage, setArtifactActionMessage] = useState<string | null>(null);
     const [recoveryActionBusyKey, setRecoveryActionBusyKey] = useState<string | null>(null);
@@ -1028,8 +1029,7 @@ export default function Launcher() {
         showAdvancedControls ||
         preflightLoading ||
         preflightOk === false ||
-        !!preflightError ||
-        !!executionLockHint;
+        !!preflightError;
     const navigableItems = [
         ...results.map((r, i) => ({ type: 'result', data: r, id: `res-${i}` })),
         ...pendingRecs.map(r => ({ type: 'recommendation', data: r, id: `rec-${r.id}` }))
@@ -1058,6 +1058,23 @@ export default function Launcher() {
             setTaskRunArtifacts([]);
         }
     };
+
+    const loadLockMetrics = useCallback(async () => {
+        try {
+            const metrics = await fetchLockMetrics();
+            setLockMetrics(metrics);
+            setLockMetricsError(null);
+        } catch (error) {
+            console.error("Failed to load lock metrics", error);
+            setLockMetrics(null);
+            setLockMetricsError("lock metrics unavailable");
+        }
+    }, []);
+
+    useEffect(() => {
+        if (!showDiagnostics) return;
+        void loadLockMetrics();
+    }, [showDiagnostics, loadLockMetrics]);
 
     const loadDodHistory = useCallback(async () => {
         setDodHistoryLoading(true);
@@ -1328,10 +1345,23 @@ export default function Launcher() {
     }, []);
 
     useEffect(() => {
-        if (results.length > 0 || pendingApproval || lastStatus === "manual_required") {
+        if (
+            pendingApproval ||
+            lastStatus === "manual_required" ||
+            runPhase === "failed" ||
+            failedAssertions.length > 0
+        ) {
             setShowDetailPanel(true);
+            return;
         }
-    }, [results.length, pendingApproval, lastStatus]);
+        if (
+            runPhase === "completed" &&
+            failedAssertions.length === 0 &&
+            !pendingApproval
+        ) {
+            setShowDetailPanel(false);
+        }
+    }, [pendingApproval, lastStatus, runPhase, failedAssertions.length]);
 
     useEffect(() => {
         if (lastStatus === "manual_required") {
@@ -1377,30 +1407,45 @@ export default function Launcher() {
         }
 
         const isExpanded = showDetailPanel && hasDetailContent;
-        const preflightExpanded = showPreflightDetail || preflightOk === false || !!preflightError;
+        const preflightExpanded =
+            showPreflightPanel &&
+            (showPreflightDetail ||
+                showAdvancedControls ||
+                preflightOk === false ||
+                !!preflightError ||
+                !!executionLockHint);
+        const desiredWidth = compactLayoutMode ? 980 : 1060;
+        const maxViewportWidth =
+            typeof window !== "undefined"
+                ? Math.max(820, (window.screen?.availWidth ?? window.innerWidth) - 18)
+                : desiredWidth;
+        const targetWidth = Math.min(desiredWidth, maxViewportWidth);
         const targetHeight = isExpanded
             ? compactLayoutMode
-                ? 620
-                : 680
+                ? 600
+                : 660
             : preflightExpanded
               ? compactLayoutMode
-                  ? 232
-                  : 256
+                  ? 210
+                  : 228
               : compactLayoutMode
-                ? 170
-                : 184;
+                ? 146
+                : 160;
 
         void getCurrentWindow()
-            .setSize(new LogicalSize(1220, targetHeight))
+            .setSize(new LogicalSize(targetWidth, targetHeight))
             .catch((error) => {
                 console.error("Failed to sync launcher window size:", error);
             });
     }, [
         showDetailPanel,
         hasDetailContent,
+        showPreflightPanel,
         showPreflightDetail,
+        showAdvancedControls,
         preflightOk,
         preflightError,
+        executionLockHint,
         compactLayoutMode,
     ]);
 
@@ -1609,6 +1654,7 @@ export default function Launcher() {
             updateExecutionState({
                 status: execRes.status,
                 runId: execRes.run_id ?? null,
+                resumeToken: execRes.resume_token ?? null,
                 plannerComplete: !!execRes.planner_complete,
                 executionComplete: !!execRes.execution_complete,
                 businessComplete: !!execRes.business_complete,
@@ -1624,6 +1670,7 @@ export default function Launcher() {
                 `**Status**: ${execRes.status}`,
                 `**Profile**: ${execRes.profile ?? effectiveProfile}${execRes.collision_policy ? ` (collision=${execRes.collision_policy})` : ""}`,
                 execRes.run_id ? `**Run ID**: ${execRes.run_id}` : "",
+                execRes.resume_token ? `**Resume Token**: ${execRes.resume_token}` : "",
                 `**Planner Complete**: ${execRes.planner_complete ? "yes" : "no"}`,
                 `**Execution Complete**: ${execRes.execution_complete ? "yes" : "no"}`,
                 `**Business Complete**: ${execRes.business_complete ? "yes" : "no"}`,
@@ -1823,12 +1870,15 @@ export default function Launcher() {
         setRunPhase("retrying");
         try {
             const resumeProfile = safeExecutionMode ? "strict" : activeExecutionProfile;
-            const execRes = await agentExecute(lastPlanId, resumeProfile);
+            const execRes = await agentExecute(lastPlanId, resumeProfile, {
+                resumeToken: runSnapshot?.resumeToken ?? null,
+            });
             setLastStatus(execRes.status);
             const verifyRes = await agentVerify(lastPlanId);
             updateExecutionState({
                 status: execRes.status,
                 runId: execRes.run_id ?? null,
+                resumeToken: execRes.resume_token ?? null,
                 plannerComplete: !!execRes.planner_complete,
                 executionComplete: !!execRes.execution_complete,
                 businessComplete: !!execRes.business_complete,
@@ -1842,6 +1892,7 @@ export default function Launcher() {
                 `**Status**: ${execRes.status}`,
                 `**Profile**: ${execRes.profile ?? resumeProfile}${execRes.collision_policy ? ` (collision=${execRes.collision_policy})` : ""}`,
                 execRes.run_id ? `**Run ID**: ${execRes.run_id}` : "",
+                execRes.resume_token ? `**Resume Token**: ${execRes.resume_token}` : "",
                 `**Planner Complete**: ${execRes.planner_complete ? "yes" : "no"}`,
                 `**Execution Complete**: ${execRes.execution_complete ? "yes" : "no"}`,
                 `**Business Complete**: ${execRes.business_complete ? "yes" : "no"}`,
@@ -1958,11 +2009,14 @@ export default function Launcher() {
                 return;
             }
             const approvalProfile = safeExecutionMode ? "strict" : activeExecutionProfile;
-            const execRes = await agentExecute(pendingApproval.planId, approvalProfile);
+            const execRes = await agentExecute(pendingApproval.planId, approvalProfile, {
+                resumeToken: runSnapshot?.resumeToken ?? null,
+            });
             const verifyRes = await agentVerify(pendingApproval.planId);
             updateExecutionState({
                 status: execRes.status,
                 runId: execRes.run_id ?? null,
+                resumeToken: execRes.resume_token ?? null,
                 plannerComplete: !!execRes.planner_complete,
                 executionComplete: !!execRes.execution_complete,
                 businessComplete: !!execRes.business_complete,
@@ -1976,6 +2030,7 @@ export default function Launcher() {
                 `**Status**: ${execRes.status}`,
                 `**Profile**: ${execRes.profile ?? approvalProfile}${execRes.collision_policy ? ` (collision=${execRes.collision_policy})` : ""}`,
                 execRes.run_id ? `**Run ID**: ${execRes.run_id}` : "",
+                execRes.resume_token ? `**Resume Token**: ${execRes.resume_token}` : "",
                 `**Planner Complete**: ${execRes.planner_complete ? "yes" : "no"}`,
                 `**Execution Complete**: ${execRes.execution_complete ? "yes" : "no"}`,
                 `**Business Complete**: ${execRes.business_complete ? "yes" : "no"}`,
@@ -2119,13 +2174,17 @@ export default function Launcher() {
         }
     };
 
+    const launcherWidthClass = compactLayoutMode
+        ? "max-w-[calc(100vw-16px)] sm:max-w-[calc(100vw-24px)] lg:max-w-[960px] xl:max-w-[1000px]"
+        : "max-w-[calc(100vw-16px)] sm:max-w-[calc(100vw-24px)] lg:max-w-[1040px] xl:max-w-[1100px]";
+
     return (
         <div
-            className="w-full h-full bg-transparent flex items-end justify-center pb-1.5 px-2 pointer-events-none"
+            className="w-full bg-transparent flex items-end justify-center pb-1.5 sm:pb-2 px-2 sm:px-3 pointer-events-none"
             onMouseDown={handleBackgroundClick}
         >
             <motion.div
-                className={`pointer-events-auto w-full ${compactLayoutMode ? "max-w-[920px]" : "max-w-[980px]"} max-h-[calc(100vh-8px)] bg-[#13161d]/96 backdrop-blur-2xl rounded-[18px] shadow-2xl overflow-hidden border transition-colors duration-500
+                className={`pointer-events-auto w-full ${launcherWidthClass} max-h-[calc(100vh-6px)] bg-[#121722]/96 backdrop-blur-2xl rounded-[18px] shadow-2xl overflow-hidden border transition-colors duration-500
                     ${successPulse ? 'border-green-500/50 shadow-green-500/20' : 'border-white/10 ring-1 ring-black/5'}
                 `}
                 initial={{ scale: 0.9, opacity: 0 }}
@@ -2266,7 +2325,7 @@ export default function Launcher() {
                             <input
                                 ref={inputRef}
                                 type="text"
-                                className="w-full h-[50px] bg-white/[0.03] border border-white/15 rounded-xl px-4 text-[20px] text-white/95 placeholder-gray-500 outline-none focus:border-white/30 transition-colors"
+                                className="w-full h-11 sm:h-12 md:h-[50px] bg-white/[0.03] border border-white/15 rounded-xl px-3.5 sm:px-4 text-[16px] sm:text-[18px] md:text-[20px] text-white/95 placeholder-gray-500 outline-none focus:border-white/30 transition-colors"
                                 placeholder={composerMode === "nl" ? "무엇이든 부탁하세요" : "버튼 또는 명령으로 실행"}
                                 value={input}
                                 onChange={(e) => setInput(e.target.value)}
@@ -2279,7 +2338,7 @@ export default function Launcher() {
                         <button
                             onClick={handleSend}
                             disabled={!input.trim() || isExecutionLocked}
-                            className="w-12 h-12 rounded-full bg-white/18 hover:bg-white/30 disabled:opacity-40 text-white flex items-center justify-center transition-colors"
+                            className="w-11 h-11 sm:w-12 sm:h-12 rounded-full bg-white/18 hover:bg-white/30 disabled:opacity-40 text-white flex items-center justify-center transition-colors"
                         >
                             {loading ? (
                                 <Activity className="w-5 h-5 animate-spin" />
@@ -2641,6 +2700,34 @@ export default function Launcher() {
 
                             {showDiagnostics && (
                                 <div className="px-4 py-3 border-b border-white/5 bg-[#151515]">
+                                    <div className="mb-2 rounded border border-white/10 bg-white/5 px-2 py-2">
+                                        <div className="text-[11px] uppercase tracking-wider text-cyan-200 font-semibold mb-1">
+                                            Singleton Lock Telemetry
+                                        </div>
+                                        {lockMetrics ? (
+                                            <div className="grid grid-cols-2 md:grid-cols-5 gap-1.5 text-[11px]">
+                                                <div className="rounded border border-emerald-400/25 bg-emerald-500/10 px-2 py-1 text-emerald-200">
+                                                    acquired={lockMetrics.acquired}
+                                                </div>
+                                                <div className="rounded border border-sky-400/25 bg-sky-500/10 px-2 py-1 text-sky-200">
+                                                    bypassed={lockMetrics.bypassed}
+                                                </div>
+                                                <div className="rounded border border-rose-400/25 bg-rose-500/10 px-2 py-1 text-rose-200">
+                                                    blocked={lockMetrics.blocked}
+                                                </div>
+                                                <div className="rounded border border-amber-400/25 bg-amber-500/10 px-2 py-1 text-amber-100">
+                                                    stale_recovered={lockMetrics.stale_recovered}
+                                                </div>
+                                                <div className="rounded border border-fuchsia-400/25 bg-fuchsia-500/10 px-2 py-1 text-fuchsia-200">
+                                                    rejected={lockMetrics.rejected}
+                                                </div>
+                                            </div>
+                                        ) : (
+                                            <div className="text-xs text-gray-400">
+                                                {lockMetricsError ?? "아직 lock telemetry를 불러오지 않았습니다."}
+                                            </div>
+                                        )}
+                                    </div>
                                     <div className="text-[11px] uppercase tracking-wider text-cyan-300 font-semibold mb-2">
                                         최근 DoD 히스토리
                                     </div>

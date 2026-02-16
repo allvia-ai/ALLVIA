@@ -11,6 +11,10 @@ if [ -f core/.env ]; then
     set +a
 fi
 
+# Semantic contract policy defaults: keep complex scenarios aligned with NL request runner.
+: "${STEER_SEMANTIC_FAIL_ON_TRUNCATION:=1}"
+: "${STEER_SEMANTIC_REQUIRE_APP_SCOPE:=1}"
+
 echo "🚀 Starting Complex Scenarios 1-5 Execution..."
 echo "⚠️  PLEASE DO NOT TOUCH THE MOUSE/KEYBOARD DURING EXECUTION"
 echo ""
@@ -29,6 +33,17 @@ REQUIRE_PRIMARY_PLANNER_VALUE="${STEER_REQUIRE_PRIMARY_PLANNER:-1}"
 LOCK_DISABLED_VALUE="${STEER_LOCK_DISABLED:-0}"
 APPROVAL_ASK_FALLBACK_VALUE="${STEER_APPROVAL_ASK_FALLBACK:-deny}"
 TEST_MODE_VALUE="${STEER_TEST_MODE:-0}"
+
+is_truthy() {
+    case "${1:-}" in
+        1|true|TRUE|yes|YES|on|ON)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
 REQUIRE_TELEGRAM_REPORT_VALUE="${STEER_REQUIRE_TELEGRAM_REPORT:-1}"
 DETERMINISTIC_GOAL_AUTOPLAN_VALUE="${STEER_DETERMINISTIC_GOAL_AUTOPLAN:-}"
 SCENARIO_IDS_RAW="${STEER_SCENARIO_IDS:-1,2,3,4,5}"
@@ -157,6 +172,15 @@ if [ "$REQUIRE_PRIMARY_PLANNER_VALUE" = "1" ] && [ "$SCENARIO_MODE_VALUE" = "1" 
     exit 1
 fi
 
+if is_truthy "$LOCK_DISABLED_VALUE"; then
+    if ! is_truthy "$TEST_MODE_VALUE" && ! is_truthy "${CI:-0}" && ! is_truthy "${STEER_ALLOW_LOCK_DISABLED_NON_TEST:-0}"; then
+        echo "❌ 안전정책 위반: STEER_LOCK_DISABLED=1 은 테스트/CI 전용입니다."
+        echo "   운영 실행에서는 STEER_LOCK_DISABLED=0으로 설정하세요."
+        echo "   예외 허용이 꼭 필요하면 STEER_ALLOW_LOCK_DISABLED_NON_TEST=1을 명시적으로 설정하세요."
+        exit 1
+    fi
+fi
+
 echo "🔧 STEER_SCENARIO_MODE=${SCENARIO_MODE_VALUE} (0=LLM planning, 1=fallback scenario mode)"
 echo "📸 STEER_NODE_CAPTURE=1, STEER_NODE_CAPTURE_ALL=${NODE_CAPTURE_ALL_VALUE}"
 echo "🧪 STEER_TEST_MODE=${TEST_MODE_VALUE}"
@@ -267,7 +291,18 @@ run_cmd_with_timeout_capture() {
 
 semantic_location_missing() {
     case "$1" in
-        NOT_FOUND|CHECK_ERROR|CHECK_TIMEOUT|MARKER_REQUIRED|"")
+        NOT_FOUND|CHECK_ERROR|CHECK_TIMEOUT|MARKER_REQUIRED|LOG_ONLY_BLOCKED*|"")
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+semantic_location_is_log() {
+    case "${1:-}" in
+        LOG_*)
             return 0
             ;;
         *)
@@ -278,6 +313,73 @@ semantic_location_missing() {
 
 normalize_semantic_token() {
     printf '%s' "$1" | tr '\r\n\t' '   ' | sed -E 's/[[:space:]]+/ /g; s/^[[:space:]]+//; s/[[:space:]]+$//'
+}
+
+extract_expected_recipients_from_request() {
+    local source_text="${1:-}"
+    [ -z "$source_text" ] && return 0
+
+    local rust_recipients=""
+    if rust_recipients="$(extract_semantic_contract_with_rust "recipients" "$source_text")"; then
+        if [ -n "$rust_recipients" ]; then
+            printf '%s\n' "$rust_recipients" | awk 'NF > 0 && !seen[$0]++'
+            return 0
+        fi
+    fi
+
+    printf '%s\n' "$source_text" | perl -ne '
+        while (/[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g) {
+            my $e = $&;
+            $e =~ s/^[<\(\["'\'']+//;
+            $e =~ s/[>\)\]"'\'',;:.]+$//;
+            print lc($e), "\n";
+        }
+    ' | awk '!seen[$0]++'
+}
+
+request_requires_mail_send() {
+    local source_text="${1:-}"
+    [ -z "$source_text" ] && return 1
+    local lower_text
+    lower_text="$(printf '%s' "$source_text" | tr '[:upper:]' '[:lower:]')"
+
+    local has_mail_context=0
+    local has_send_intent=0
+    local has_non_mail_send_context=0
+
+    if printf '%s' "$lower_text" | grep -Eiq 'mail|gmail|email|이메일|메일|전자메일'; then
+        has_mail_context=1
+    fi
+    if printf '%s' "$lower_text" | grep -Eiq '보내|발송|send'; then
+        has_send_intent=1
+    fi
+    if printf '%s' "$lower_text" | grep -Eiq 'telegram|텔레그램|slack|디스코드|discord|notion|노션'; then
+        has_non_mail_send_context=1
+    fi
+
+    local recipients=""
+    recipients="$(extract_expected_recipients_from_request "$source_text" || true)"
+    if [ -n "$recipients" ]; then
+        return 0
+    fi
+
+    if [ "$has_mail_context" = "1" ] && [ "$has_send_intent" = "1" ]; then
+        return 0
+    fi
+    if [ "$has_send_intent" = "1" ] && [ "$has_non_mail_send_context" = "0" ] && [ "$has_mail_context" = "1" ]; then
+        return 0
+    fi
+    return 1
+}
+
+selected_scenarios_require_mail() {
+    local sid=""
+    for sid in ${SELECTED_SCENARIO_IDS}; do
+        if complex_scenario_required_artifacts "$sid" | grep -Fxq "mail_send"; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 SEMANTIC_CONTRACT_RUST_BIN=""
@@ -431,25 +533,42 @@ preflight_checks() {
         local focus_activate_out=""
         local focus_front_out=""
         local focus_front=""
-        if ! run_cmd_with_timeout_capture "$preflight_timeout" osascript -e 'tell application "Finder" to activate'; then
-            focus_activate_out="${RUN_TIMEOUT_STDERR:-$RUN_TIMEOUT_STDOUT}"
-            echo "❌ Preflight failed: Focus handoff activate(Finder) failed."
-            [ -n "$focus_activate_out" ] && echo "   Details: $focus_activate_out"
-            failed=1
-        elif ! run_cmd_with_timeout_capture "$preflight_timeout" osascript -e 'tell application "System Events" to return name of first application process whose frontmost is true'; then
-            focus_front_out="${RUN_TIMEOUT_STDERR:-$RUN_TIMEOUT_STDOUT}"
-            echo "❌ Preflight failed: Focus handoff frontmost check failed."
-            [ -n "$focus_front_out" ] && echo "   Details: $focus_front_out"
-            failed=1
-        else
-            focus_front="$(printf '%s' "${RUN_TIMEOUT_STDOUT}" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-            if [ "$focus_front" != "Finder" ]; then
-                echo "❌ Preflight failed: Focus handoff check failed (expected=Finder actual=${focus_front:-unknown})."
-                echo "   Fix: 실행 중 전면 앱 충돌을 막기 위해 전용 데스크톱/사용자 세션에서 실행하세요."
-                failed=1
+        local focus_retries="${STEER_PREFLIGHT_FOCUS_RETRIES:-3}"
+        local focus_retry_sleep="${STEER_PREFLIGHT_FOCUS_RETRY_SLEEP_SEC:-0.25}"
+        local focus_attempt=1
+        local focus_ok=0
+        if ! [[ "$focus_retries" =~ ^[0-9]+$ ]] || [ "$focus_retries" -lt 1 ]; then
+            focus_retries=3
+        fi
+
+        while [ "$focus_attempt" -le "$focus_retries" ]; do
+            if ! run_cmd_with_timeout_capture "$preflight_timeout" osascript -e 'tell application "Finder" to activate'; then
+                focus_activate_out="${RUN_TIMEOUT_STDERR:-$RUN_TIMEOUT_STDOUT}"
+            elif ! run_cmd_with_timeout_capture "$preflight_timeout" osascript -e 'tell application "System Events" to return name of first application process whose frontmost is true'; then
+                focus_front_out="${RUN_TIMEOUT_STDERR:-$RUN_TIMEOUT_STDOUT}"
             else
-                echo "✅ Preflight: Focus handoff works (frontmost=Finder)."
+                focus_front="$(printf '%s' "${RUN_TIMEOUT_STDOUT}" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+                if [ "$focus_front" = "Finder" ]; then
+                    focus_ok=1
+                    break
+                fi
+                focus_front_out="expected=Finder actual=${focus_front:-unknown}"
             fi
+
+            if [ "$focus_attempt" -lt "$focus_retries" ]; then
+                sleep "$focus_retry_sleep"
+            fi
+            focus_attempt=$((focus_attempt + 1))
+        done
+
+        if [ "$focus_ok" -eq 1 ]; then
+            echo "✅ Preflight: Focus handoff works (frontmost=Finder, attempt=${focus_attempt}/${focus_retries})."
+        else
+            echo "❌ Preflight failed: Focus handoff check failed after ${focus_retries} attempts."
+            [ -n "$focus_activate_out" ] && echo "   activate details: $focus_activate_out"
+            [ -n "$focus_front_out" ] && echo "   frontmost details: $focus_front_out"
+            echo "   Fix: 실행 중 전면 앱 충돌을 막기 위해 전용 데스크톱/사용자 세션에서 실행하세요."
+            failed=1
         fi
     else
         echo "ℹ️ Preflight: Focus handoff check disabled (STEER_PREFLIGHT_FOCUS_HANDOFF=0)."
@@ -469,7 +588,11 @@ preflight_checks() {
         echo "ℹ️ Preflight: OPENAI_API_KEY not required in current mode (CLI/scenario path)."
     fi
 
-    if [ "${STEER_REQUIRE_MAIL_SEND:-1}" = "1" ] && [ -z "$MAIL_TO_TARGET" ]; then
+    local require_mail_send_preflight=0
+    if [ "${STEER_REQUIRE_MAIL_SEND:-0}" = "1" ] || selected_scenarios_require_mail; then
+        require_mail_send_preflight=1
+    fi
+    if [ "$require_mail_send_preflight" -eq 1 ] && [ -z "$MAIL_TO_TARGET" ]; then
         echo "❌ Preflight failed: mail send target is empty."
         echo "   Fix: STEER_DEFAULT_MAIL_TO 또는 git user.email 을 설정하세요."
         failed=1
@@ -564,6 +687,38 @@ END {
         compressed="${compressed:0:max_chars}"$'\n'"- ...(메시지 길이 축약)"
     fi
     printf '%s' "$compressed"
+}
+
+collect_diagnostic_event_lines() {
+    local limit="${STEER_DIAGNOSTIC_EVENT_TAIL:-8}"
+    local diag_path="${STEER_DIAGNOSTIC_EVENTS_PATH:-scenario_results/diagnostic_events.jsonl}"
+
+    if ! [[ "$limit" =~ ^[0-9]+$ ]]; then
+        limit=8
+    fi
+    if [ "$limit" -le 0 ]; then
+        return 0
+    fi
+    if [ ! -f "$diag_path" ]; then
+        return 0
+    fi
+
+    if command -v jq >/dev/null 2>&1; then
+        tail -n 240 "$diag_path" 2>/dev/null \
+            | jq -r '
+                select(
+                    .type == "run.attempt"
+                    or .type == "telegram.send.retry"
+                    or .type == "telegram.send.error"
+                    or .type == "n8n.http.retry"
+                    or .type == "scheduler.start.skipped"
+                )
+                | "- diag[" + (.type | tostring) + "] " + ((.payload | tostring) // "{}")
+            ' 2>/dev/null \
+            | tail -n "$limit"
+    else
+        tail -n "$limit" "$diag_path" 2>/dev/null | sed -E 's/^/- diag.raw /'
+    fi
 }
 
 log_run_attempt() {
@@ -709,13 +864,23 @@ run_surf_with_input_guard() {
     local poll_interval="${STEER_INPUT_POLL_SECONDS:-1}"
     local max_pauses="${STEER_INPUT_GUARD_MAX_PAUSES:-40}"
     local max_pause_seconds="${STEER_INPUT_GUARD_MAX_PAUSE_SECONDS:-300}"
+    local live_new_item_limit="${STEER_INPUT_GUARD_MAX_NEW_ITEMS:-${STEER_MAX_NEW_ITEM_ACTIONS:-6}}"
+    local live_new_item_pattern="Shortcut 'n'.*Created new item|mail_draft_ready|shortcut cmd\\+n"
     local paused=0
     local pause_count=0
     local pause_started_epoch=0
     local total_paused_seconds=0
     local run_pid=""
 
+    if ! [[ "$live_new_item_limit" =~ ^[0-9]+$ ]]; then
+        live_new_item_limit=6
+    fi
+    if [ "$live_new_item_limit" -lt 1 ]; then
+        live_new_item_limit=1
+    fi
+
     echo "🛡️ User-input guard enabled (mode=${STEER_USER_INPUT_GUARD_MODE:-all}, apps=${STEER_USER_ACTIVE_APPS:-Terminal,Codex,iTerm2}, active<=${active_threshold}s, resume>=${resume_idle}s, max_pauses=${max_pauses}, max_pause_seconds=${max_pause_seconds})"
+    echo "🛡️ Window flood guard enabled (new_item_limit=${live_new_item_limit})"
 
     if [ -n "$CLI_LLM_VALUE" ]; then
         STEER_SCENARIO_MODE="$SCENARIO_MODE_VALUE" \
@@ -742,6 +907,22 @@ run_surf_with_input_guard() {
     run_pid=$!
 
     while kill -0 "$run_pid" 2>/dev/null; do
+        if [ -f "$log_file" ]; then
+            local new_item_live_count=0
+            new_item_live_count="$(grep -Eic "$live_new_item_pattern" "$log_file" 2>/dev/null || true)"
+            if [ "${new_item_live_count:-0}" -gt "$live_new_item_limit" ]; then
+                CURRENT_INPUT_GUARD_ABORTED=1
+                CURRENT_INPUT_GUARD_ABORT_REASON="new_item_flood(${new_item_live_count}>${live_new_item_limit})"
+                echo "⛔️ [InputGuard] Abort run: ${CURRENT_INPUT_GUARD_ABORT_REASON}"
+                echo "⛔️ [InputGuard] Abort run: ${CURRENT_INPUT_GUARD_ABORT_REASON}" >> "$log_file"
+                kill -TERM "$run_pid" >/dev/null 2>&1 || true
+                pkill -TERM -P "$run_pid" >/dev/null 2>&1 || true
+                sleep 1
+                kill -KILL "$run_pid" >/dev/null 2>&1 || true
+                pkill -KILL -P "$run_pid" >/dev/null 2>&1 || true
+                break
+            fi
+        fi
         local idle_sec=""
         idle_sec="$(get_idle_seconds || true)"
         if [ -n "$idle_sec" ]; then
@@ -1733,6 +1914,39 @@ capture_and_notify() {
         [ -z "$token" ] && continue
         expected_tokens+=("$token")
     done < <(printf '%s\n' "${merged_tokens[@]}" | awk 'NF > 0 && !seen[$0]++')
+    local token_truncated=0
+    local default_token_cap=384
+    local request_len=${#scenario_request}
+    local token_cap=0
+    if [ "$request_len" -gt 2400 ]; then
+        default_token_cap=640
+    fi
+    token_cap="${STEER_SEMANTIC_MAX_TOKENS:-$default_token_cap}"
+    if ! [[ "$token_cap" =~ ^[0-9]+$ ]]; then
+        token_cap="$default_token_cap"
+    fi
+    if [ "$token_cap" -lt 0 ]; then
+        token_cap=0
+    fi
+    if [ "$token_cap" -gt 0 ] && [ "${#expected_tokens[@]}" -gt "$token_cap" ]; then
+        token_truncated=1
+        expected_tokens=("${expected_tokens[@]:0:$token_cap}")
+    fi
+    if [ -n "$CURRENT_SCENARIO_MARKER" ]; then
+        local marker_kept=0
+        for token in "${expected_tokens[@]}"; do
+            if [ "$token" = "$CURRENT_SCENARIO_MARKER" ]; then
+                marker_kept=1
+                break
+            fi
+        done
+        if [ "$marker_kept" -eq 0 ]; then
+            if [ "$token_cap" -gt 0 ] && [ "${#expected_tokens[@]}" -ge "$token_cap" ]; then
+                expected_tokens=("${expected_tokens[@]:0:$((token_cap - 1))}")
+            fi
+            expected_tokens+=("$CURRENT_SCENARIO_MARKER")
+        fi
+    fi
     for artifact in "${required_artifacts[@]}"; do
         case "$artifact" in
             semantic_tokens)
@@ -1780,6 +1994,9 @@ capture_and_notify() {
                     location="$(token_presence_location "$normalized_token" "$CURRENT_SCENARIO_MARKER" "$CURRENT_SCENARIO_START_EPOCH")"
                 fi
             fi
+            if [ "${STEER_SEMANTIC_REQUIRE_APP_SCOPE:-1}" = "1" ] && semantic_location_is_log "$location"; then
+                location="LOG_ONLY_BLOCKED(${location})"
+            fi
             if semantic_location_missing "$location"; then
                 semantic_missing=$((semantic_missing + 1))
                 semantic_lines="${semantic_lines}- 의미검증 ❌ \"${token}\" (location=${location})"$'\n'
@@ -1788,6 +2005,13 @@ capture_and_notify() {
             fi
         done
         semantic_lines="${semantic_lines}- 의미검증 토큰 수: ${semantic_checked}"$'\n'
+        if [ "$token_truncated" -eq 1 ]; then
+            semantic_lines="${semantic_lines}- 의미검증 토큰이 상한(${token_cap})으로 잘렸습니다(STEER_SEMANTIC_MAX_TOKENS 조정 필요)"$'\n'
+            if [ "${STEER_SEMANTIC_FAIL_ON_TRUNCATION:-1}" = "1" ]; then
+                status="failed"
+                semantic_lines="${semantic_lines}- 계약 위반: 토큰 절단 발생으로 최종 상태를 failed로 강등"$'\n'
+            fi
+        fi
         if [ "$require_semantic_tokens" -eq 1 ] && [ "$semantic_checked" -eq 0 ]; then
             status="failed"
             semantic_lines="${semantic_lines}- 계약 위반: semantic token 계약이 비어 있습니다"$'\n'
@@ -1808,7 +2032,11 @@ capture_and_notify() {
         fi
     fi
 
-    if [ "$require_mail_send" -eq 1 ] || [ "${STEER_REQUIRE_MAIL_SEND:-1}" = "1" ]; then
+    local request_requires_mail=0
+    if request_requires_mail_send "$scenario_request"; then
+        request_requires_mail=1
+    fi
+    if [ "$require_mail_send" -eq 1 ] || [ "${STEER_REQUIRE_MAIL_SEND:-0}" = "1" ] || [ "$request_requires_mail" -eq 1 ]; then
         local mail_send_logged=0
         local mail_log_status="${mail_proof_status:-}"
         local mail_log_recipient="${mail_proof_recipient:-}"
@@ -1950,6 +2178,24 @@ capture_and_notify() {
                 mail_body_location="LOG_MAIL_BODY_LEN"
             fi
         fi
+        if [ "${STEER_SEMANTIC_REQUIRE_APP_SCOPE:-1}" = "1" ]; then
+            if semantic_location_is_log "$mail_sent_location"; then
+                mail_sent_ok=0
+                mail_sent_location="LOG_ONLY_BLOCKED(${mail_sent_location})"
+            fi
+            if [ "$mail_subject_ok" -eq 1 ] && semantic_location_is_log "$mail_subject_location"; then
+                mail_subject_ok=0
+                mail_subject_location="LOG_ONLY_BLOCKED(${mail_subject_location})"
+            fi
+            if [ "$mail_recipient_ok" -eq 1 ] && semantic_location_is_log "$mail_recipient_location"; then
+                mail_recipient_ok=0
+                mail_recipient_location="LOG_ONLY_BLOCKED(${mail_recipient_location})"
+            fi
+            if [ "$mail_body_ok" -eq 1 ] && semantic_location_is_log "$mail_body_location"; then
+                mail_body_ok=0
+                mail_body_location="LOG_ONLY_BLOCKED(${mail_body_location})"
+            fi
+        fi
         local mail_mailbox_evidence_ok=0
         local mail_mailbox_evidence_location="$mail_sent_location"
         case "$mail_sent_location" in
@@ -1995,9 +2241,13 @@ capture_and_notify() {
 
     local evidence_lines=""
     local fallback_hit=0
+    local cmd_n_guard_count=0
+    local cmd_n_window_flood_guard_count=0
     if grep -Eiq "fallback action|FALLBACK_ACTION:" "$log_file" 2>/dev/null; then
         fallback_hit=1
     fi
+    cmd_n_guard_count=$(grep -Ec 'cmd_n_loop_guard_block' "$log_file" 2>/dev/null || true)
+    cmd_n_window_flood_guard_count=$(grep -Ec 'cmd_n_window_flood_block' "$log_file" 2>/dev/null || true)
     while IFS= read -r line; do
         if [ -n "$line" ]; then
             evidence_lines="${evidence_lines}- ${line}"$'\n'
@@ -2013,11 +2263,26 @@ capture_and_notify() {
     evidence_lines="${evidence_lines}- STEER_REQUIRE_MAIL_BODY=${REQUIRE_MAIL_BODY_VALUE}"$'\n'
     evidence_lines="${evidence_lines}- STEER_REQUIRE_MAIL_SUBJECT=${REQUIRE_MAIL_SUBJECT_VALUE}"$'\n'
     evidence_lines="${evidence_lines}- STEER_REQUIRE_SENT_MAILBOX_EVIDENCE=${REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE}"$'\n'
+    evidence_lines="${evidence_lines}- STEER_SEMANTIC_FAIL_ON_TRUNCATION=${STEER_SEMANTIC_FAIL_ON_TRUNCATION}"$'\n'
+    evidence_lines="${evidence_lines}- STEER_SEMANTIC_REQUIRE_APP_SCOPE=${STEER_SEMANTIC_REQUIRE_APP_SCOPE}"$'\n'
+    local diag_lines=""
+    diag_lines="$(collect_diagnostic_event_lines || true)"
+    if [ -n "$diag_lines" ]; then
+        evidence_lines="${evidence_lines}- diagnostics tail (${STEER_DIAGNOSTIC_EVENTS_PATH:-scenario_results/diagnostic_events.jsonl})"$'\n'"${diag_lines}"$'\n'
+    fi
     if [ "$fallback_hit" -eq 1 ]; then
         evidence_lines="${evidence_lines}- fallback 액션 감지됨(fallback action/FALLBACK_ACTION)"$'\n'
         if [ "$FAIL_ON_FALLBACK_VALUE" = "1" ]; then
             evidence_lines="${evidence_lines}- 정책상 fallback 감지 시 실패 처리(STEER_FAIL_ON_FALLBACK=1)"$'\n'
         fi
+    fi
+    if [ "$cmd_n_guard_count" -gt 0 ]; then
+        status="failed"
+        evidence_lines="${evidence_lines}- cmd+n 루프 가드 발동 횟수=${cmd_n_guard_count}"$'\n'
+    fi
+    if [ "$cmd_n_window_flood_guard_count" -gt 0 ]; then
+        status="failed"
+        evidence_lines="${evidence_lines}- cmd+n 창 폭증 가드 발동 횟수=${cmd_n_window_flood_guard_count}"$'\n'
     fi
     if [ "${CURRENT_INPUT_GUARD_ABORTED:-0}" = "1" ]; then
         evidence_lines="${evidence_lines}- 입력 가드 중단: ${CURRENT_INPUT_GUARD_ABORT_REASON:-unknown}"$'\n'
@@ -2159,6 +2424,12 @@ capture_and_notify() {
         elif [ "${fallback_hit:-0}" -eq 1 ]; then
             fail_primary_reason="fallback_detected"
             retry_guide="fallback 유도 원인(포커스/권한/플랜)을 먼저 제거하세요."
+        elif [ "${cmd_n_window_flood_guard_count:-0}" -gt 0 ]; then
+            fail_primary_reason="cmd_n_window_flood_guard"
+            retry_guide="생성된 새 창을 정리한 뒤 재실행하세요."
+        elif [ "${cmd_n_guard_count:-0}" -gt 0 ]; then
+            fail_primary_reason="cmd_n_loop_guard"
+            retry_guide="cmd+n 연속 시도를 줄이도록 플랜/앱 상태를 정리한 뒤 재실행하세요."
         else
             fail_primary_reason="evidence_or_runtime_failure"
             retry_guide="실패 근거 라인 기준으로 실패 단계만 수정 후 재실행하세요."

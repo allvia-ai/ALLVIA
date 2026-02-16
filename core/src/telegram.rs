@@ -282,8 +282,24 @@ impl TelegramBot {
             }
         }
 
-        let failed_assertions: Vec<&crate::db::TaskStageAssertionRecord> =
-            assertions.iter().filter(|a| !a.passed).collect();
+        let mut failed_assertion_map: BTreeMap<
+            (String, String),
+            crate::db::TaskStageAssertionRecord,
+        > = BTreeMap::new();
+        for assertion in assertions.iter().filter(|a| !a.passed) {
+            let key = (
+                assertion.stage_name.clone(),
+                assertion.assertion_key.clone(),
+            );
+            match failed_assertion_map.get(&key) {
+                Some(prev) if prev.id >= assertion.id => {}
+                _ => {
+                    failed_assertion_map.insert(key, assertion.clone());
+                }
+            }
+        }
+        let failed_assertions: Vec<crate::db::TaskStageAssertionRecord> =
+            failed_assertion_map.into_values().collect();
         if assertions.is_empty() {
             lines.push("검증: assertion 없음".to_string());
         } else if failed_assertions.is_empty() {

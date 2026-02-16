@@ -36,6 +36,7 @@ import {
     ContextSelectionSchema,
     ProjectScanSchema,
     JudgmentSchema,
+    LockMetricsSchema,
     type SystemStatus,
     type Routine,
     type LogEntry,
@@ -73,6 +74,7 @@ import {
     type ContextSelection,
     type ProjectScan,
     type Judgment,
+    type LockMetrics,
     type QualityScore,
 } from "./types";
 import { z } from "zod";
@@ -90,6 +92,11 @@ const api = axios.create({
 export async function fetchSystemStatus(): Promise<SystemStatus> {
     const { data } = await api.get("/status");
     return SystemStatusSchema.parse(data);
+}
+
+export async function fetchLockMetrics(): Promise<LockMetrics> {
+    const { data } = await api.get("/system/lock-metrics");
+    return LockMetricsSchema.parse(data);
 }
 
 export async function fetchLogs(): Promise<LogEntry[]> {
@@ -312,11 +319,18 @@ export async function agentPlan(
 
 export async function agentExecute(
     planId: string,
-    profile?: ExecutionProfile
+    profile?: ExecutionProfile,
+    options?: { resumeFrom?: number | null; resumeToken?: string | null }
 ): Promise<AgentExecuteResponse> {
     const payload: Record<string, unknown> = { plan_id: planId };
     if (profile) {
         payload.profile = profile;
+    }
+    if (options?.resumeFrom != null) {
+        payload.resume_from = options.resumeFrom;
+    }
+    if (options?.resumeToken) {
+        payload.resume_token = options.resumeToken;
     }
     const { data } = await api.post("/agent/execute", payload);
     return AgentExecuteResponseSchema.parse(data);

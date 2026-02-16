@@ -747,21 +747,32 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // 5. Start File Watcher
-    // Watch Downloads folder
-    let home = std::env::var("HOME").unwrap_or("/".to_string());
-    let downloads = format!("{}/Downloads", home);
-
-    // We reuse log_tx to send file events to Analyzer
-    if let Err(e) = monitor::spawn_file_watcher(downloads.clone(), log_tx.clone()) {
-        println!("⚠️  Failed to watch {}: {}", downloads, e);
+    // 5. Start File Watcher (Downloads or override path)
+    if env_flag("STEER_DISABLE_DOWNLOAD_WATCHER") {
+        println!("ℹ️  Downloads watcher disabled via STEER_DISABLE_DOWNLOAD_WATCHER.");
     } else {
-        println!("👀 Watching for changes in {}", downloads);
+        let home = std::env::var("HOME").unwrap_or("/".to_string());
+        let downloads = std::env::var("STEER_DOWNLOADS_DIR")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| format!("{}/Downloads", home));
+
+        // Reuse log_tx to send file events to Analyzer.
+        if let Err(e) = monitor::spawn_file_watcher(downloads.clone(), log_tx.clone()) {
+            println!("⚠️  Failed to watch {}: {}", downloads, e);
+        } else {
+            println!("👀 Watching for changes in {}", downloads);
+        }
     }
 
     // 6. Start App Watcher (Active Window Poller)
-    monitor::spawn_app_watcher(log_tx.clone());
-    println!("👀 Watching for active application changes...");
+    if env_flag("STEER_DISABLE_APP_WATCHER") {
+        println!("ℹ️  App watcher disabled via STEER_DISABLE_APP_WATCHER.");
+    } else {
+        monitor::spawn_app_watcher(log_tx.clone());
+        println!("👀 Watching for active application changes...");
+    }
 
     let mut policy = policy::PolicyEngine::new(); // Starts LOCKED
     let mut res_mon = monitor::ResourceMonitor::new();

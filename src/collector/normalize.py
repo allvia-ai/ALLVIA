@@ -87,7 +87,7 @@ def _parse_version(value: str) -> Optional[Tuple[int, int]]:
 
 
 def _utc_now() -> str:
-    return dt.datetime.utcnow().isoformat() + "Z"
+    return dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z")
 
 
 def _normalize_ts(value: Any, allow_missing_required: bool, level: str) -> str:
@@ -100,7 +100,7 @@ def _normalize_ts(value: Any, allow_missing_required: bool, level: str) -> str:
     if level == "strict":
         raise NormalizationError("invalid ts")
     if isinstance(value, (int, float)):
-        return dt.datetime.utcfromtimestamp(value).isoformat() + "Z"
+        return dt.datetime.fromtimestamp(value, tz=dt.UTC).isoformat().replace("+00:00", "Z")
     return _utc_now()
 
 

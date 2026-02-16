@@ -1,4 +1,5 @@
 use crate::approval_gate;
+use crate::controller::heuristics;
 use crate::nl_automation::{ApprovalContext, ExecutionResult, Plan, StepType};
 
 use crate::browser_automation;
@@ -6,6 +7,7 @@ use crate::tool_chaining::CrossAppBridge;
 use crate::visual_driver::{SmartStep, UiAction, VisualDriver};
 use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputCollisionPolicy {
@@ -88,6 +90,14 @@ fn push_run_attempt(logs: &mut Vec<String>, phase: &str, status: &str, details: 
         "ts": ts
     });
     logs.push(format!("RUN_ATTEMPT_JSON|{}", payload));
+    crate::diagnostic_events::emit(
+        "run.attempt",
+        json!({
+            "phase": phase,
+            "status": status,
+            "details": details
+        }),
+    );
 }
 
 fn step_requires_browser_focus(step_type: &StepType) -> bool {
@@ -136,6 +146,217 @@ fn expected_front_app_for_step(step_data: &Value) -> Option<String> {
         .filter(|raw| !raw.is_empty())
 }
 
+#[derive(Debug, Default)]
+struct FocusHandoffState {
+    drift_events: usize,
+    recovery_attempts: usize,
+    recovered_events: usize,
+    failed_events: usize,
+}
+
+fn parse_bool_env_with_default(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
+}
+
+fn focus_handoff_enabled() -> bool {
+    parse_bool_env_with_default("STEER_EXEC_FOCUS_HANDOFF", true)
+}
+
+fn focus_handoff_finder_bridge_enabled() -> bool {
+    parse_bool_env_with_default("STEER_EXEC_FOCUS_HANDOFF_FINDER_BRIDGE", true)
+}
+
+fn focus_handoff_retries() -> usize {
+    std::env::var("STEER_EXEC_FOCUS_HANDOFF_RETRIES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.clamp(1, 6))
+        .unwrap_or(2)
+}
+
+fn focus_handoff_retry_ms() -> u64 {
+    std::env::var("STEER_EXEC_FOCUS_HANDOFF_RETRY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.clamp(80, 1200))
+        .unwrap_or(220)
+}
+
+fn app_matches_expected(front_app: &str, expected_app: &str) -> bool {
+    let front = front_app.trim();
+    let expected = expected_app.trim();
+    if front.is_empty() || expected.is_empty() {
+        return false;
+    }
+    if front.eq_ignore_ascii_case(expected) {
+        return true;
+    }
+    let front_lower = front.to_ascii_lowercase();
+    let expected_lower = expected.to_ascii_lowercase();
+    front_lower.contains(&expected_lower) || expected_lower.contains(&front_lower)
+}
+
+async fn recover_expected_focus(
+    logs: &mut Vec<String>,
+    focus_state: &mut FocusHandoffState,
+    step_idx: usize,
+    expected_app: &str,
+    front_before: &str,
+) -> (bool, String) {
+    focus_state.drift_events += 1;
+    let retries = focus_handoff_retries();
+    let retry_ms = focus_handoff_retry_ms();
+    let use_finder_bridge = focus_handoff_finder_bridge_enabled();
+    push_run_attempt(
+        logs,
+        "focus_handoff",
+        "drift_detected",
+        &format!(
+            "step={} expected_app={} frontmost={}",
+            step_idx + 1,
+            expected_app,
+            front_before
+        ),
+    );
+
+    let mut last_front = front_before.to_string();
+    for attempt in 1..=retries {
+        focus_state.recovery_attempts += 1;
+        push_run_attempt(
+            logs,
+            "focus_handoff",
+            "recovering",
+            &format!(
+                "step={} attempt={}/{} target={}",
+                step_idx + 1,
+                attempt,
+                retries,
+                expected_app
+            ),
+        );
+
+        let _ = heuristics::ensure_app_focus(expected_app, 3).await;
+        if use_finder_bridge {
+            let front_now = CrossAppBridge::get_frontmost_app().unwrap_or_default();
+            if !app_matches_expected(&front_now, expected_app) {
+                let _ = heuristics::ensure_app_focus("Finder", 2).await;
+                let _ = heuristics::ensure_app_focus(expected_app, 3).await;
+            }
+        }
+
+        let front_after = CrossAppBridge::get_frontmost_app().unwrap_or_default();
+        last_front = front_after.clone();
+        if app_matches_expected(&front_after, expected_app) {
+            focus_state.recovered_events += 1;
+            push_run_attempt(
+                logs,
+                "focus_handoff",
+                "recovered",
+                &format!(
+                    "step={} attempt={} expected_app={} frontmost={}",
+                    step_idx + 1,
+                    attempt,
+                    expected_app,
+                    front_after
+                ),
+            );
+            return (true, front_after);
+        }
+        tokio::time::sleep(Duration::from_millis(retry_ms)).await;
+    }
+
+    focus_state.failed_events += 1;
+    push_run_attempt(
+        logs,
+        "focus_handoff",
+        "failed",
+        &format!(
+            "step={} expected_app={} frontmost={} retries={}",
+            step_idx + 1,
+            expected_app,
+            last_front,
+            retries
+        ),
+    );
+    (false, last_front)
+}
+
+async fn recover_browser_focus(
+    logs: &mut Vec<String>,
+    focus_state: &mut FocusHandoffState,
+    step_idx: usize,
+    front_before: &str,
+) -> (bool, String) {
+    focus_state.drift_events += 1;
+    let browser_candidates = [
+        "Google Chrome",
+        "Safari",
+        "Arc",
+        "Brave Browser",
+        "Microsoft Edge",
+        "Firefox",
+    ];
+    push_run_attempt(
+        logs,
+        "focus_handoff_browser",
+        "recovering",
+        &format!("step={} frontmost={}", step_idx + 1, front_before),
+    );
+    let mut last_front = front_before.to_string();
+    for app in browser_candidates {
+        focus_state.recovery_attempts += 1;
+        let _ = heuristics::ensure_app_focus(app, 2).await;
+        let front_after = CrossAppBridge::get_frontmost_app().unwrap_or_default();
+        last_front = front_after.clone();
+        if is_browser_app(&front_after) {
+            focus_state.recovered_events += 1;
+            push_run_attempt(
+                logs,
+                "focus_handoff_browser",
+                "recovered",
+                &format!(
+                    "step={} target={} frontmost={}",
+                    step_idx + 1,
+                    app,
+                    front_after
+                ),
+            );
+            return (true, front_after);
+        }
+    }
+    focus_state.failed_events += 1;
+    push_run_attempt(
+        logs,
+        "focus_handoff_browser",
+        "failed",
+        &format!("step={} frontmost={}", step_idx + 1, last_front),
+    );
+    (false, last_front)
+}
+
+fn push_focus_handoff_summary(logs: &mut Vec<String>, focus_state: &FocusHandoffState) {
+    push_run_attempt(
+        logs,
+        "focus_handoff_summary",
+        "done",
+        &format!(
+            "drift_events={},recovery_attempts={},recovered_events={},failed_events={}",
+            focus_state.drift_events,
+            focus_state.recovery_attempts,
+            focus_state.recovered_events,
+            focus_state.failed_events
+        ),
+    );
+}
+
 pub async fn execute_plan(
     plan: &Plan,
     start_index: usize,
@@ -149,6 +370,7 @@ pub async fn execute_plan(
     let mut blocked_reason = "policy_blocked".to_string();
     let mut approval_context: Option<ApprovalContext> = None;
     let mut resume_from: Option<usize> = None;
+    let mut focus_handoff_state = FocusHandoffState::default();
 
     logs.push(format!(
         "Start plan {} ({})",
@@ -182,8 +404,29 @@ pub async fn execute_plan(
         {
             if let Some(expected_app) = expected_front_app_for_step(&step.data) {
                 let front_app = CrossAppBridge::get_frontmost_app().unwrap_or_default();
-                let front_trimmed = front_app.trim().to_string();
-                if !front_trimmed.is_empty() && !front_trimmed.eq_ignore_ascii_case(&expected_app) {
+                let mut front_trimmed = front_app.trim().to_string();
+                let mut recovered = false;
+                if !front_trimmed.is_empty() && !app_matches_expected(&front_trimmed, &expected_app)
+                {
+                    if focus_handoff_enabled() {
+                        let (ok, recovered_front) = recover_expected_focus(
+                            &mut logs,
+                            &mut focus_handoff_state,
+                            idx,
+                            &expected_app,
+                            &front_trimmed,
+                        )
+                        .await;
+                        recovered = ok;
+                        if !recovered_front.trim().is_empty() {
+                            front_trimmed = recovered_front;
+                        }
+                    }
+                }
+                if !front_trimmed.is_empty()
+                    && !app_matches_expected(&front_trimmed, &expected_app)
+                    && !recovered
+                {
                     manual_required = true;
                     resume_from = Some(idx);
                     manual_steps.push(format!(
@@ -211,12 +454,27 @@ pub async fn execute_plan(
                         ),
                     );
                     break;
+                } else if recovered {
+                    logs.push(format!(
+                        "FOCUS_HANDOFF_RECOVERED: step={} expected_app={} frontmost={}",
+                        idx + 1,
+                        expected_app,
+                        front_trimmed
+                    ));
                 }
             }
         }
 
         if options.enforce_browser_focus && step_requires_browser_focus(&step.step_type) {
-            let front_app = CrossAppBridge::get_frontmost_app().unwrap_or_default();
+            let mut front_app = CrossAppBridge::get_frontmost_app().unwrap_or_default();
+            if !is_browser_app(&front_app) && focus_handoff_enabled() {
+                let (ok, recovered_front) =
+                    recover_browser_focus(&mut logs, &mut focus_handoff_state, idx, &front_app)
+                        .await;
+                if ok {
+                    front_app = recovered_front;
+                }
+            }
             if !is_browser_app(&front_app) {
                 let collision_details = format!(
                     "step={} expected=browser frontmost={} policy={}",
@@ -535,6 +793,7 @@ pub async fn execute_plan(
             "Execution stopped with blocked status (reason={})",
             blocked_reason
         ));
+        push_focus_handoff_summary(&mut logs, &focus_handoff_state);
         push_run_attempt(&mut logs, "execution_end", "blocked", &blocked_reason);
         let resume_token = build_resume_token(plan, resume_from, &blocked_reason);
         if let Some(token) = resume_token.as_ref() {
@@ -551,6 +810,7 @@ pub async fn execute_plan(
     }
     if approval_required {
         logs.push("Execution paused awaiting approval".to_string());
+        push_focus_handoff_summary(&mut logs, &focus_handoff_state);
         push_run_attempt(
             &mut logs,
             "execution_end",
@@ -575,6 +835,7 @@ pub async fn execute_plan(
     }
     if manual_required {
         logs.push("Execution paused for manual input".to_string());
+        push_focus_handoff_summary(&mut logs, &focus_handoff_state);
         push_run_attempt(
             &mut logs,
             "execution_end",
@@ -598,6 +859,7 @@ pub async fn execute_plan(
         };
     }
 
+    push_focus_handoff_summary(&mut logs, &focus_handoff_state);
     push_run_attempt(
         &mut logs,
         "execution_end",

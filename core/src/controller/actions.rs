@@ -165,6 +165,10 @@ impl ActionRunner {
         None
     }
 
+    fn has_tracked_mail_draft(history: &[String]) -> bool {
+        Self::mail_current_draft_id(history).is_some()
+    }
+
     fn remember_mail_draft_id(history: &mut Vec<String>, draft_id: &str) {
         let trimmed = draft_id.trim();
         if trimmed.is_empty() {
@@ -234,6 +238,80 @@ impl ActionRunner {
             return false;
         }
         Self::history_has_recent_created_new_item_for_app(history, app_name)
+    }
+
+    fn cmd_n_window_flood_limit() -> usize {
+        std::env::var("STEER_CMD_N_WINDOW_FLOOD_LIMIT")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|v| v.clamp(1, 30))
+            .unwrap_or(3)
+    }
+
+    fn cmd_n_window_flood_limit_for_app(app_name: &str) -> usize {
+        let normalized = app_name
+            .trim()
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let env_key = format!("STEER_CMD_N_WINDOW_FLOOD_LIMIT_{}", normalized);
+        if let Ok(raw) = std::env::var(&env_key) {
+            if let Ok(parsed) = raw.trim().parse::<usize>() {
+                return parsed.clamp(1, 30);
+            }
+        }
+        if app_name.trim().eq_ignore_ascii_case("Mail") {
+            return 1;
+        }
+        Self::cmd_n_window_flood_limit()
+    }
+
+    fn cmd_n_window_flood_history_window() -> usize {
+        std::env::var("STEER_CMD_N_WINDOW_FLOOD_WINDOW")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|v| v.clamp(12, 512))
+            .unwrap_or(96)
+    }
+
+    fn history_recent_cmd_n_created_count(
+        history: &[String],
+        app_name: &str,
+        recent_window: usize,
+    ) -> usize {
+        let target = app_name.trim().to_lowercase();
+        if target.is_empty() {
+            return 0;
+        }
+
+        let start_idx = history.len().saturating_sub(recent_window);
+        let mut count = 0usize;
+        let mut current_app = String::new();
+
+        for (idx, entry) in history.iter().enumerate() {
+            let lower = entry.to_lowercase();
+            if let Some(rest) = lower.strip_prefix("opened app: ") {
+                current_app = rest.trim().to_string();
+                continue;
+            }
+            if idx < start_idx {
+                continue;
+            }
+            if current_app != target {
+                continue;
+            }
+            if lower.contains("shortcut 'n'") && lower.contains("created new item") {
+                count += 1;
+            }
+        }
+
+        count
     }
 
     fn session_has_single_fire_new_item(
@@ -374,6 +452,7 @@ impl ActionRunner {
         let preferred_id = Self::mail_current_draft_id(history).unwrap_or_default();
         let recipient_hint = Self::preferred_mail_recipient(goal).unwrap_or_default();
         let marker_hint = Self::preferred_run_scope_marker(goal).unwrap_or_default();
+        Self::mail_guard_outgoing_drafts(goal, Some(preferred_id.as_str()))?;
         let lines = [
             "on run argv",
             "set preferredId to \"\"",
@@ -712,6 +791,89 @@ impl ActionRunner {
         Ok(out.trim().parse::<i64>().unwrap_or(0))
     }
 
+    fn mail_max_outgoing_for_auto_draft() -> i64 {
+        std::env::var("STEER_MAIL_MAX_OUTGOING_FOR_AUTO_DRAFT")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .map(|v| v.clamp(1, 64))
+            .unwrap_or(8)
+    }
+
+    fn mail_guard_outgoing_drafts(goal: Option<&str>, keep_draft_id: Option<&str>) -> Result<()> {
+        let limit = Self::mail_max_outgoing_for_auto_draft();
+        let before = Self::mail_outgoing_count().unwrap_or(0);
+        if before <= limit {
+            return Ok(());
+        }
+
+        // Scope-safe cleanup first: remove only drafts tied to current run marker.
+        let _ = Self::mail_cleanup_marker_outgoing(goal, keep_draft_id);
+        let after = Self::mail_outgoing_count().unwrap_or(before);
+        if after <= limit {
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!(
+            "ambiguous_draft: outgoing drafts {} exceed limit {} (set STEER_MAIL_MAX_OUTGOING_FOR_AUTO_DRAFT or clean Mail drafts)",
+            after,
+            limit
+        ))
+    }
+
+    fn mail_cleanup_marker_outgoing(
+        goal: Option<&str>,
+        keep_draft_id: Option<&str>,
+    ) -> Result<i64> {
+        let marker_hint = Self::preferred_run_scope_marker(goal).unwrap_or_default();
+        if marker_hint.trim().is_empty() {
+            return Ok(0);
+        }
+        let keep_hint = keep_draft_id.unwrap_or_default().trim().to_string();
+        let lines = [
+            "on run argv",
+            "set markerHint to item 1 of argv",
+            "set keepDraftId to \"\"",
+            "if (count of argv) >= 2 then set keepDraftId to item 2 of argv",
+            "if markerHint is \"\" then return \"0\"",
+            "set removedCount to 0",
+            "tell application \"Mail\"",
+            "set totalOutgoing to (count of outgoing messages)",
+            "if totalOutgoing > 0 then",
+            "repeat with idx from totalOutgoing to 1 by -1",
+            "set candidate to item idx of outgoing messages",
+            "set candidateId to \"\"",
+            "set candidateSubject to \"\"",
+            "set candidateBody to \"\"",
+            "try",
+            "set candidateId to (id of candidate as text)",
+            "end try",
+            "if keepDraftId is not \"\" and candidateId is keepDraftId then",
+            "-- keep this draft",
+            "else",
+            "try",
+            "set candidateSubject to (subject of candidate as text)",
+            "end try",
+            "try",
+            "set candidateBody to (content of candidate as text)",
+            "end try",
+            "if candidateBody is missing value then set candidateBody to \"\"",
+            "if candidateSubject contains markerHint or candidateBody contains markerHint then",
+            "try",
+            "delete candidate",
+            "set removedCount to removedCount + 1",
+            "end try",
+            "end if",
+            "end if",
+            "end repeat",
+            "end if",
+            "end tell",
+            "return removedCount as text",
+            "end run",
+        ];
+        let out = crate::applescript::run_with_args(&lines, &[marker_hint, keep_hint])?;
+        Ok(out.trim().parse::<i64>().unwrap_or(0))
+    }
+
     fn parse_mail_send_result(raw: &str) -> MailSendResult {
         let mut parts = raw.trim().split('|');
         MailSendResult {
@@ -723,6 +885,17 @@ impl ActionRunner {
             draft_id: parts.next().unwrap_or("").trim().to_string(),
             body_len: parts.next().and_then(|v| v.trim().parse::<i64>().ok()),
         }
+    }
+
+    fn enforce_mail_send_policy(goal: Option<&str>, send_result: &MailSendResult) -> Result<()> {
+        crate::outbound_policy::enforce_mail_send_policy(
+            goal,
+            &send_result.recipient,
+            &send_result.subject,
+            send_result.body_len,
+            &send_result.status,
+        )
+        .map_err(|e| anyhow::anyhow!(e))
     }
 
     fn mail_send_latest_message(goal: Option<&str>, draft_id: Option<&str>) -> Result<String> {
@@ -877,9 +1050,6 @@ impl ActionRunner {
             "tell application \"Mail\"",
             "set beforeOutgoing to (count of outgoing messages)",
             "if beforeOutgoing = 0 then",
-            "if my sent_message_exists(subjectHint, fallbackAddress, markerHint) then",
-            "return \"sent_confirmed|0|0|\" & fallbackAddress & \"|\" & subjectHint & \"||0\"",
-            "end if",
             "return \"no_draft|0|0||\"",
             "end if",
             "if draftHint is \"\" then",
@@ -919,13 +1089,23 @@ impl ActionRunner {
             "if hasTarget is false then",
             "make new to recipient at end of to recipients of _msg with properties {address:fallbackAddress}",
             "end if",
-            "set _recipient to fallbackAddress",
+            "set _recipient to \"\"",
+            "repeat with r in to recipients of _msg",
+            "try",
+            "set _recipient to _recipient & \" \" & (address of r as text)",
+            "end try",
+            "end repeat",
             "else",
             "if (count of to recipients of _msg) = 0 then",
             "return \"missing_recipient|\" & beforeOutgoing & \"|\" & beforeOutgoing & \"||\" & _subject",
             "else",
             "try",
-            "set _recipient to (address of first to recipient of _msg as text)",
+            "set _recipient to \"\"",
+            "repeat with r in to recipients of _msg",
+            "try",
+            "set _recipient to _recipient & \" \" & (address of r as text)",
+            "end try",
+            "end repeat",
             "end try",
             "end if",
             "end if",
@@ -942,6 +1122,9 @@ impl ActionRunner {
             "try",
             "set _bodyLen to (length of _bodyText)",
             "end try",
+            "if _bodyLen <= 2 then",
+            "return \"empty_body|\" & beforeOutgoing & \"|\" & beforeOutgoing & \"|\" & _recipient & \"|\" & _subject & \"|\" & _draftId & \"|\" & _bodyLen",
+            "end if",
             "if markerHint is not \"\" and (_bodyText does not contain markerHint) then",
             "if strictDraftCheck then",
             "return \"missing_marker|\" & beforeOutgoing & \"|\" & beforeOutgoing & \"|\" & _recipient & \"|\" & _subject & \"|\" & _draftId & \"|\" & _bodyLen",
@@ -986,7 +1169,14 @@ impl ActionRunner {
             "set _subject to (subject of _msg as text)",
             "end try",
             "try",
-            "if (count of to recipients of _msg) > 0 then set _recipient to (address of first to recipient of _msg as text)",
+            "if (count of to recipients of _msg) > 0 then",
+            "set _recipient to \"\"",
+            "repeat with r in to recipients of _msg",
+            "try",
+            "set _recipient to _recipient & \" \" & (address of r as text)",
+            "end try",
+            "end repeat",
+            "end if",
             "end try",
             "try",
             "set _draftId to (id of _msg as text)",
@@ -1282,6 +1472,14 @@ impl ActionRunner {
     }
 
     fn mail_send_fresh_from_goal(goal: &str, history: &mut Vec<String>) -> Result<String> {
+        if let Ok(removed) = Self::mail_cleanup_marker_outgoing(Some(goal), None) {
+            if removed > 0 {
+                info!(
+                    "      📧 [MailDraft] cleaned stale marker drafts before fresh send: {}",
+                    removed
+                );
+            }
+        }
         let mut body_lines = Self::extract_quoted_fragments(goal)
             .into_iter()
             .filter(|s| s.len() >= 3)
@@ -1897,6 +2095,12 @@ impl ActionRunner {
                     .map(|v| v.trim().to_lowercase())
                     .filter(|v| !v.is_empty())
                     .or_else(|| {
+                        Self::preferred_target_app_from_history("shortcut", plan, history)
+                            .map(|v| v.trim().to_lowercase())
+                            .filter(|v| !v.is_empty())
+                    })
+                    .or_else(|| heuristics::goal_primary_app(goal).map(|v| v.trim().to_lowercase()))
+                    .or_else(|| {
                         Self::last_opened_app_from_history(history).map(|v| v.trim().to_lowercase())
                     })
                     .unwrap_or_else(|| "unknown".to_string());
@@ -1997,6 +2201,52 @@ impl ActionRunner {
             }
         }
         Some(target)
+    }
+
+    fn resolve_shortcut_target_app(
+        action_type: &str,
+        plan: &serde_json::Value,
+        history: &[String],
+        goal: &str,
+        front_app: &str,
+    ) -> String {
+        if let Some(app) = plan
+            .get("app")
+            .and_then(|v| v.as_str())
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+        {
+            return app.to_string();
+        }
+
+        if let Some(app) = Self::preferred_target_app_from_history(action_type, plan, history) {
+            let trimmed = app.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+
+        let front_trimmed = front_app.trim();
+        if !front_trimmed.is_empty() && !Self::is_focus_noise_app(front_trimmed) {
+            return front_trimmed.to_string();
+        }
+
+        if let Some(app) = heuristics::goal_primary_app(goal) {
+            return app.to_string();
+        }
+
+        if let Some(app) = Self::last_opened_app_from_history(history) {
+            let trimmed = app.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+
+        if !front_trimmed.is_empty() {
+            return front_trimmed.to_string();
+        }
+
+        "unknown".to_string()
     }
 
     async fn stabilize_focus_for_action(
@@ -2678,18 +2928,23 @@ impl ActionRunner {
                     let is_cmd_shift_d = key == "d" && has_command && has_shift;
                     let front_app = crate::tool_chaining::CrossAppBridge::get_frontmost_app()
                         .unwrap_or_default();
-                    let cmd_n_target_app = plan["app"]
-                        .as_str()
-                        .unwrap_or(front_app.as_str())
-                        .trim()
-                        .to_string();
+                    let cmd_n_target_app =
+                        Self::resolve_shortcut_target_app("key", plan, history, goal, &front_app);
                     let cmd_n_single_fire_key = format!(
                         "shortcut:{}:command+n:new_item",
                         cmd_n_target_app.to_lowercase()
                     );
+                    let cmd_n_history_skip = is_cmd_n
+                        && !cmd_n_target_app.is_empty()
+                        && Self::should_skip_redundant_cmd_n(history, &cmd_n_target_app);
                     let cmd_n_session_skip = is_cmd_n
                         && !cmd_n_target_app.is_empty()
                         && Self::session_has_single_fire_new_item(session, &cmd_n_single_fire_key);
+                    let cmd_n_mail_draft_tracked = is_cmd_n
+                        && cmd_n_target_app.eq_ignore_ascii_case("Mail")
+                        && Self::has_tracked_mail_draft(history);
+                    let cmd_n_redundant_skip =
+                        cmd_n_history_skip || cmd_n_session_skip || cmd_n_mail_draft_tracked;
                     let (cmd_n_attempts, cmd_n_successes) = if is_cmd_n {
                         Self::session_cmd_n_stats(session, &cmd_n_target_app)
                     } else {
@@ -2699,8 +2954,49 @@ impl ActionRunner {
                         && !cmd_n_target_app.is_empty()
                         && cmd_n_successes == 0
                         && cmd_n_attempts >= Self::max_cmd_n_attempts_per_app();
+                    let cmd_n_recent_created = if is_cmd_n {
+                        Self::history_recent_cmd_n_created_count(
+                            history,
+                            &cmd_n_target_app,
+                            Self::cmd_n_window_flood_history_window(),
+                        )
+                    } else {
+                        0
+                    };
+                    let cmd_n_flood_limit = if is_cmd_n {
+                        Self::cmd_n_window_flood_limit_for_app(&cmd_n_target_app)
+                    } else {
+                        Self::cmd_n_window_flood_limit()
+                    };
+                    let cmd_n_window_flood_hit = is_cmd_n
+                        && cmd_n_recent_created >= cmd_n_flood_limit;
 
-                    if cmd_n_attempt_guard_hit {
+                    if is_cmd_n
+                        && (cmd_n_target_app.is_empty()
+                            || cmd_n_target_app.eq_ignore_ascii_case("unknown"))
+                    {
+                        description =
+                            "Shortcut 'n' + [command] blocked (target app unresolved)".to_string();
+                        action_status_override = Some("failed");
+                        action_data = Some(json!({
+                            "proof": "cmd_n_target_unknown_block",
+                            "shortcut": "cmd+n",
+                            "front_app": front_app
+                        }));
+                    } else if cmd_n_window_flood_hit {
+                        description = format!(
+                            "Shortcut '{}' + {:?} blocked (window flood guard, recent_created={})",
+                            key, shortcut_modifiers, cmd_n_recent_created
+                        );
+                        action_status_override = Some("failed");
+                        action_data = Some(json!({
+                            "proof": "cmd_n_window_flood_block",
+                            "front_app": cmd_n_target_app,
+                            "shortcut": "cmd+n",
+                            "recent_created": cmd_n_recent_created,
+                            "flood_limit": cmd_n_flood_limit
+                        }));
+                    } else if cmd_n_attempt_guard_hit {
                         description = format!(
                             "Shortcut '{}' + {:?} blocked (cmd+n loop guard in {}, attempts={})",
                             key, shortcut_modifiers, cmd_n_target_app, cmd_n_attempts
@@ -2712,11 +3008,14 @@ impl ActionRunner {
                             "shortcut": "cmd+n",
                             "attempts": cmd_n_attempts
                         }));
-                    } else if is_cmd_n
-                        && !cmd_n_target_app.is_empty()
-                        && (Self::should_skip_redundant_cmd_n(history, &cmd_n_target_app)
-                            || cmd_n_session_skip)
-                    {
+                    } else if is_cmd_n && !cmd_n_target_app.is_empty() && cmd_n_redundant_skip {
+                        let skip_reason = if cmd_n_mail_draft_tracked {
+                            "mail_draft_tracked"
+                        } else if cmd_n_session_skip {
+                            "session_single_fire"
+                        } else {
+                            "history_redundant"
+                        };
                         description = format!(
                             "Shortcut '{}' + {:?} skipped (redundant new item in {})",
                             key, shortcut_modifiers, cmd_n_target_app
@@ -2725,7 +3024,8 @@ impl ActionRunner {
                         action_data = Some(json!({
                             "proof": "redundant_new_item_skip",
                             "front_app": cmd_n_target_app,
-                            "shortcut": "cmd+n"
+                            "shortcut": "cmd+n",
+                            "reason": skip_reason
                         }));
                     } else if is_cmd_n && cmd_n_target_app.eq_ignore_ascii_case("Mail") {
                         let _ = heuristics::ensure_app_focus("Mail", 5).await;
@@ -2756,12 +3056,21 @@ impl ActionRunner {
                                 let outgoing_after = send_result
                                     .outgoing_after
                                     .unwrap_or_else(|| Self::mail_outgoing_count().unwrap_or(-1));
-                                if send_result.status == "sent_confirmed" {
+                                let policy_error =
+                                    Self::enforce_mail_send_policy(Some(goal), &send_result).err();
+                                if policy_error.is_none() && send_result.status == "sent_confirmed"
+                                {
                                     description = format!(
                                         "Shortcut '{}' + {:?} (Mail sent)",
                                         key, shortcut_modifiers
                                     );
                                     action_status_override = Some("success");
+                                } else if let Some(policy_err) = policy_error.as_ref() {
+                                    description = format!(
+                                        "Shortcut '{}' + {:?} (mail blocked by outbound policy: {})",
+                                        key, shortcut_modifiers, policy_err
+                                    );
+                                    action_status_override = Some("failed");
                                 } else {
                                     description = format!(
                                         "Shortcut '{}' + {:?} (mail send blocked: {})",
@@ -2778,7 +3087,8 @@ impl ActionRunner {
                                     "recipient": send_result.recipient,
                                     "subject": send_result.subject,
                                     "draft_id": send_result.draft_id,
-                                    "body_len": send_result.body_len
+                                    "body_len": send_result.body_len,
+                                    "outbound_policy_error": policy_error.as_ref().map(|e| e.to_string()).unwrap_or_default()
                                 }));
                                 println!(
                                     "MAIL_SEND_PROOF|status={}|recipient={}|subject={}|body_len={}|draft_id={}",
@@ -2800,8 +3110,32 @@ impl ActionRunner {
                                             send_result.body_len.unwrap_or(-1).to_string(),
                                         ),
                                         ("draft_id", send_result.draft_id.clone()),
+                                        (
+                                            "outbound_policy",
+                                            policy_error
+                                                .as_ref()
+                                                .map(|e| format!("blocked:{}", e))
+                                                .unwrap_or_else(|| "pass".to_string()),
+                                        ),
                                     ],
                                 );
+                                if policy_error.is_none()
+                                    && send_result.status == "sent_confirmed"
+                                    && !send_result.draft_id.trim().is_empty()
+                                {
+                                    if let Ok(removed) = Self::mail_cleanup_marker_outgoing(
+                                        Some(goal),
+                                        Some(send_result.draft_id.as_str()),
+                                    ) {
+                                        if removed > 0 {
+                                            Self::log_evidence(
+                                                "mail",
+                                                "cleanup",
+                                                &[("removed", removed.to_string())],
+                                            );
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
                                 description = format!(
@@ -2863,18 +3197,24 @@ impl ActionRunner {
                         key == "s" && modifiers.iter().any(|m| m.eq_ignore_ascii_case("command"));
                     let front_app = crate::tool_chaining::CrossAppBridge::get_frontmost_app()
                         .unwrap_or_default();
-                    let cmd_n_target_app = plan["app"]
-                        .as_str()
-                        .unwrap_or(front_app.as_str())
-                        .trim()
-                        .to_string();
+                    let cmd_n_target_app = Self::resolve_shortcut_target_app(
+                        "shortcut", plan, history, goal, &front_app,
+                    );
                     let cmd_n_single_fire_key = format!(
                         "shortcut:{}:command+n:new_item",
                         cmd_n_target_app.to_lowercase()
                     );
+                    let cmd_n_history_skip = is_cmd_n
+                        && !cmd_n_target_app.is_empty()
+                        && Self::should_skip_redundant_cmd_n(history, &cmd_n_target_app);
                     let cmd_n_session_skip = is_cmd_n
                         && !cmd_n_target_app.is_empty()
                         && Self::session_has_single_fire_new_item(session, &cmd_n_single_fire_key);
+                    let cmd_n_mail_draft_tracked = is_cmd_n
+                        && cmd_n_target_app.eq_ignore_ascii_case("Mail")
+                        && Self::has_tracked_mail_draft(history);
+                    let cmd_n_redundant_skip =
+                        cmd_n_history_skip || cmd_n_session_skip || cmd_n_mail_draft_tracked;
                     let (cmd_n_attempts, cmd_n_successes) = if is_cmd_n {
                         Self::session_cmd_n_stats(session, &cmd_n_target_app)
                     } else {
@@ -2884,7 +3224,48 @@ impl ActionRunner {
                         && !cmd_n_target_app.is_empty()
                         && cmd_n_successes == 0
                         && cmd_n_attempts >= Self::max_cmd_n_attempts_per_app();
-                    if cmd_n_attempt_guard_hit {
+                    let cmd_n_recent_created = if is_cmd_n {
+                        Self::history_recent_cmd_n_created_count(
+                            history,
+                            &cmd_n_target_app,
+                            Self::cmd_n_window_flood_history_window(),
+                        )
+                    } else {
+                        0
+                    };
+                    let cmd_n_flood_limit = if is_cmd_n {
+                        Self::cmd_n_window_flood_limit_for_app(&cmd_n_target_app)
+                    } else {
+                        Self::cmd_n_window_flood_limit()
+                    };
+                    let cmd_n_window_flood_hit = is_cmd_n
+                        && cmd_n_recent_created >= cmd_n_flood_limit;
+                    if is_cmd_n
+                        && (cmd_n_target_app.is_empty()
+                            || cmd_n_target_app.eq_ignore_ascii_case("unknown"))
+                    {
+                        description =
+                            "Shortcut 'n' + [command] blocked (target app unresolved)".to_string();
+                        action_status_override = Some("failed");
+                        action_data = Some(json!({
+                            "proof": "cmd_n_target_unknown_block",
+                            "shortcut": "cmd+n",
+                            "front_app": front_app
+                        }));
+                    } else if cmd_n_window_flood_hit {
+                        description = format!(
+                            "Shortcut '{}' + {:?} blocked (window flood guard, recent_created={})",
+                            key, modifiers, cmd_n_recent_created
+                        );
+                        action_status_override = Some("failed");
+                        action_data = Some(json!({
+                            "proof": "cmd_n_window_flood_block",
+                            "front_app": cmd_n_target_app,
+                            "shortcut": "cmd+n",
+                            "recent_created": cmd_n_recent_created,
+                            "flood_limit": cmd_n_flood_limit
+                        }));
+                    } else if cmd_n_attempt_guard_hit {
                         description = format!(
                             "Shortcut '{}' + {:?} blocked (cmd+n loop guard in {}, attempts={})",
                             key, modifiers, cmd_n_target_app, cmd_n_attempts
@@ -2896,11 +3277,14 @@ impl ActionRunner {
                             "shortcut": "cmd+n",
                             "attempts": cmd_n_attempts
                         }));
-                    } else if is_cmd_n
-                        && !cmd_n_target_app.is_empty()
-                        && (Self::should_skip_redundant_cmd_n(history, &cmd_n_target_app)
-                            || cmd_n_session_skip)
-                    {
+                    } else if is_cmd_n && !cmd_n_target_app.is_empty() && cmd_n_redundant_skip {
+                        let skip_reason = if cmd_n_mail_draft_tracked {
+                            "mail_draft_tracked"
+                        } else if cmd_n_session_skip {
+                            "session_single_fire"
+                        } else {
+                            "history_redundant"
+                        };
                         description = format!(
                             "Shortcut '{}' + {:?} skipped (redundant new item in {})",
                             key, modifiers, cmd_n_target_app
@@ -2909,7 +3293,8 @@ impl ActionRunner {
                         action_data = Some(json!({
                             "proof": "redundant_new_item_skip",
                             "front_app": cmd_n_target_app,
-                            "shortcut": "cmd+n"
+                            "shortcut": "cmd+n",
+                            "reason": skip_reason
                         }));
                     } else if is_cmd_n && cmd_n_target_app.eq_ignore_ascii_case("Mail") {
                         let _ = heuristics::ensure_app_focus("Mail", 5).await;
@@ -2940,10 +3325,19 @@ impl ActionRunner {
                                 let outgoing_after = send_result
                                     .outgoing_after
                                     .unwrap_or_else(|| Self::mail_outgoing_count().unwrap_or(-1));
-                                if send_result.status == "sent_confirmed" {
+                                let policy_error =
+                                    Self::enforce_mail_send_policy(Some(goal), &send_result).err();
+                                if policy_error.is_none() && send_result.status == "sent_confirmed"
+                                {
                                     description =
                                         format!("Shortcut '{}' + {:?} (Mail sent)", key, modifiers);
                                     action_status_override = Some("success");
+                                } else if let Some(policy_err) = policy_error.as_ref() {
+                                    description = format!(
+                                        "Shortcut '{}' + {:?} (mail blocked by outbound policy: {})",
+                                        key, modifiers, policy_err
+                                    );
+                                    action_status_override = Some("failed");
                                 } else {
                                     description = format!(
                                         "Shortcut '{}' + {:?} (mail send blocked: {})",
@@ -2960,7 +3354,8 @@ impl ActionRunner {
                                     "recipient": send_result.recipient,
                                     "subject": send_result.subject,
                                     "draft_id": send_result.draft_id,
-                                    "body_len": send_result.body_len
+                                    "body_len": send_result.body_len,
+                                    "outbound_policy_error": policy_error.as_ref().map(|e| e.to_string()).unwrap_or_default()
                                 }));
                                 println!(
                                     "MAIL_SEND_PROOF|status={}|recipient={}|subject={}|body_len={}|draft_id={}",
@@ -2982,8 +3377,32 @@ impl ActionRunner {
                                             send_result.body_len.unwrap_or(-1).to_string(),
                                         ),
                                         ("draft_id", send_result.draft_id.clone()),
+                                        (
+                                            "outbound_policy",
+                                            policy_error
+                                                .as_ref()
+                                                .map(|e| format!("blocked:{}", e))
+                                                .unwrap_or_else(|| "pass".to_string()),
+                                        ),
                                     ],
                                 );
+                                if policy_error.is_none()
+                                    && send_result.status == "sent_confirmed"
+                                    && !send_result.draft_id.trim().is_empty()
+                                {
+                                    if let Ok(removed) = Self::mail_cleanup_marker_outgoing(
+                                        Some(goal),
+                                        Some(send_result.draft_id.as_str()),
+                                    ) {
+                                        if removed > 0 {
+                                            Self::log_evidence(
+                                                "mail",
+                                                "cleanup",
+                                                &[("removed", removed.to_string())],
+                                            );
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
                                 description = format!(
@@ -3055,9 +3474,15 @@ impl ActionRunner {
                         let outgoing_after = send_result
                             .outgoing_after
                             .unwrap_or_else(|| Self::mail_outgoing_count().unwrap_or(-1));
-                        if send_result.status == "sent_confirmed" {
+                        let policy_error =
+                            Self::enforce_mail_send_policy(Some(goal), &send_result).err();
+                        if policy_error.is_none() && send_result.status == "sent_confirmed" {
                             description = "Mail send completed".to_string();
                             action_status_override = Some("success");
+                        } else if let Some(policy_err) = policy_error.as_ref() {
+                            description =
+                                format!("Mail send blocked by outbound policy: {}", policy_err);
+                            action_status_override = Some("failed");
                         } else {
                             description = format!("Mail send blocked: {}", result_raw);
                             action_status_override = Some("failed");
@@ -3072,7 +3497,8 @@ impl ActionRunner {
                             "subject": send_result.subject,
                             "draft_id": send_result.draft_id,
                             "body_len": send_result.body_len,
-                            "fresh_recovery_used": fresh_recovery_used
+                            "fresh_recovery_used": fresh_recovery_used,
+                            "outbound_policy_error": policy_error.as_ref().map(|e| e.to_string()).unwrap_or_default()
                         }));
                         println!(
                             "MAIL_SEND_PROOF|status={}|recipient={}|subject={}|body_len={}|draft_id={}|fresh_recovery={}",
@@ -3093,8 +3519,32 @@ impl ActionRunner {
                                 ("body_len", send_result.body_len.unwrap_or(-1).to_string()),
                                 ("draft_id", send_result.draft_id.clone()),
                                 ("fresh_recovery", fresh_recovery_used.to_string()),
+                                (
+                                    "outbound_policy",
+                                    policy_error
+                                        .as_ref()
+                                        .map(|e| format!("blocked:{}", e))
+                                        .unwrap_or_else(|| "pass".to_string()),
+                                ),
                             ],
                         );
+                        if policy_error.is_none()
+                            && send_result.status == "sent_confirmed"
+                            && !send_result.draft_id.trim().is_empty()
+                        {
+                            if let Ok(removed) = Self::mail_cleanup_marker_outgoing(
+                                Some(goal),
+                                Some(send_result.draft_id.as_str()),
+                            ) {
+                                if removed > 0 {
+                                    Self::log_evidence(
+                                        "mail",
+                                        "cleanup",
+                                        &[("removed", removed.to_string())],
+                                    );
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         description = format!("mail_send failed: {}", e);
@@ -3656,6 +4106,7 @@ impl ActionRunner {
 mod tests {
     use super::ActionRunner;
     use serde_json::json;
+    use serial_test::serial;
 
     #[test]
     fn normalize_email_candidate_strips_korean_particle_suffix() {
@@ -3698,6 +4149,17 @@ mod tests {
             key_from_history.as_deref(),
             Some("shortcut:notes:command+n:new_item")
         );
+
+        let key_from_goal = ActionRunner::action_idempotency_key(
+            "shortcut",
+            &plan_without_app,
+            "메일 새 창 만들어줘",
+            &[],
+        );
+        assert_eq!(
+            key_from_goal.as_deref(),
+            Some("shortcut:mail:command+n:new_item")
+        );
     }
 
     #[test]
@@ -3708,6 +4170,89 @@ mod tests {
             "Typed 'Subject' (mail subject)".to_string(),
         ];
         assert!(ActionRunner::should_skip_redundant_cmd_n(&history, "Mail"));
+        assert!(!ActionRunner::should_skip_redundant_cmd_n(
+            &history, "Notes"
+        ));
+    }
+
+    #[test]
+    fn history_recent_cmd_n_created_count_tracks_window_flood() {
+        let history = vec![
+            "Opened app: Mail".to_string(),
+            "Shortcut 'n' + [\"command\"] (Created new item)".to_string(),
+            "Typed 'Subject A'".to_string(),
+            "Shortcut 'n' + [\"command\"] (Created new item)".to_string(),
+            "Typed 'Subject B'".to_string(),
+            "Shortcut 'n' + [\"command\"] (Created new item)".to_string(),
+        ];
+        let count = ActionRunner::history_recent_cmd_n_created_count(&history, "Mail", 16);
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn history_recent_cmd_n_created_count_is_app_scoped() {
+        let history = vec![
+            "Opened app: Mail".to_string(),
+            "Shortcut 'n' + [\"command\"] (Created new item)".to_string(),
+            "Opened app: Notes".to_string(),
+            "Shortcut 'n' + [\"command\"] (Created new item)".to_string(),
+            "Shortcut 'n' + [\"command\"] (Created new item)".to_string(),
+            "Opened app: Mail".to_string(),
+            "Shortcut 'n' + [\"command\"] (Created new item)".to_string(),
+        ];
+
+        let mail_count = ActionRunner::history_recent_cmd_n_created_count(&history, "Mail", 32);
+        let notes_count = ActionRunner::history_recent_cmd_n_created_count(&history, "Notes", 32);
+
+        assert_eq!(mail_count, 2);
+        assert_eq!(notes_count, 2);
+    }
+
+    #[test]
+    #[serial]
+    fn cmd_n_window_flood_limit_for_mail_defaults_to_one() {
+        std::env::remove_var("STEER_CMD_N_WINDOW_FLOOD_LIMIT");
+        std::env::remove_var("STEER_CMD_N_WINDOW_FLOOD_LIMIT_MAIL");
+        let got = ActionRunner::cmd_n_window_flood_limit_for_app("Mail");
+        assert_eq!(got, 1);
+    }
+
+    #[test]
+    #[serial]
+    fn cmd_n_window_flood_limit_for_app_specific_env_overrides_default() {
+        std::env::set_var("STEER_CMD_N_WINDOW_FLOOD_LIMIT", "4");
+        std::env::set_var("STEER_CMD_N_WINDOW_FLOOD_LIMIT_MAIL", "2");
+        let mail = ActionRunner::cmd_n_window_flood_limit_for_app("Mail");
+        let notes = ActionRunner::cmd_n_window_flood_limit_for_app("Notes");
+        std::env::remove_var("STEER_CMD_N_WINDOW_FLOOD_LIMIT_MAIL");
+        std::env::remove_var("STEER_CMD_N_WINDOW_FLOOD_LIMIT");
+        assert_eq!(mail, 2);
+        assert_eq!(notes, 4);
+    }
+
+    #[test]
+    #[serial]
+    fn mail_max_outgoing_for_auto_draft_defaults_and_clamps() {
+        std::env::remove_var("STEER_MAIL_MAX_OUTGOING_FOR_AUTO_DRAFT");
+        assert_eq!(ActionRunner::mail_max_outgoing_for_auto_draft(), 8);
+
+        std::env::set_var("STEER_MAIL_MAX_OUTGOING_FOR_AUTO_DRAFT", "0");
+        assert_eq!(ActionRunner::mail_max_outgoing_for_auto_draft(), 1);
+
+        std::env::set_var("STEER_MAIL_MAX_OUTGOING_FOR_AUTO_DRAFT", "999");
+        assert_eq!(ActionRunner::mail_max_outgoing_for_auto_draft(), 64);
+
+        std::env::remove_var("STEER_MAIL_MAX_OUTGOING_FOR_AUTO_DRAFT");
+    }
+
+    #[test]
+    fn tracked_mail_draft_is_detected_even_without_recent_cmd_n_phrase() {
+        let history = vec![
+            "Opened app: Mail".to_string(),
+            "MAIL_DRAFT_ID:123456".to_string(),
+            "Typed '안건 공유' (mail subject)".to_string(),
+        ];
+        assert!(ActionRunner::has_tracked_mail_draft(&history));
         assert!(!ActionRunner::should_skip_redundant_cmd_n(
             &history, "Notes"
         ));

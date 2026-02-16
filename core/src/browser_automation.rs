@@ -66,6 +66,111 @@ impl BrowserAutomation {
         }
     }
 
+    fn env_bool_with_default(key: &str, default: bool) -> bool {
+        std::env::var(key)
+            .ok()
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(default)
+    }
+
+    fn env_usize_bounded(key: &str, default: usize, min: usize, max: usize) -> usize {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|v| v.clamp(min, max))
+            .unwrap_or(default)
+    }
+
+    fn env_u64_bounded(key: &str, default: u64, min: u64, max: u64) -> u64 {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|v| v.clamp(min, max))
+            .unwrap_or(default)
+    }
+
+    fn snapshot_focus_recovery_enabled() -> bool {
+        Self::env_bool_with_default("STEER_BROWSER_SNAPSHOT_FOCUS_RECOVERY", true)
+    }
+
+    fn snapshot_retry_count() -> usize {
+        Self::env_usize_bounded("STEER_BROWSER_SNAPSHOT_RETRIES", 2, 0, 8)
+    }
+
+    fn snapshot_retry_ms() -> u64 {
+        Self::env_u64_bounded("STEER_BROWSER_SNAPSHOT_RETRY_MS", 160, 30, 2000)
+    }
+
+    fn snapshot_recovery_apps() -> Vec<String> {
+        let raw = std::env::var("STEER_BROWSER_SNAPSHOT_RECOVERY_APPS")
+            .unwrap_or_else(|_| "Safari,Google Chrome,Arc".to_string());
+        raw.split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    fn activate_app(app_name: &str) {
+        let escaped = app_name.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!("tell application \"{}\" to activate", escaped);
+        let _ = Command::new("osascript").arg("-e").arg(script).output();
+    }
+
+    fn recover_snapshot_focus(attempt: usize) {
+        let apps = Self::snapshot_recovery_apps();
+        if apps.is_empty() {
+            return;
+        }
+        let front = CrossAppBridge::get_frontmost_app().unwrap_or_default();
+        let front_already_browser = apps.iter().any(|a| a.eq_ignore_ascii_case(front.trim()));
+        if front_already_browser {
+            return;
+        }
+        let idx = if attempt == 0 {
+            0
+        } else {
+            (attempt - 1) % apps.len()
+        };
+        if let Some(target) = apps.get(idx) {
+            Self::activate_app(target);
+        }
+    }
+
+    fn parse_snapshot_stdout(&mut self, stdout: &str) -> Vec<ElementRef> {
+        let mut refs = Vec::new();
+        self.element_refs.clear();
+        self.ref_counter = 0;
+        self.last_snapshot_refs.clear();
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.split('|').collect();
+            if parts.len() < 6 {
+                continue;
+            }
+            self.ref_counter += 1;
+            let ref_id = format!("E{}", self.ref_counter);
+            let elem_ref = ElementRef {
+                id: ref_id.clone(),
+                role: parts[0].to_string(),
+                name: parts[1].to_string(),
+                bounds: Some(Bounds {
+                    x: parts[2].parse().unwrap_or(0),
+                    y: parts[3].parse().unwrap_or(0),
+                    width: parts[4].parse().unwrap_or(0),
+                    height: parts[5].parse().unwrap_or(0),
+                }),
+            };
+            self.element_refs.insert(ref_id, elem_ref.clone());
+            refs.push(elem_ref);
+        }
+        refs
+    }
+
     // =====================================================
     // Snapshot: Build element reference map (like clawdbot's restoreRoleRefsForTarget)
     // =====================================================
@@ -106,35 +211,38 @@ impl BrowserAutomation {
             end tell
         "#;
 
-        let output = Command::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .output()
-            .context("Failed to execute AppleScript for snapshot")?;
+        let retry_count = Self::snapshot_retry_count();
+        let retry_sleep = std::time::Duration::from_millis(Self::snapshot_retry_ms());
+        let recovery_enabled = Self::snapshot_focus_recovery_enabled();
+        let mut last_script_issue: Option<String> = None;
 
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
+        for attempt in 0..=retry_count {
+            if attempt > 0 && recovery_enabled {
+                Self::recover_snapshot_focus(attempt);
+                std::thread::sleep(retry_sleep);
+            }
 
-            for line in stdout.lines() {
-                let parts: Vec<&str> = line.split('|').collect();
-                if parts.len() >= 6 {
-                    self.ref_counter += 1;
-                    let ref_id = format!("E{}", self.ref_counter);
-
-                    let elem_ref = ElementRef {
-                        id: ref_id.clone(),
-                        role: parts[0].to_string(),
-                        name: parts[1].to_string(),
-                        bounds: Some(Bounds {
-                            x: parts[2].parse().unwrap_or(0),
-                            y: parts[3].parse().unwrap_or(0),
-                            width: parts[4].parse().unwrap_or(0),
-                            height: parts[5].parse().unwrap_or(0),
-                        }),
-                    };
-
-                    self.element_refs.insert(ref_id.clone(), elem_ref.clone());
-                    refs.push(elem_ref);
+            match Command::new("osascript").arg("-e").arg(script).output() {
+                Ok(output) => {
+                    if output.status.success() {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        refs = self.parse_snapshot_stdout(&stdout);
+                        if !refs.is_empty() {
+                            break;
+                        }
+                        last_script_issue = Some("osascript_ok_but_no_elements".to_string());
+                    } else {
+                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        let detail = if !stderr.is_empty() { stderr } else { stdout };
+                        last_script_issue = Some(format!(
+                            "osascript_failed(status={} detail={})",
+                            output.status, detail
+                        ));
+                    }
+                }
+                Err(err) => {
+                    last_script_issue = Some(format!("osascript_exec_error: {}", err));
                 }
             }
         }
@@ -179,9 +287,11 @@ impl BrowserAutomation {
         println!("📸 [Browser] Snapshot captured: {} elements", refs.len());
         if refs.is_empty() && !crate::env_flag("STEER_ALLOW_EMPTY_SNAPSHOT_REFS") {
             let front_app = CrossAppBridge::get_frontmost_app().unwrap_or_default();
+            let issue = last_script_issue.unwrap_or_else(|| "unknown".to_string());
             return Err(anyhow::anyhow!(
-                "snapshot returned zero elements (frontmost='{}'). ensure target window is visible/focused and accessibility permissions are granted",
-                front_app
+                "snapshot returned zero elements (frontmost='{}', issue='{}'). ensure target window is visible/focused and accessibility permissions are granted",
+                front_app,
+                issue
             ));
         }
         Ok(refs)

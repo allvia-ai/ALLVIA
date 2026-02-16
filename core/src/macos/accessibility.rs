@@ -21,6 +21,73 @@ fn check_ax_err(err: i32) -> Result<(), i32> {
     }
 }
 
+fn env_flag_default(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
+}
+
+fn env_usize_bounded(key: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|v| v.clamp(min, max))
+        .unwrap_or(default)
+}
+
+fn env_u64_bounded(key: &str, default: u64, min: u64, max: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.clamp(min, max))
+        .unwrap_or(default)
+}
+
+fn snapshot_focus_retry_count() -> usize {
+    env_usize_bounded("STEER_AX_SNAPSHOT_FOCUS_RETRIES", 2, 0, 8)
+}
+
+fn snapshot_focus_retry_ms() -> u64 {
+    env_u64_bounded("STEER_AX_SNAPSHOT_RETRY_MS", 120, 20, 2000)
+}
+
+fn snapshot_window_retry_count() -> usize {
+    env_usize_bounded("STEER_AX_SNAPSHOT_WINDOW_RETRIES", 3, 0, 12)
+}
+
+fn snapshot_window_retry_ms() -> u64 {
+    env_u64_bounded("STEER_AX_SNAPSHOT_WINDOW_RETRY_MS", 90, 20, 2000)
+}
+
+fn snapshot_fallback_app_name() -> String {
+    std::env::var("STEER_AX_SNAPSHOT_FALLBACK_APP")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "Finder".to_string())
+}
+
+fn snapshot_strict_mode() -> bool {
+    if let Ok(raw) = std::env::var("STEER_AX_SNAPSHOT_STRICT") {
+        let normalized = raw.trim().to_ascii_lowercase();
+        if matches!(normalized.as_str(), "0" | "false" | "no" | "off") {
+            return false;
+        }
+        if matches!(normalized.as_str(), "1" | "true" | "yes" | "on") {
+            return true;
+        }
+    }
+    crate::env_flag("STEER_SCENARIO_MODE")
+        || crate::env_flag("STEER_TEST_MODE")
+        || env_flag_default("STEER_PREFLIGHT_FOCUS_HANDOFF", false)
+}
+
 // Helper to get attribute
 fn get_attribute(element: AXUIElementRef, attribute: &str) -> Option<CFTypeRef> {
     unsafe {
@@ -50,6 +117,13 @@ pub fn snapshot(_scope: Option<String>) -> Value {
     println!("[MacOS] Capturing Snapshot (Native)...");
 
     unsafe {
+        let strict_mode = snapshot_strict_mode();
+        let retry_count = snapshot_focus_retry_count();
+        let retry_sleep = Duration::from_millis(snapshot_focus_retry_ms());
+        let window_retry_count = snapshot_window_retry_count();
+        let window_retry_sleep = Duration::from_millis(snapshot_window_retry_ms());
+        let fallback_app = snapshot_fallback_app_name();
+
         // 1. System Wide
         let system_wide = AXUIElementCreateSystemWide();
         let _system_wrapper = AxElement(system_wide); // Auto-release
@@ -57,20 +131,40 @@ pub fn snapshot(_scope: Option<String>) -> Value {
         // 2. Focused App
         let mut focused_app_ref = resolve_focused_application(system_wide);
         if focused_app_ref.is_none() {
-            let (front_name, front_pid) = frontmost_app_info_via_osascript().unwrap_or_default();
-            if let Some(pid) = front_pid {
-                bring_process_frontmost(pid);
-            } else if !front_name.is_empty() {
-                activate_application_by_name(&front_name);
+            for _ in 0..retry_count {
+                let (front_name, front_pid) =
+                    frontmost_app_info_via_osascript().unwrap_or_default();
+                if let Some(pid) = front_pid {
+                    bring_process_frontmost(pid);
+                } else if !front_name.is_empty() {
+                    activate_application_by_name(&front_name);
+                }
+                thread::sleep(retry_sleep);
+                focused_app_ref = resolve_focused_application(system_wide);
+                if focused_app_ref.is_some() {
+                    break;
+                }
             }
-            thread::sleep(Duration::from_millis(120));
+        }
+        if focused_app_ref.is_none() {
+            activate_application_by_name(&fallback_app);
+            thread::sleep(retry_sleep);
             focused_app_ref = resolve_focused_application(system_wide);
         }
         let focused_app_ref = match focused_app_ref {
             Some(v) => v,
             None => {
                 let (front_name, _) = frontmost_app_info_via_osascript().unwrap_or_default();
-                return json!({
+                crate::diagnostic_events::emit(
+                    "ax.snapshot.focus_missing",
+                    json!({
+                        "kind": "application",
+                        "frontmost_app_hint": front_name,
+                        "fallback_app": fallback_app,
+                        "strict_mode": strict_mode
+                    }),
+                );
+                let mut payload = json!({
                     "role": "AXApplication",
                     "title": front_name,
                     "focused_window": {
@@ -79,8 +173,14 @@ pub fn snapshot(_scope: Option<String>) -> Value {
                         "children": []
                     },
                     "warning": "No focused application",
-                    "frontmost_app_hint": front_name
+                    "frontmost_app_hint": front_name,
+                    "strict_mode": strict_mode,
+                    "ok": false
                 });
+                if strict_mode {
+                    payload["error"] = json!("NO_FOCUSED_APPLICATION");
+                }
+                return payload;
             }
         };
         // Note: get_attribute returns +1 retain count, so we wrap it
@@ -98,10 +198,39 @@ pub fn snapshot(_scope: Option<String>) -> Value {
         };
 
         // 3. Focused Window
-        let focused_window_ref = match resolve_focused_window(focused_app_ref) {
+        let mut focused_window_ref = resolve_focused_window(focused_app_ref);
+        if focused_window_ref.is_none() {
+            for _ in 0..window_retry_count {
+                let (front_name, front_pid) = frontmost_app_info_via_osascript().unwrap_or_default();
+                if let Some(pid) = front_pid {
+                    bring_process_frontmost(pid);
+                } else if !front_name.trim().is_empty() {
+                    activate_application_by_name(&front_name);
+                } else if !app_title.trim().is_empty() {
+                    activate_application_by_name(&app_title);
+                } else {
+                    activate_application_by_name(&fallback_app);
+                }
+                thread::sleep(window_retry_sleep);
+                focused_window_ref = resolve_focused_window(focused_app_ref);
+                if focused_window_ref.is_some() {
+                    break;
+                }
+            }
+        }
+        let focused_window_ref = match focused_window_ref {
             Some(r) => r,
             None => {
-                return json!({
+                crate::diagnostic_events::emit(
+                    "ax.snapshot.focus_missing",
+                    json!({
+                        "kind": "window",
+                        "app_title": app_title,
+                        "fallback_app": fallback_app,
+                        "strict_mode": strict_mode
+                    }),
+                );
+                let mut payload = json!({
                     "role": "AXApplication",
                     "title": app_title,
                     "focused_window": {
@@ -109,8 +238,14 @@ pub fn snapshot(_scope: Option<String>) -> Value {
                         "title": "",
                         "children": []
                     },
-                    "warning": "No focused window"
-                })
+                    "warning": "No focused window",
+                    "strict_mode": strict_mode,
+                    "ok": false
+                });
+                if strict_mode {
+                    payload["error"] = json!("NO_FOCUSED_WINDOW");
+                }
+                return payload;
             }
         };
         let _focused_window = AxElement(focused_window_ref);
@@ -128,7 +263,9 @@ pub fn snapshot(_scope: Option<String>) -> Value {
                 "role": "AXWindow",
                 "title": window_title,
                 "children": children_json
-            }
+            },
+            "strict_mode": strict_mode,
+            "ok": true
         })
     }
 }

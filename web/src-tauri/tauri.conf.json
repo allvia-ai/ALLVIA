@@ -13,8 +13,8 @@
     "windows": [
       {
         "title": "Steer OS Launcher",
-        "width": 1220,
-        "height": 184,
+        "width": 1060,
+        "height": 160,
         "resizable": false,
         "fullscreen": false,
         "decorations": false,

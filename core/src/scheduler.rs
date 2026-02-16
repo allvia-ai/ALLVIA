@@ -3,8 +3,11 @@ use crate::{db, workflow_intake};
 use cron::Schedule;
 use std::collections::HashSet;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::time::{self, Duration};
+
+static SCHEDULER_STARTED: AtomicBool = AtomicBool::new(false);
 
 struct RoutineClaimGuard {
     routine_id: i64,
@@ -27,6 +30,30 @@ impl Scheduler {
     }
 
     pub fn start(&self) {
+        let allow_multi_scheduler = std::env::var("STEER_ALLOW_MULTI_SCHEDULER")
+            .ok()
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+        if !allow_multi_scheduler
+            && SCHEDULER_STARTED
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            println!("⏭️ Scheduler already started. Ignoring duplicate start().");
+            crate::diagnostic_events::emit(
+                "scheduler.start.skipped",
+                serde_json::json!({
+                    "reason": "already_started"
+                }),
+            );
+            return;
+        }
+
         let llm = self.llm.clone();
         let active_routines = Arc::new(tokio::sync::Mutex::new(HashSet::<i64>::new()));
         let claim_owner = format!(
@@ -37,6 +64,13 @@ impl Scheduler {
 
         tokio::spawn(async move {
             println!("⏰ Routine Scheduler started (Tick: 60s)");
+            crate::diagnostic_events::emit(
+                "scheduler.start",
+                serde_json::json!({
+                    "tick_seconds": 60,
+                    "claim_owner": claim_owner
+                }),
+            );
             let max_retries: u32 = std::env::var("ROUTINE_MAX_RETRIES")
                 .ok()
                 .and_then(|v| v.parse().ok())

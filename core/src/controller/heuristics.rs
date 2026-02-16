@@ -550,26 +550,30 @@ pub fn try_close_front_dialog() -> bool {
 
 pub fn goal_primary_app(goal: &str) -> Option<&'static str> {
     let lower = goal.to_lowercase();
-    if lower.contains("safari") {
+    if lower.contains("safari") || lower.contains("사파리") {
         return Some("Safari");
     }
-    if lower.contains("notes") {
+    if lower.contains("notes") || lower.contains("노트") || lower.contains("메모") {
         return Some("Notes");
     }
-    if lower.contains("mail") {
+    if lower.contains("mail") || lower.contains("메일") || lower.contains("gmail") {
         return Some("Mail");
     }
-    if lower.contains("textedit") {
+    if lower.contains("textedit") || lower.contains("텍스트에디트") || lower.contains("텍스트 편집")
+    {
         return Some("TextEdit");
     }
-    if lower.contains("calculator") {
+    if lower.contains("calculator") || lower.contains("계산기") {
         return Some("Calculator");
     }
-    if lower.contains("finder") {
+    if lower.contains("finder") || lower.contains("파인더") {
         return Some("Finder");
     }
-    if lower.contains("preview") {
+    if lower.contains("preview") || lower.contains("미리보기") {
         return Some("Preview");
+    }
+    if lower.contains("calendar") || lower.contains("캘린더") {
+        return Some("Calendar");
     }
     None
 }

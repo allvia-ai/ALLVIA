@@ -238,6 +238,7 @@ export const AgentExecuteResponseSchema = z.object({
         .optional(),
     manual_steps: z.array(z.string()).optional().default([]),
     resume_from: z.number().optional().nullable(),
+    resume_token: z.string().optional().nullable(),
     run_id: z.string().nullable().optional(),
     planner_complete: z.boolean().optional().default(false),
     execution_complete: z.boolean().optional().default(false),
@@ -415,6 +416,14 @@ export const JudgmentSchema = z.object({
     consecutive_no_progress: z.number(),
 });
 
+export const LockMetricsSchema = z.object({
+    acquired: z.number(),
+    bypassed: z.number(),
+    blocked: z.number(),
+    stale_recovered: z.number(),
+    rejected: z.number(),
+});
+
 export type SystemStatus = z.infer<typeof SystemStatusSchema>;
 export type LogEntry = z.infer<typeof LogEntrySchema>;
 export type Routine = z.infer<typeof RoutineSchema>;
@@ -454,3 +463,4 @@ export type AgentRecoveryEventResponse = z.infer<typeof AgentRecoveryEventRespon
 export type ContextSelection = z.infer<typeof ContextSelectionSchema>;
 export type ProjectScan = z.infer<typeof ProjectScanSchema>;
 export type Judgment = z.infer<typeof JudgmentSchema>;
+export type LockMetrics = z.infer<typeof LockMetricsSchema>;
