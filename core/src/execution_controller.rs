@@ -9,6 +9,9 @@ use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::Duration;
 
+#[cfg(target_os = "macos")]
+use std::process::Command;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputCollisionPolicy {
     Ignore,
@@ -188,6 +191,141 @@ fn focus_handoff_retry_ms() -> u64 {
         .and_then(|v| v.parse::<u64>().ok())
         .map(|v| v.clamp(80, 1200))
         .unwrap_or(220)
+}
+
+fn user_activity_guard_enabled() -> bool {
+    parse_bool_env_with_default("STEER_USER_ACTIVITY_GUARD_ENABLED", true)
+}
+
+fn user_activity_idle_resume_secs() -> u64 {
+    std::env::var("STEER_USER_ACTIVITY_IDLE_RESUME_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.clamp(5, 600))
+        .unwrap_or(60)
+}
+
+fn user_activity_poll_ms() -> u64 {
+    std::env::var("STEER_USER_ACTIVITY_POLL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.clamp(200, 5000))
+        .unwrap_or(1000)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_idle_ns_from_ioreg(raw: &str) -> Option<u64> {
+    for line in raw.lines() {
+        if !line.contains("\"HIDIdleTime\"") {
+            continue;
+        }
+        let value = line.split('=').nth(1)?.trim();
+        if let Some(hex) = value.strip_prefix("0x") {
+            if let Ok(ns) = u64::from_str_radix(hex.trim(), 16) {
+                return Some(ns);
+            }
+        } else if let Some(first_token) = value.split_whitespace().next() {
+            if let Ok(ns) = first_token.parse::<u64>() {
+                return Some(ns);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn system_idle_secs() -> Option<f64> {
+    let output = Command::new("ioreg")
+        .args(["-c", "IOHIDSystem"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    parse_idle_ns_from_ioreg(&text).map(|ns| ns as f64 / 1_000_000_000.0)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn system_idle_secs() -> Option<f64> {
+    None
+}
+
+async fn wait_until_user_idle_if_active(
+    logs: &mut Vec<String>,
+    step_idx: usize,
+    reason: &str,
+) -> bool {
+    if !user_activity_guard_enabled() {
+        return false;
+    }
+    let resume_secs = user_activity_idle_resume_secs() as f64;
+    let poll_ms = user_activity_poll_ms();
+    let mut idle_secs = match system_idle_secs() {
+        Some(v) => v,
+        None => return false,
+    };
+    if idle_secs >= resume_secs {
+        return false;
+    }
+
+    push_run_attempt(
+        logs,
+        "user_activity_pause",
+        "waiting",
+        &format!(
+            "step={} reason={} idle_secs={:.1} resume_secs={}",
+            step_idx + 1,
+            reason,
+            idle_secs,
+            resume_secs as u64
+        ),
+    );
+    logs.push(format!(
+        "USER_ACTIVITY_PAUSE: step={} reason={} (idle {:.1}s < {}s). Waiting for user idle...",
+        step_idx + 1,
+        reason,
+        idle_secs,
+        resume_secs as u64
+    ));
+
+    let mut wait_loops = 0usize;
+    loop {
+        tokio::time::sleep(Duration::from_millis(poll_ms)).await;
+        wait_loops += 1;
+        idle_secs = system_idle_secs().unwrap_or(0.0);
+        if idle_secs >= resume_secs {
+            break;
+        }
+        if wait_loops % 10 == 0 {
+            logs.push(format!(
+                "USER_ACTIVITY_WAITING: step={} idle={:.1}s target={}s",
+                step_idx + 1,
+                idle_secs,
+                resume_secs as u64
+            ));
+        }
+    }
+
+    push_run_attempt(
+        logs,
+        "user_activity_pause",
+        "resumed",
+        &format!(
+            "step={} reason={} idle_secs={:.1}",
+            step_idx + 1,
+            reason,
+            idle_secs
+        ),
+    );
+    logs.push(format!(
+        "USER_ACTIVITY_RESUMED: step={} reason={} (idle {:.1}s >= {}s)",
+        step_idx + 1,
+        reason,
+        idle_secs,
+        resume_secs as u64
+    ));
+    true
 }
 
 fn app_matches_expected(front_app: &str, expected_app: &str) -> bool {
@@ -408,6 +546,16 @@ pub async fn execute_plan(
                 let mut recovered = false;
                 if !front_trimmed.is_empty() && !app_matches_expected(&front_trimmed, &expected_app)
                 {
+                    let _ = wait_until_user_idle_if_active(
+                        &mut logs,
+                        idx,
+                        "frontmost_mismatch_expected_app",
+                    )
+                    .await;
+                    let front_after_idle = CrossAppBridge::get_frontmost_app().unwrap_or_default();
+                    if !front_after_idle.trim().is_empty() {
+                        front_trimmed = front_after_idle.trim().to_string();
+                    }
                     if focus_handoff_enabled() {
                         let (ok, recovered_front) = recover_expected_focus(
                             &mut logs,
@@ -468,6 +616,12 @@ pub async fn execute_plan(
         if options.enforce_browser_focus && step_requires_browser_focus(&step.step_type) {
             let mut front_app = CrossAppBridge::get_frontmost_app().unwrap_or_default();
             if !is_browser_app(&front_app) && focus_handoff_enabled() {
+                let _ =
+                    wait_until_user_idle_if_active(&mut logs, idx, "browser_focus_required").await;
+                let front_after_idle = CrossAppBridge::get_frontmost_app().unwrap_or_default();
+                if !front_after_idle.trim().is_empty() {
+                    front_app = front_after_idle;
+                }
                 let (ok, recovered_front) =
                     recover_browser_focus(&mut logs, &mut focus_handoff_state, idx, &front_app)
                         .await;
@@ -982,5 +1136,27 @@ fn summary_for_plan(plan: &Plan) -> String {
             format!("Summary: fill form for {}", purpose)
         }
         crate::nl_automation::IntentType::GenericTask => "Summary: need more details".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "macos")]
+    use super::parse_idle_ns_from_ioreg;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_idle_ns_from_decimal_line() {
+        let sample = r#"    | | |   "HIDIdleTime" = 31574920250"#;
+        let parsed = parse_idle_ns_from_ioreg(sample).expect("decimal HIDIdleTime should parse");
+        assert_eq!(parsed, 31_574_920_250);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_idle_ns_from_hex_line() {
+        let sample = r#"    | | |   "HIDIdleTime" = 0x75BCD15"#;
+        let parsed = parse_idle_ns_from_ioreg(sample).expect("hex HIDIdleTime should parse");
+        assert_eq!(parsed, 123_456_789);
     }
 }

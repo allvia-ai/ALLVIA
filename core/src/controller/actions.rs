@@ -416,6 +416,76 @@ impl ActionRunner {
         }
     }
 
+    fn goal_mentions_mail(goal: &str) -> bool {
+        let lower = goal.to_lowercase();
+        lower.contains("mail") || lower.contains("gmail") || lower.contains("메일")
+    }
+
+    fn strip_markup_for_mail_body(raw: &str) -> String {
+        let with_breaks = raw
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace("<br />", "\n")
+            .replace("<br/>", "\n")
+            .replace("<br>", "\n")
+            .replace("&nbsp;", " ");
+
+        let mut out = String::with_capacity(with_breaks.len());
+        let mut in_tag = false;
+        for ch in with_breaks.chars() {
+            if ch == '<' {
+                in_tag = true;
+                continue;
+            }
+            if ch == '>' {
+                in_tag = false;
+                continue;
+            }
+            if !in_tag {
+                out.push(ch);
+            }
+        }
+
+        let decoded = out
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&");
+
+        decoded
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn scripted_mail_body_fallback(goal: &str, history: &[String]) -> Option<(String, String)> {
+        let prefer_notes = Self::last_text_app_from_history(history)
+            .map(|app| app.eq_ignore_ascii_case("Notes"))
+            .unwrap_or(true);
+        let source_order = if prefer_notes {
+            ["Notes", "TextEdit"]
+        } else {
+            ["TextEdit", "Notes"]
+        };
+
+        for source in source_order {
+            let raw = if source == "Notes" {
+                Self::notes_read_text(Some(goal))
+            } else {
+                Self::textedit_read_text(Some(goal))
+            };
+
+            if let Ok(text) = raw {
+                let normalized = Self::strip_markup_for_mail_body(&text);
+                if normalized.chars().count() >= 6 {
+                    return Some((source.to_string(), normalized));
+                }
+            }
+        }
+        None
+    }
+
     fn extract_first_number(text: &str) -> Option<String> {
         let mut token = String::new();
         let mut started = false;
@@ -2968,8 +3038,8 @@ impl ActionRunner {
                     } else {
                         Self::cmd_n_window_flood_limit()
                     };
-                    let cmd_n_window_flood_hit = is_cmd_n
-                        && cmd_n_recent_created >= cmd_n_flood_limit;
+                    let cmd_n_window_flood_hit =
+                        is_cmd_n && cmd_n_recent_created >= cmd_n_flood_limit;
 
                     if is_cmd_n
                         && (cmd_n_target_app.is_empty()
@@ -3238,8 +3308,8 @@ impl ActionRunner {
                     } else {
                         Self::cmd_n_window_flood_limit()
                     };
-                    let cmd_n_window_flood_hit = is_cmd_n
-                        && cmd_n_recent_created >= cmd_n_flood_limit;
+                    let cmd_n_window_flood_hit =
+                        is_cmd_n && cmd_n_recent_created >= cmd_n_flood_limit;
                     if is_cmd_n
                         && (cmd_n_target_app.is_empty()
                             || cmd_n_target_app.eq_ignore_ascii_case("unknown"))
@@ -3560,8 +3630,16 @@ impl ActionRunner {
                 {
                     let _ = heuristics::ensure_app_focus(app_name, 1).await;
                 }
-                let front_app =
+                let mut front_app =
                     crate::tool_chaining::CrossAppBridge::get_frontmost_app().unwrap_or_default();
+                if !front_app.eq_ignore_ascii_case("Mail")
+                    && Self::has_tracked_mail_draft(history)
+                    && Self::goal_mentions_mail(goal)
+                {
+                    let _ = heuristics::ensure_app_focus("Mail", 3).await;
+                    front_app = crate::tool_chaining::CrossAppBridge::get_frontmost_app()
+                        .unwrap_or_default();
+                }
                 if front_app.eq_ignore_ascii_case("Mail") {
                     let draft_id = Self::mail_ensure_draft(Some(goal), history)
                         .ok()
@@ -3585,12 +3663,18 @@ impl ActionRunner {
                         );
                     }
                     if action_status_override != Some("failed") {
+                        let mut scripted_source: Option<String> = None;
                         let mut text = crate::tool_chaining::CrossAppBridge::get_clipboard()
                             .unwrap_or_else(|_| "".to_string());
                         let fallback = Self::mail_fallback_body_from_goal(goal);
                         if text.trim().len() < 6 {
                             if !fallback.is_empty() {
                                 text = fallback;
+                            } else if let Some((source, scripted)) =
+                                Self::scripted_mail_body_fallback(goal, history)
+                            {
+                                scripted_source = Some(source);
+                                text = scripted;
                             }
                         } else {
                             let quoted = Self::extract_quoted_fragments(goal)
@@ -3622,6 +3706,14 @@ impl ActionRunner {
                                 }
                             }
                         }
+                        if text.trim().len() < 6 {
+                            if let Some((source, scripted)) =
+                                Self::scripted_mail_body_fallback(goal, history)
+                            {
+                                scripted_source = Some(source);
+                                text = scripted;
+                            }
+                        }
                         match Self::mail_append_body(&text, draft_id.as_deref()) {
                             Ok((target_draft_id, mut readback_len)) => {
                                 Self::remember_mail_draft_id(history, &target_draft_id);
@@ -3651,13 +3743,17 @@ impl ActionRunner {
                                             .to_string();
                                     action_status_override = Some("failed");
                                 } else {
-                                    description =
-                                        "Pasted clipboard contents (mail body)".to_string();
+                                    description = if let Some(source) = scripted_source.clone() {
+                                        format!("Pasted scripted contents (mail body: {})", source)
+                                    } else {
+                                        "Pasted clipboard contents (mail body)".to_string()
+                                    };
                                     action_status_override = Some("success");
                                     action_data = Some(json!({
                                         "proof": "mail_body_appended",
                                         "text_len": text.chars().count(),
-                                        "readback_len": readback_len
+                                        "readback_len": readback_len,
+                                        "source": scripted_source.clone().unwrap_or_else(|| "clipboard".to_string())
                                     }));
                                     Self::log_evidence(
                                         "mail",
@@ -3666,6 +3762,11 @@ impl ActionRunner {
                                             ("status", "confirmed".to_string()),
                                             ("body_len", readback_len.to_string()),
                                             ("draft_id", target_draft_id),
+                                            (
+                                                "source",
+                                                scripted_source
+                                                    .unwrap_or_else(|| "clipboard".to_string()),
+                                            ),
                                         ],
                                     );
                                 }
@@ -3783,12 +3884,53 @@ impl ActionRunner {
                         }
                     }
                 } else {
-                    let step = SmartStep::new(
-                        UiAction::KeyboardShortcut("c".to_string(), vec!["command".to_string()]),
-                        "Copy",
-                    );
-                    driver.add_step(step);
-                    description = "Copied selection".to_string();
+                    let inferred_text_app = Self::last_text_app_from_history(history);
+                    if Self::goal_mentions_mail(goal)
+                        && inferred_text_app
+                            .as_deref()
+                            .map(|app| {
+                                app.eq_ignore_ascii_case("Notes")
+                                    || app.eq_ignore_ascii_case("TextEdit")
+                            })
+                            .unwrap_or(false)
+                    {
+                        if let Some((source, scripted)) =
+                            Self::scripted_mail_body_fallback(goal, history)
+                        {
+                            if !scripted.trim().is_empty() {
+                                let _ =
+                                    crate::tool_chaining::CrossAppBridge::copy_to_clipboard(&scripted);
+                            }
+                            description =
+                                format!("Copied selection ({} scripted fallback)", source);
+                            action_status_override = Some("success");
+                            action_data = Some(json!({
+                                "proof": "scripted_copy_fallback",
+                                "source": source,
+                                "text_len": scripted.chars().count()
+                            }));
+                        } else {
+                            let step = SmartStep::new(
+                                UiAction::KeyboardShortcut(
+                                    "c".to_string(),
+                                    vec!["command".to_string()],
+                                ),
+                                "Copy",
+                            );
+                            driver.add_step(step);
+                            description = "Copied selection".to_string();
+                        }
+                    } else {
+                        let step = SmartStep::new(
+                            UiAction::KeyboardShortcut(
+                                "c".to_string(),
+                                vec!["command".to_string()],
+                            ),
+                            "Copy",
+                        );
+                        driver.add_step(step);
+                        description = "Copied selection".to_string();
+                    }
                 }
             }
             "select_all" => {
@@ -4332,5 +4474,22 @@ mod tests {
             ActionRunner::session_cmd_n_stats(&session, "Notes");
         assert_eq!((mail_attempts, mail_successes), (2, 1));
         assert_eq!((notes_attempts, notes_successes), (1, 1));
+    }
+
+    #[test]
+    fn strip_markup_for_mail_body_removes_basic_html_tags() {
+        let raw = "<div>Title</div><br/>line 2&nbsp;&amp;&lt;ok&gt;";
+        let got = ActionRunner::strip_markup_for_mail_body(raw);
+        assert!(got.contains("Title"));
+        assert!(got.contains("line 2"));
+        assert!(got.contains("&<ok>"));
+        assert!(!got.contains("<div>"));
+    }
+
+    #[test]
+    fn goal_mentions_mail_matches_korean_and_english() {
+        assert!(ActionRunner::goal_mentions_mail("Mail 앱에서 보내줘"));
+        assert!(ActionRunner::goal_mentions_mail("gmail digest"));
+        assert!(!ActionRunner::goal_mentions_mail("notes only"));
     }
 }

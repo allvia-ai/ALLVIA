@@ -144,10 +144,7 @@ pub fn enforce_telegram_send_policy(chat_id: &str, text: &str) -> Result<(), Str
 
     let deny_targets = std::env::var("STEER_OUTBOUND_TELEGRAM_DENY_TARGET_IDS").unwrap_or_default();
     if csv_has_exact(&deny_targets, chat) {
-        return Err(format!(
-            "telegram_send policy: denied target id ({})",
-            chat
-        ));
+        return Err(format!("telegram_send policy: denied target id ({})", chat));
     }
     let allow_targets =
         std::env::var("STEER_OUTBOUND_TELEGRAM_ALLOW_TARGET_IDS").unwrap_or_default();
@@ -163,8 +160,12 @@ pub fn enforce_telegram_send_policy(chat_id: &str, text: &str) -> Result<(), Str
         return Err("telegram_send policy: text is empty".to_string());
     }
 
-    let max_chars =
-        parse_usize_env_with_default("STEER_OUTBOUND_TELEGRAM_MAX_MESSAGE_CHARS", 120_000, 64, 400_000);
+    let max_chars = parse_usize_env_with_default(
+        "STEER_OUTBOUND_TELEGRAM_MAX_MESSAGE_CHARS",
+        120_000,
+        64,
+        400_000,
+    );
     if body.chars().count() > max_chars {
         return Err(format!(
             "telegram_send policy: message too long ({})",

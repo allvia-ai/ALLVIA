@@ -10,11 +10,14 @@
     "beforeBuildCommand": "npm run build"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "title": "Steer OS Launcher",
-        "width": 1060,
-        "height": 160,
+        "width": 1240,
+        "height": 214,
+        "minWidth": 980,
+        "minHeight": 176,
         "resizable": false,
         "fullscreen": false,
         "decorations": false,

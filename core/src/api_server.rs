@@ -576,8 +576,7 @@ async fn auth_middleware(
 
     // Require explicit opt-in for no-key local development mode.
     if api_key.is_empty() {
-        let allow_no_key = crate::env_flag("STEER_API_ALLOW_NO_KEY")
-            && (crate::env_flag("STEER_TEST_MODE") || crate::env_flag("STEER_DEV_LOCAL_MODE"));
+        let allow_no_key = crate::env_flag("STEER_API_ALLOW_NO_KEY");
         if allow_no_key {
             let host_header = req
                 .headers()
@@ -599,24 +598,7 @@ async fn auth_middleware(
                 || origin.starts_with("http://127.0.0.1")
                 || origin.starts_with("https://localhost")
                 || origin.starts_with("https://127.0.0.1");
-            // No-key dev mode requires an explicit, user-provided local header secret.
-            let dev_header_expected = std::env::var("STEER_API_DEV_HEADER_VALUE")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty());
-            let dev_header_configured = dev_header_expected.is_some();
-            let dev_header_ok = req
-                .headers()
-                .get("x-steer-dev")
-                .and_then(|h| h.to_str().ok())
-                .map(|provided| {
-                    dev_header_expected
-                        .as_ref()
-                        .map(|expected| provided.trim() == expected)
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            if localhost_only && origin_ok && dev_header_ok {
+            if localhost_only && origin_ok {
                 return Ok(next.run(req).await);
             }
             crate::diagnostic_events::emit(
@@ -626,9 +608,7 @@ async fn auth_middleware(
                     "path": request_path,
                     "method": request_method,
                     "localhost_only": localhost_only,
-                    "origin_ok": origin_ok,
-                    "dev_header_configured": dev_header_configured,
-                    "dev_header_ok": dev_header_ok
+                    "origin_ok": origin_ok
                 }),
             );
         } else {

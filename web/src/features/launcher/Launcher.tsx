@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
+import axios from "axios";
 import {
     Zap,
     Activity,
@@ -9,6 +10,7 @@ import {
     Globe,
     Wand2,
     AppWindow,
+    MessageCircle,
     Mic,
     ArrowUp,
     Circle
@@ -89,7 +91,7 @@ type ExecutionSnapshot = {
     } | null;
 };
 
-type ComposerMode = "nl" | "program";
+type ComposerMode = "nl" | "chat" | "program";
 
 type QuickProgramAction = {
     key: string;
@@ -216,6 +218,13 @@ const QUICK_NL_SUGGESTIONS = [
     "노트에서 최근 TODO 정리해줘",
     "복잡 시나리오 1번 실행해줘",
     "텔레그램으로 실행 결과 요약 보내줘",
+];
+
+const QUICK_CHAT_SUGGESTIONS = [
+    "안녕? 오늘 우선순위 3개만 정리해줘",
+    "방금 실행 결과를 한 줄로 설명해줘",
+    "지금 가장 위험한 문제 하나만 알려줘",
+    "다음에 뭘 하면 좋을지 3단계로 말해줘",
 ];
 
 const EXECUTION_PROFILE_OPTIONS: ExecutionProfileOption[] = [
@@ -1173,6 +1182,34 @@ export default function Launcher() {
             }
             return preflight.ok;
         } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 404) {
+                const nowIso = new Date().toISOString();
+                setPreflightChecks([
+                    {
+                        key: "legacy_core_preflight",
+                        label: "Preflight API",
+                        ok: true,
+                        expected: "/api/agent/preflight",
+                        actual: "legacy_core_mode",
+                        message:
+                            "Legacy core detected (preflight API unavailable). Proceeding without preflight gate.",
+                    },
+                ]);
+                setPreflightOk(true);
+                setPreflightCheckedAt(nowIso);
+                setPreflightActiveApp(null);
+                setPreflightError(null);
+                if (!silent) {
+                    setResults([
+                        {
+                            type: "response",
+                            content:
+                                "⚠️ 실행 전 점검 API가 없는 코어 버전입니다. 이번 실행은 preflight 게이트 없이 진행합니다.",
+                        },
+                    ]);
+                }
+                return true;
+            }
             const message = error instanceof Error ? error.message : String(error);
             setPreflightOk(false);
             setPreflightError(message);
@@ -1406,31 +1443,33 @@ export default function Launcher() {
             return;
         }
 
+        const showOperationalPanels = composerMode !== "chat";
         const isExpanded = showDetailPanel && hasDetailContent;
         const preflightExpanded =
+            showOperationalPanels &&
             showPreflightPanel &&
             (showPreflightDetail ||
                 showAdvancedControls ||
                 preflightOk === false ||
                 !!preflightError ||
                 !!executionLockHint);
-        const desiredWidth = compactLayoutMode ? 980 : 1060;
+        const desiredWidth = compactLayoutMode ? 1080 : 1240;
         const maxViewportWidth =
             typeof window !== "undefined"
-                ? Math.max(820, (window.screen?.availWidth ?? window.innerWidth) - 18)
+                ? Math.max(960, (window.screen?.availWidth ?? window.innerWidth) - 24)
                 : desiredWidth;
         const targetWidth = Math.min(desiredWidth, maxViewportWidth);
         const targetHeight = isExpanded
             ? compactLayoutMode
-                ? 600
-                : 660
+                ? 640
+                : 720
             : preflightExpanded
               ? compactLayoutMode
-                  ? 210
-                  : 228
+                  ? 252
+                  : 292
               : compactLayoutMode
-                ? 146
-                : 160;
+                ? 182
+                : 214;
 
         void getCurrentWindow()
             .setSize(new LogicalSize(targetWidth, targetHeight))
@@ -1447,6 +1486,7 @@ export default function Launcher() {
         preflightError,
         executionLockHint,
         compactLayoutMode,
+        composerMode,
     ]);
 
     // Reset selection when items change
@@ -1488,7 +1528,7 @@ export default function Launcher() {
             setShowDetailPanel(true);
             return;
         }
-        if (safeExecutionMode && !bypassSafeCountdown) {
+        if (composerMode !== "chat" && safeExecutionMode && !bypassSafeCountdown) {
             const executeAtMs = Date.now() + 3000;
             setPendingDispatch({ prompt, executeAtMs });
             setDispatchBlockedReason("안전 카운트다운");
@@ -1507,7 +1547,7 @@ export default function Launcher() {
             setRunPhase("idle");
             return;
         }
-        if (bypassSafeCountdown && pendingDispatch) {
+        if (composerMode !== "chat" && bypassSafeCountdown && pendingDispatch) {
             setPendingDispatch(null);
         }
         if (loading) {
@@ -1559,6 +1599,32 @@ export default function Launcher() {
         lastDispatchRef.current = { promptKey, ts: now };
         setDispatchBlockedReason(null);
         setDispatchBlockedUntilMs(null);
+
+        if (composerMode === "chat") {
+            setShowDetailPanel(true);
+            setLoading(true);
+            setRunPhase("running");
+            setResults([]);
+            setPendingApproval(null);
+            setRecoveryActionBusyKey(null);
+
+            try {
+                const res = await sendChatMessage(prompt);
+                setResults([{ type: "response", content: res.response }]);
+                setInput("");
+                setRunPhase("completed");
+                triggerSuccess();
+            } catch (error) {
+                const message =
+                    error instanceof Error ? error.message : "Failed to reach chat agent.";
+                setResults([{ type: "error", content: message }]);
+                setRunPhase("failed");
+                triggerError();
+            } finally {
+                setLoading(false);
+            }
+            return;
+        }
 
         const preflightReady = await runPreflightCheck(false);
         if (!preflightReady) {
@@ -2175,12 +2241,12 @@ export default function Launcher() {
     };
 
     const launcherWidthClass = compactLayoutMode
-        ? "max-w-[calc(100vw-16px)] sm:max-w-[calc(100vw-24px)] lg:max-w-[960px] xl:max-w-[1000px]"
-        : "max-w-[calc(100vw-16px)] sm:max-w-[calc(100vw-24px)] lg:max-w-[1040px] xl:max-w-[1100px]";
+        ? "max-w-[calc(100vw-16px)] sm:max-w-[calc(100vw-24px)] lg:max-w-[1080px] xl:max-w-[1160px]"
+        : "max-w-[calc(100vw-16px)] sm:max-w-[calc(100vw-24px)] lg:max-w-[1220px] xl:max-w-[1280px]";
 
     return (
         <div
-            className="w-full bg-transparent flex items-end justify-center pb-1.5 sm:pb-2 px-2 sm:px-3 pointer-events-none"
+            className="w-full h-full bg-[radial-gradient(120%_90%_at_50%_0%,rgba(18,44,89,0.45),rgba(9,13,22,0.96)_62%,rgba(7,10,17,0.98)_100%)] flex items-end justify-center pb-2 sm:pb-3 px-2 sm:px-3 pointer-events-none"
             onMouseDown={handleBackgroundClick}
         >
             <motion.div
@@ -2210,6 +2276,16 @@ export default function Launcher() {
                                 자연어
                             </button>
                             <button
+                                onClick={() => setComposerMode("chat")}
+                                disabled={isExecutionLocked}
+                                className={`px-3 py-1.5 text-xs rounded-lg font-medium transition-colors ${composerMode === "chat"
+                                    ? "bg-white/15 text-white"
+                                    : "text-gray-400 hover:text-gray-200"
+                                    } ${isExecutionLocked ? "opacity-50 cursor-not-allowed" : ""}`}
+                            >
+                                대화
+                            </button>
+                            <button
                                 onClick={() => setComposerMode("program")}
                                 disabled={isExecutionLocked}
                                 className={`px-3 py-1.5 text-xs rounded-lg font-medium transition-colors ${composerMode === "program"
@@ -2221,20 +2297,22 @@ export default function Launcher() {
                             </button>
                         </div>
 
-                        <button
-                            onClick={() => setShowAdvancedControls((prev) => !prev)}
-                            disabled={isExecutionLocked}
-                            className={`px-2.5 py-1.5 text-[11px] rounded-xl border transition-colors shrink-0 ${
-                                showAdvancedControls
-                                    ? "border-cyan-400/35 bg-cyan-500/15 text-cyan-200"
-                                    : "border-white/20 bg-white/5 text-gray-300 hover:bg-white/10"
-                            } ${isExecutionLocked ? "opacity-50 cursor-not-allowed" : ""}`}
-                            title="고급 실행 옵션/점검 패널 표시"
-                        >
-                            옵션 {showAdvancedControls ? "ON" : "OFF"}
-                        </button>
+                        {composerMode !== "chat" && (
+                            <button
+                                onClick={() => setShowAdvancedControls((prev) => !prev)}
+                                disabled={isExecutionLocked}
+                                className={`px-2.5 py-1.5 text-[11px] rounded-xl border transition-colors shrink-0 ${
+                                    showAdvancedControls
+                                        ? "border-cyan-400/35 bg-cyan-500/15 text-cyan-200"
+                                        : "border-white/20 bg-white/5 text-gray-300 hover:bg-white/10"
+                                } ${isExecutionLocked ? "opacity-50 cursor-not-allowed" : ""}`}
+                                title="고급 실행 옵션/점검 패널 표시"
+                            >
+                                옵션 {showAdvancedControls ? "ON" : "OFF"}
+                            </button>
+                        )}
 
-                        {showAdvancedControls && (
+                        {composerMode !== "chat" && showAdvancedControls && (
                             <div className="inline-flex items-center gap-1 rounded-xl bg-white/6 p-1 shrink-0">
                                 {EXECUTION_PROFILE_OPTIONS.map((option) => (
                                     <button
@@ -2261,7 +2339,7 @@ export default function Launcher() {
                                 ))}
                             </div>
                         )}
-                        {showAdvancedControls && (
+                        {composerMode !== "chat" && showAdvancedControls && (
                             <div className="hidden lg:flex items-center gap-2 text-[11px] text-gray-300 shrink-0">
                                 <span className="px-2 py-1 rounded-full border border-white/15 bg-white/5">
                                     권장 {profileLabel(profileRecommendation.profile)}
@@ -2326,7 +2404,13 @@ export default function Launcher() {
                                 ref={inputRef}
                                 type="text"
                                 className="w-full h-11 sm:h-12 md:h-[50px] bg-white/[0.03] border border-white/15 rounded-xl px-3.5 sm:px-4 text-[16px] sm:text-[18px] md:text-[20px] text-white/95 placeholder-gray-500 outline-none focus:border-white/30 transition-colors"
-                                placeholder={composerMode === "nl" ? "무엇이든 부탁하세요" : "버튼 또는 명령으로 실행"}
+                                placeholder={
+                                    composerMode === "program"
+                                        ? "버튼 또는 명령으로 실행"
+                                        : composerMode === "chat"
+                                          ? "간단히 대화해보세요"
+                                          : "무엇이든 부탁하세요"
+                                }
                                 value={input}
                                 onChange={(e) => setInput(e.target.value)}
                                 onKeyDown={handleKeyDown}
@@ -2356,13 +2440,13 @@ export default function Launcher() {
                         )}
                     </div>
 
-                    {executionLockHint && (
+                    {composerMode !== "chat" && executionLockHint && (
                         <div className="mt-2 rounded-lg border border-amber-400/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-100">
                             실행 차단 사유: {executionLockHint}
                         </div>
                     )}
 
-                    {showPreflightPanel && (
+                    {composerMode !== "chat" && showPreflightPanel && (
                     <div className={`mt-2.5 rounded-xl border px-3 py-2 ${preflightOk === false || preflightError ? "border-rose-500/35 bg-rose-500/10" : "border-white/10 bg-[#1b1b1b]/80"}`}>
                         <div className="flex items-center justify-between gap-3">
                             <div className="text-xs text-gray-200">
@@ -2490,6 +2574,21 @@ export default function Launcher() {
                         </div>
                     )}
 
+                    {composerMode === "chat" && !input.trim() && (
+                        <div className="mt-2.5 rounded-xl border border-white/10 bg-[#1b1b1b]/90 p-2.5 flex flex-nowrap gap-2 overflow-x-auto">
+                            {(compactLayoutMode ? QUICK_CHAT_SUGGESTIONS.slice(0, 2) : QUICK_CHAT_SUGGESTIONS).map((suggestion) => (
+                                <button
+                                    key={suggestion}
+                                    onClick={() => handleSuggestionClick(suggestion)}
+                                    disabled={isExecutionLocked}
+                                    className="text-xs px-3.5 py-1.5 rounded-full bg-white/8 text-gray-200 hover:bg-white/15 border border-white/10 transition-colors whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                    {suggestion}
+                                </button>
+                            ))}
+                        </div>
+                    )}
+
                     {composerMode === "program" && (
                         <div className="mt-2.5 rounded-xl border border-white/10 bg-[#1b1b1b]/90 p-2.5 flex flex-nowrap gap-2 overflow-x-auto">
                             {(compactLayoutMode ? QUICK_PROGRAM_ACTIONS.slice(0, 4) : QUICK_PROGRAM_ACTIONS).map((action) => (
@@ -2508,10 +2607,14 @@ export default function Launcher() {
                     <div className="mt-2.5 flex items-center justify-between text-gray-300">
                         <div className="flex items-center gap-1.5">
                             <button
-                                onClick={() => setComposerMode(prev => prev === "nl" ? "program" : "nl")}
+                                onClick={() =>
+                                    setComposerMode((prev) =>
+                                        prev === "nl" ? "chat" : prev === "chat" ? "program" : "nl"
+                                    )
+                                }
                                 disabled={isExecutionLocked}
                                 className="p-2 rounded-full hover:bg-white/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                                title="모드 전환"
+                                title="모드 순환"
                             >
                                 <Plus className="w-4 h-4" />
                             </button>
@@ -2546,6 +2649,14 @@ export default function Launcher() {
                                 title="프로그램 버튼"
                             >
                                 <AppWindow className="w-4 h-4" />
+                            </button>
+                            <button
+                                onClick={() => setComposerMode("chat")}
+                                disabled={isExecutionLocked}
+                                className="p-2 rounded-full hover:bg-white/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                title="대화 모드"
+                            >
+                                <MessageCircle className="w-4 h-4" />
                             </button>
                             <span className="text-xl font-semibold text-gray-300 ml-1">5.2</span>
                         </div>

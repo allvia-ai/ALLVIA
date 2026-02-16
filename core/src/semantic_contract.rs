@@ -312,7 +312,8 @@ mod tests {
 
     #[test]
     fn tokens_strip_korean_particle_from_email_token() {
-        let source = r#"받는 사람에 qed4950@gmail.com를 입력하고 기록 토큰에도 qed4950@gmail.com를 포함"#;
+        let source =
+            r#"받는 사람에 qed4950@gmail.com를 입력하고 기록 토큰에도 qed4950@gmail.com를 포함"#;
         let tokens = extract_expected_tokens(source);
         assert!(tokens.iter().any(|t| t == "qed4950@gmail.com"));
         assert!(!tokens.iter().any(|t| t.contains("gmail.com를")));

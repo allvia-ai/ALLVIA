@@ -54,8 +54,8 @@ impl N8nRuntime {
             .unwrap_or_else(|_| "docker".to_string())
             .trim()
             .to_lowercase();
-        let test_context =
-            parse_bool_env_with_default("STEER_TEST_MODE", false) || parse_bool_env_with_default("CI", false);
+        let test_context = parse_bool_env_with_default("STEER_TEST_MODE", false)
+            || parse_bool_env_with_default("CI", false);
         match raw.as_str() {
             "npx" => {
                 if !parse_bool_env_with_default("STEER_N8N_ENABLE_NPX_RUNTIME", false) {
@@ -64,7 +64,9 @@ impl N8nRuntime {
                     );
                     return Self::Docker;
                 }
-                if !test_context && !parse_bool_env_with_default("STEER_N8N_ALLOW_NPX_NON_TEST", false) {
+                if !test_context
+                    && !parse_bool_env_with_default("STEER_N8N_ALLOW_NPX_NON_TEST", false)
+                {
                     eprintln!(
                         "⚠️ STEER_N8N_RUNTIME=npx ignored outside test mode. \
 Set STEER_N8N_ALLOW_NPX_NON_TEST=1 to force npx runtime."

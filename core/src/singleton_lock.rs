@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static LOCK_ACQUIRED_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -357,9 +357,10 @@ fn process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    std::process::Command::new("kill")
+    Command::new("kill")
         .arg("-0")
         .arg(pid.to_string())
+        .stderr(Stdio::null())
         .status()
         .map(|status| status.success())
         .unwrap_or(false)

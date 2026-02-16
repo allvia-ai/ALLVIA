@@ -600,13 +600,19 @@ async fn main() -> anyhow::Result<()> {
     println!("🤖 Local OS Agent (Rust Native Mode) Started!");
     // [Phase 4] Self-Diagnosis: Check Accessibility Permissions
     println!("🔍 Checking Accessibility Permissions...");
-    let ax_check = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg("tell application \"System Events\" to return name of first application process")
-        .output();
+    let ax_check = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::task::spawn_blocking(|| {
+            std::process::Command::new("osascript")
+                .arg("-e")
+                .arg("tell application \"System Events\" to return name of first application process")
+                .output()
+        }),
+    )
+    .await;
 
     match ax_check {
-        Ok(output) if output.status.success() => {
+        Ok(Ok(Ok(output))) if output.status.success() => {
             println!("✅ Accessibility Permissions: GRANTED.");
         }
         _ => {
@@ -701,11 +707,19 @@ async fn main() -> anyhow::Result<()> {
         info!("🧠 Brain Routine Scheduler Active.");
     }
 
-    // 2.5 Init MCP
-    if let Err(e) = mcp_client::init_mcp() {
-        warn!("⚠️ Failed to init MCP: {}", e);
-    } else {
-        info!("🔌 MCP System Initialized.");
+    // 2.5 Init MCP (non-blocking guard)
+    // MCP server handshakes can stall in headless launchd sessions.
+    // Bound initialization time so API startup is never blocked.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        tokio::task::spawn_blocking(mcp_client::init_mcp),
+    )
+    .await
+    {
+        Ok(Ok(Ok(()))) => info!("🔌 MCP System Initialized."),
+        Ok(Ok(Err(e))) => warn!("⚠️ Failed to init MCP: {}", e),
+        Ok(Err(e)) => warn!("⚠️ MCP init join error: {}", e),
+        Err(_) => warn!("⚠️ MCP init timeout (continuing without blocking startup)"),
     }
 
     // 1. Start Native Event Tap (replaces IPC Adapter)

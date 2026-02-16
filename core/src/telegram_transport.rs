@@ -212,7 +212,8 @@ pub async fn send_message_chunked(
     parse_mode: Option<&str>,
     max_send_attempts: u32,
 ) -> Result<()> {
-    if let Err(policy_err) = crate::outbound_policy::enforce_telegram_send_policy(chat_id, message) {
+    if let Err(policy_err) = crate::outbound_policy::enforce_telegram_send_policy(chat_id, message)
+    {
         crate::diagnostic_events::emit(
             "telegram.send.blocked",
             serde_json::json!({

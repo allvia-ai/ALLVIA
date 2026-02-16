@@ -698,7 +698,10 @@ mod tests {
         std::env::remove_var("STEER_TEST_MODE");
         std::env::remove_var("CI");
         std::env::remove_var("STEER_APPROVAL_ALLOW_ONCE_NON_TEST");
-        let plan = test_plan(&format!("plan-fallback-allow-blocked-{}", uuid::Uuid::new_v4()));
+        let plan = test_plan(&format!(
+            "plan-fallback-allow-blocked-{}",
+            uuid::Uuid::new_v4()
+        ));
         let action = r#"{"action":"shell","command":"sudo apt install git"}"#;
         let decision = evaluate_approval(action, &plan);
         assert_eq!(decision.status, "denied");
@@ -715,7 +718,10 @@ mod tests {
         std::env::remove_var("STEER_TEST_MODE");
         std::env::remove_var("CI");
         std::env::set_var("STEER_APPROVAL_ALLOW_ONCE_NON_TEST", "1");
-        let plan = test_plan(&format!("plan-fallback-allow-non-test-{}", uuid::Uuid::new_v4()));
+        let plan = test_plan(&format!(
+            "plan-fallback-allow-non-test-{}",
+            uuid::Uuid::new_v4()
+        ));
         let action = r#"{"action":"shell","command":"sudo apt install git"}"#;
         let decision = evaluate_approval(action, &plan);
         assert_eq!(decision.status, "approved");

@@ -32,7 +32,14 @@ cp .env.example .env
 cargo build --release
 
 # 4. 실행 (Accessibility 권한 필요)
-./target/release/core
+export STEER_API_ALLOW_NO_KEY=1
+./target/release/local_os_agent
+
+# UI 데모 모드(백그라운드 간섭 최소화)
+STEER_API_ALLOW_NO_KEY=1 STEER_DISABLE_EVENT_TAP=1 ./target/release/local_os_agent
+
+# 복구 + 백그라운드 재기동(권장)
+./scripts/recover_runtime.sh
 ```
 
 ## 📦 Release

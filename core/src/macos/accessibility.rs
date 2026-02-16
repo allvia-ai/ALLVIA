@@ -201,7 +201,8 @@ pub fn snapshot(_scope: Option<String>) -> Value {
         let mut focused_window_ref = resolve_focused_window(focused_app_ref);
         if focused_window_ref.is_none() {
             for _ in 0..window_retry_count {
-                let (front_name, front_pid) = frontmost_app_info_via_osascript().unwrap_or_default();
+                let (front_name, front_pid) =
+                    frontmost_app_info_via_osascript().unwrap_or_default();
                 if let Some(pid) = front_pid {
                     bring_process_frontmost(pid);
                 } else if !front_name.trim().is_empty() {
