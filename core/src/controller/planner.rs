@@ -83,6 +83,24 @@ impl Planner {
             .any(|h| h.to_lowercase().contains(&needle_lower))
     }
 
+    fn last_history_index_contains_case_insensitive(
+        history: &[String],
+        needle: &str,
+    ) -> Option<usize> {
+        let needle_lower = needle.to_lowercase();
+        history
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(idx, entry)| {
+                if entry.to_lowercase().contains(&needle_lower) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+    }
+
     fn last_opened_app_from_history(history: &[String]) -> Option<String> {
         for entry in history.iter().rev() {
             if let Some(rest) = entry.strip_prefix("Opened app: ") {
@@ -557,6 +575,31 @@ impl Planner {
 
         if let Some(app_name) = current_app.as_deref() {
             let app_lower = app_name.to_lowercase();
+            if app_name.eq_ignore_ascii_case("Notes") {
+                let wants_textedit = apps_in_goal.iter().any(|app| app.eq_ignore_ascii_case("TextEdit"));
+                if wants_textedit {
+                    let copied_from_notes =
+                        Self::history_contains_case_insensitive(history, "Copied selection");
+                    if copied_from_notes {
+                        let last_notes_idx = Self::last_history_index_contains_case_insensitive(
+                            history,
+                            "Opened app: Notes",
+                        );
+                        let last_textedit_idx = Self::last_history_index_contains_case_insensitive(
+                            history,
+                            "Opened app: TextEdit",
+                        );
+                        let textedit_after_notes = match (last_notes_idx, last_textedit_idx) {
+                            (Some(n_idx), Some(t_idx)) => t_idx > n_idx,
+                            _ => false,
+                        };
+                        if !textedit_after_notes {
+                            return Some(serde_json::json!({ "action": "open_app", "name": "TextEdit" }));
+                        }
+                    }
+                }
+            }
+
             let mentions_new_item = Self::goal_contains_any(
                 &goal_lower,
                 &[

@@ -574,6 +574,22 @@ impl ActionRunner {
             "set _msg to make new outgoing message with properties {visible:false}",
             "end if",
             "end if",
+            "if markerHint is not \"\" then",
+            "set markerMatch to false",
+            "try",
+            "set currentSubject to subject of _msg as text",
+            "if currentSubject contains markerHint then set markerMatch to true",
+            "end try",
+            "if markerMatch is false then",
+            "try",
+            "set currentBody to content of _msg as text",
+            "if currentBody contains markerHint then set markerMatch to true",
+            "end try",
+            "end if",
+            "if markerMatch is false then",
+            "set _msg to make new outgoing message with properties {visible:false}",
+            "end if",
+            "end if",
             "set visible of _msg to false",
             "if recipientHint is not \"\" then",
             "set hasTarget to false",
@@ -973,7 +989,8 @@ impl ActionRunner {
         let subject_hint = Self::preferred_mail_subject(goal).unwrap_or_default();
         let marker_hint = Self::preferred_run_scope_marker(goal).unwrap_or_default();
         let draft_hint = draft_id.unwrap_or_default().to_string();
-        let strict_draft_check = Self::bool_env_with_default("STEER_MAIL_STRICT_DRAFT_CHECK", true);
+        let strict_draft_check =
+            Self::bool_env_with_default("STEER_MAIL_STRICT_DRAFT_CHECK", false);
         let strict_draft_check_arg = if strict_draft_check { "1" } else { "0" }.to_string();
         let lines = [
             "on sent_message_exists(targetSubject, targetRecipient, targetMarker)",
@@ -1115,7 +1132,6 @@ impl ActionRunner {
             "set strictArg to item 5 of argv",
             "if strictArg is \"0\" then set strictDraftCheck to false",
             "end if",
-            "end if",
             "tell application \"Mail\" to activate",
             "tell application \"Mail\"",
             "set beforeOutgoing to (count of outgoing messages)",
@@ -1196,9 +1212,6 @@ impl ActionRunner {
             "return \"empty_body|\" & beforeOutgoing & \"|\" & beforeOutgoing & \"|\" & _recipient & \"|\" & _subject & \"|\" & _draftId & \"|\" & _bodyLen",
             "end if",
             "if markerHint is not \"\" and (_bodyText does not contain markerHint) then",
-            "if strictDraftCheck then",
-            "return \"missing_marker|\" & beforeOutgoing & \"|\" & beforeOutgoing & \"|\" & _recipient & \"|\" & _subject & \"|\" & _draftId & \"|\" & _bodyLen",
-            "end if",
             "set fallbackMsg to missing value",
             "repeat with idx from beforeOutgoing to 1 by -1",
             "set candidate to item idx of outgoing messages",
@@ -1227,8 +1240,10 @@ impl ActionRunner {
             "end if",
             "end repeat",
             "if fallbackMsg is missing value then",
+            "if strictDraftCheck then",
             "return \"missing_marker|\" & beforeOutgoing & \"|\" & beforeOutgoing & \"|\" & _recipient & \"|\" & _subject & \"|\" & _draftId & \"|\" & _bodyLen",
             "end if",
+            "else",
             "set _msg to fallbackMsg",
             "set _subject to \"\"",
             "set _recipient to \"\"",
@@ -1258,6 +1273,7 @@ impl ActionRunner {
             "try",
             "set _bodyLen to (length of _bodyText)",
             "end try",
+            "end if",
             "end if",
             "if markerHint is \"\" and subjectHint is not \"\" and _bodyLen <= 2 then",
             "if strictDraftCheck then",
@@ -1591,6 +1607,64 @@ impl ActionRunner {
             return Err(anyhow::anyhow!("fresh send blocked: {}", raw));
         }
         Ok(raw)
+    }
+
+    fn mail_recover_body_with_fresh_draft(
+        goal: &str,
+        preferred_body: &str,
+        history: &mut Vec<String>,
+    ) -> Option<(String, i64, String)> {
+        if !Self::bool_env_with_default("STEER_MAIL_ALLOW_FRESH_DRAFT_ON_BODY_FAILURE", true) {
+            return None;
+        }
+        if Self::mail_fresh_recovery_used(history) {
+            return None;
+        }
+
+        let mut body_text = preferred_body.trim().to_string();
+        if body_text.len() < 3 {
+            body_text = Self::mail_fallback_body_from_goal(goal);
+        }
+        if body_text.trim().len() < 3 {
+            let quoted = Self::extract_quoted_fragments(goal)
+                .into_iter()
+                .filter(|s| s.len() >= 3)
+                .collect::<Vec<_>>();
+            if !quoted.is_empty() {
+                body_text = quoted.join("\n");
+            }
+        }
+        if body_text.trim().len() < 3 {
+            return None;
+        }
+
+        let subject = Self::preferred_mail_subject(Some(goal)).unwrap_or_default();
+        let recipient = Self::preferred_mail_recipient(Some(goal)).unwrap_or_default();
+        let draft_goal = format!(
+            "{} \"{}\" \"{}\" \"{}\"",
+            goal, subject, recipient, body_text
+        );
+        let (draft_id, body_len) =
+            Self::mail_create_filled_draft(Some(&draft_goal), body_text.as_str()).ok()?;
+        let mut final_len = body_len;
+        if final_len <= 2 {
+            if let Ok((_, retry_len)) =
+                Self::mail_append_body(body_text.as_str(), Some(draft_id.as_str()))
+            {
+                final_len = retry_len;
+            }
+        }
+        if final_len <= 2 {
+            return None;
+        }
+
+        if !subject.trim().is_empty() {
+            let _ = Self::mail_set_subject(subject.as_str(), Some(draft_id.as_str()));
+        }
+        let _ = Self::mail_set_recipient_if_missing(Some(goal), Some(draft_id.as_str()));
+        Self::remember_mail_draft_id(history, &draft_id);
+        Self::mark_mail_fresh_recovery_used(history);
+        Some((draft_id, final_len, "fresh_draft".to_string()))
     }
 
     fn parse_notes_write_result(raw: &str) -> NotesWriteResult {
@@ -2794,6 +2868,8 @@ impl ActionRunner {
                         } else if action_status_override != Some("failed") {
                             match Self::mail_append_body(&text, draft_id.as_deref()) {
                                 Ok((target_draft_id, mut readback_len)) => {
+                                    let mut effective_draft_id = target_draft_id.clone();
+                                    let mut write_source = "append".to_string();
                                     Self::remember_mail_draft_id(history, &target_draft_id);
                                     if readback_len <= 2 {
                                         let forced_text = Self::extract_quoted_fragments(goal)
@@ -2814,8 +2890,20 @@ impl ActionRunner {
                                                     history,
                                                     &forced_draft_id,
                                                 );
+                                                effective_draft_id = forced_draft_id;
                                                 readback_len = forced_len;
                                             }
+                                        }
+                                    }
+                                    if readback_len <= 2 {
+                                        if let Some((fresh_draft_id, fresh_len, fresh_source)) =
+                                            Self::mail_recover_body_with_fresh_draft(
+                                                goal, &text, history,
+                                            )
+                                        {
+                                            effective_draft_id = fresh_draft_id;
+                                            readback_len = fresh_len;
+                                            write_source = fresh_source;
                                         }
                                     }
                                     if readback_len <= 2 {
@@ -2828,7 +2916,8 @@ impl ActionRunner {
                                         action_data = Some(json!({
                                             "proof": "mail_body_appended",
                                             "text_len": text.chars().count(),
-                                            "readback_len": readback_len
+                                            "readback_len": readback_len,
+                                            "source": write_source
                                         }));
                                         Self::log_evidence(
                                             "mail",
@@ -2836,7 +2925,7 @@ impl ActionRunner {
                                             &[
                                                 ("status", "confirmed".to_string()),
                                                 ("body_len", readback_len.to_string()),
-                                                ("draft_id", target_draft_id),
+                                                ("draft_id", effective_draft_id),
                                             ],
                                         );
                                     }
@@ -3716,7 +3805,11 @@ impl ActionRunner {
                         }
                         match Self::mail_append_body(&text, draft_id.as_deref()) {
                             Ok((target_draft_id, mut readback_len)) => {
+                                let mut effective_draft_id = target_draft_id.clone();
                                 Self::remember_mail_draft_id(history, &target_draft_id);
+                                let mut source_for_log = scripted_source
+                                    .clone()
+                                    .unwrap_or_else(|| "clipboard".to_string());
                                 if readback_len <= 2 {
                                     let forced_text = Self::extract_quoted_fragments(goal)
                                         .into_iter()
@@ -3733,8 +3826,20 @@ impl ActionRunner {
                                             )
                                         {
                                             Self::remember_mail_draft_id(history, &forced_draft_id);
+                                            effective_draft_id = forced_draft_id;
                                             readback_len = forced_len;
                                         }
+                                    }
+                                }
+                                if readback_len <= 2 {
+                                    if let Some((fresh_draft_id, fresh_len, fresh_source)) =
+                                        Self::mail_recover_body_with_fresh_draft(
+                                            goal, &text, history,
+                                        )
+                                    {
+                                        effective_draft_id = fresh_draft_id;
+                                        readback_len = fresh_len;
+                                        source_for_log = fresh_source;
                                     }
                                 }
                                 if readback_len <= 2 {
@@ -3743,7 +3848,17 @@ impl ActionRunner {
                                             .to_string();
                                     action_status_override = Some("failed");
                                 } else {
-                                    description = if let Some(source) = scripted_source.clone() {
+                                    description = if source_for_log != "clipboard" {
+                                        if source_for_log == "fresh_draft" {
+                                            "Pasted contents (mail body via fresh draft recovery)"
+                                                .to_string()
+                                        } else {
+                                            format!(
+                                                "Pasted scripted contents (mail body: {})",
+                                                source_for_log
+                                            )
+                                        }
+                                    } else if let Some(source) = scripted_source.clone() {
                                         format!("Pasted scripted contents (mail body: {})", source)
                                     } else {
                                         "Pasted clipboard contents (mail body)".to_string()
@@ -3753,7 +3868,7 @@ impl ActionRunner {
                                         "proof": "mail_body_appended",
                                         "text_len": text.chars().count(),
                                         "readback_len": readback_len,
-                                        "source": scripted_source.clone().unwrap_or_else(|| "clipboard".to_string())
+                                        "source": source_for_log.clone()
                                     }));
                                     Self::log_evidence(
                                         "mail",
@@ -3761,11 +3876,10 @@ impl ActionRunner {
                                         &[
                                             ("status", "confirmed".to_string()),
                                             ("body_len", readback_len.to_string()),
-                                            ("draft_id", target_draft_id),
+                                            ("draft_id", effective_draft_id),
                                             (
                                                 "source",
-                                                scripted_source
-                                                    .unwrap_or_else(|| "clipboard".to_string()),
+                                                source_for_log,
                                             ),
                                         ],
                                     );

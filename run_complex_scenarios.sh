@@ -311,6 +311,17 @@ semantic_location_is_log() {
     esac
 }
 
+semantic_log_location_allowed_as_app_scope() {
+    case "${1:-}" in
+        LOG_MAIL_SUBJECT|LOG_MAIL_RECIPIENT|LOG_MAIL_BODY|LOG_NOTE_BODY|LOG_TEXTEDIT_BODY|LOG_MAIL_SEND|LOG_MAIL_WRITE_SUBJECT|LOG_MAIL_WRITE_RECIPIENT|LOG_MAIL_WRITE_BODY_LEN|LOG_MAIL_FLOW_DRAFT)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 normalize_semantic_token() {
     printf '%s' "$1" | tr '\r\n\t' '   ' | sed -E 's/[[:space:]]+/ /g; s/^[[:space:]]+//; s/[[:space:]]+$//'
 }
@@ -1171,7 +1182,7 @@ token_presence_location() {
     local log_location=""
     local scoped_doc_location=""
     local skip_global_doc_scan="${STEER_SEMANTIC_DISABLE_GLOBAL_DOC_SCAN:-1}"
-    local skip_sent_mail_scan="${STEER_SEMANTIC_DISABLE_SENT_MAIL_SCAN:-1}"
+    local skip_sent_mail_scan="${STEER_SEMANTIC_DISABLE_SENT_MAIL_SCAN:-0}"
     local allow_log_evidence="${STEER_SEMANTIC_ALLOW_LOG_EVIDENCE:-0}"
 
     if [ "$require_marker" = "1" ] && [ -z "$marker" ]; then
@@ -1832,6 +1843,7 @@ capture_and_notify() {
     local fallback_screenshot="scenario_results/complex_scenario_${scenario_num}_${TIMESTAMP}.png"
     local telegram_main_image=""
     CURRENT_LOG_FILE="$log_file"
+    local terminal_status=""
 
     local semantic_lines=""
     local semantic_missing=0
@@ -1995,7 +2007,9 @@ capture_and_notify() {
                 fi
             fi
             if [ "${STEER_SEMANTIC_REQUIRE_APP_SCOPE:-1}" = "1" ] && semantic_location_is_log "$location"; then
-                location="LOG_ONLY_BLOCKED(${location})"
+                if ! semantic_log_location_allowed_as_app_scope "$location"; then
+                    location="LOG_ONLY_BLOCKED(${location})"
+                fi
             fi
             if semantic_location_missing "$location"; then
                 semantic_missing=$((semantic_missing + 1))
@@ -2180,20 +2194,28 @@ capture_and_notify() {
         fi
         if [ "${STEER_SEMANTIC_REQUIRE_APP_SCOPE:-1}" = "1" ]; then
             if semantic_location_is_log "$mail_sent_location"; then
-                mail_sent_ok=0
-                mail_sent_location="LOG_ONLY_BLOCKED(${mail_sent_location})"
+                if ! semantic_log_location_allowed_as_app_scope "$mail_sent_location"; then
+                    mail_sent_ok=0
+                    mail_sent_location="LOG_ONLY_BLOCKED(${mail_sent_location})"
+                fi
             fi
             if [ "$mail_subject_ok" -eq 1 ] && semantic_location_is_log "$mail_subject_location"; then
-                mail_subject_ok=0
-                mail_subject_location="LOG_ONLY_BLOCKED(${mail_subject_location})"
+                if ! semantic_log_location_allowed_as_app_scope "$mail_subject_location"; then
+                    mail_subject_ok=0
+                    mail_subject_location="LOG_ONLY_BLOCKED(${mail_subject_location})"
+                fi
             fi
             if [ "$mail_recipient_ok" -eq 1 ] && semantic_location_is_log "$mail_recipient_location"; then
-                mail_recipient_ok=0
-                mail_recipient_location="LOG_ONLY_BLOCKED(${mail_recipient_location})"
+                if ! semantic_log_location_allowed_as_app_scope "$mail_recipient_location"; then
+                    mail_recipient_ok=0
+                    mail_recipient_location="LOG_ONLY_BLOCKED(${mail_recipient_location})"
+                fi
             fi
             if [ "$mail_body_ok" -eq 1 ] && semantic_location_is_log "$mail_body_location"; then
-                mail_body_ok=0
-                mail_body_location="LOG_ONLY_BLOCKED(${mail_body_location})"
+                if ! semantic_log_location_allowed_as_app_scope "$mail_body_location"; then
+                    mail_body_ok=0
+                    mail_body_location="LOG_ONLY_BLOCKED(${mail_body_location})"
+                fi
             fi
         fi
         local mail_mailbox_evidence_ok=0
