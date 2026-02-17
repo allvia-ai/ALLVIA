@@ -2753,11 +2753,28 @@ if [ "$STATUS" != "success" ]; then
     fi
 fi
 
+BRIEF_MAIL_RESULT_LINE="- 메일 발송 증거: 확인 필요"
+if [ "${MAIL_PROOF_STATUS:-}" = "sent_confirmed" ]; then
+    BRIEF_MAIL_RESULT_LINE="- 메일 정상 발송 완료 (${MAIL_PROOF_RECIPIENT:-unknown})"
+fi
+BRIEF_FINAL_LINE="- 문제가 있어 재실행 필요 -> 실패"
+if [ "$STATUS" = "success" ]; then
+    BRIEF_FINAL_LINE="- 문제 없음 -> 성공"
+fi
+
 TELEGRAM_MESSAGE=$(cat <<EOF
-작업: ${TASK_NAME}
-요청: ${REQUEST_PREVIEW}
-수행: 자연어 요청 실행 및 결과 캡처/검증
-결과: ${RESULT_TEXT}
+📌 ${TASK_NAME} - 쉽게 말한 요약
+
+🔄 뭘 했는지
+- 사용자 명령을 실행 플랜으로 만들고
+- 단계별 실행/캡처 증거를 수집했고
+- 결과를 검증 규칙으로 최종 판정했어요.
+
+✅ 결과
+- ${RESULT_TEXT}
+${BRIEF_MAIL_RESULT_LINE}
+${BRIEF_FINAL_LINE}
+
 상태: ${STATUS_LABEL}
 판정:
 - ${JUDGEMENT_SUMMARY}

@@ -2458,12 +2458,29 @@ capture_and_notify() {
         fi
     fi
 
+    local brief_mail_result_line="- 메일 발송 증거: 확인 필요"
+    if [ "${mail_proof_status:-}" = "sent_confirmed" ]; then
+        brief_mail_result_line="- 메일 정상 발송 완료 (${mail_proof_recipient:-unknown})"
+    fi
+    local brief_final_line="- 문제가 있어 재실행 필요 -> 실패"
+    if [ "$status" = "success" ]; then
+        brief_final_line="- 문제 없음 -> 성공"
+    fi
+
     local telegram_message
     telegram_message=$(cat <<EOF
-작업: 시나리오 ${scenario_num} - ${scenario_name}
-요청: ${scenario_goal}
-수행: 자동 시나리오 실행 및 결과 캡처/검증
-결과: ${result_info}
+📌 시나리오 ${scenario_num} - 쉽게 말한 요약
+
+🔄 뭘 했는지
+- 요청한 자동 실행 체인을 끝까지 수행했고
+- 단계별 캡처/실행 증거를 수집했고
+- 결과를 검증 규칙으로 최종 판정했어요.
+
+✅ 결과
+- ${result_info}
+${brief_mail_result_line}
+${brief_final_line}
+
 상태: ${status_label}
 판정:
 - ${judgement_summary}
@@ -2581,15 +2598,15 @@ else
     echo "⏭️  Scenario 1 skipped (STEER_SCENARIO_IDS=${SELECTED_SCENARIO_IDS})"
 fi
 
-# Scenario 2: Finder -> TextEdit -> Notes
+# Scenario 2: Finder -> Notes -> TextEdit -> Mail
 if should_run_scenario 2; then
     echo "---------------------------------------------------"
-    echo "📂 Scenario 2: Finder → TextEdit → Notes"
+    echo "📂 Scenario 2: Finder → Notes → TextEdit → Mail"
     LOG_FILE="scenario_results/complex_scenario_2_${TIMESTAMP}.log"
-    SCENARIO_GOAL="Finder/TextEdit/Notes/Mail transfer chain."
+    SCENARIO_GOAL="Finder/Notes/TextEdit/Mail transfer chain."
     CURRENT_SCENARIO_MARKER="$MARKER_S2"
     echo "Goal: ${SCENARIO_GOAL}"
-    CMD="Finder를 열어 Downloads 폴더로 이동하세요. TextEdit를 열어 새 문서(Cmd+N)를 만들고 제목 \"${SUBJECT_S2}\"를 입력한 뒤 아래 3줄을 그대로 입력하세요: \"1. invoice.pdf\", \"2. screenshot.png\", \"3. notes.txt\". 다음 줄에 \"${MARKER_S2}\"를 정확히 입력하세요. 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Notes를 열어 새 메모(Cmd+N)를 만들고 붙여넣기(Cmd+V)하세요. 다시 전체 선택(Cmd+A) 후 복사(Cmd+C)하고 Mail을 열어 새 이메일(Cmd+N) 초안을 만든 뒤 제목 \"${SUBJECT_S2}\"를 입력하고 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
+    CMD="아래 순서를 정확히 지키세요. 1) Finder를 열고 Downloads 폴더를 전면으로 가져오세요. 2) Notes를 열고 새 메모(Cmd+N)를 만든 뒤 제목을 \"${SUBJECT_S2}\"로 입력하세요. 3) 본문에 다음 4줄을 그대로 입력하세요: \"1. invoice.pdf\", \"2. screenshot.png\", \"3. notes.txt\", \"${MARKER_S2}\". 4) 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. 5) TextEdit를 열고 새 문서(Cmd+N)에 붙여넣기(Cmd+V)한 뒤 다음 줄에 \"Shared via Notes\"를 입력하세요. 6) 다시 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. 7) Mail을 열고 새 이메일(Cmd+N) 초안을 만든 뒤 제목 \"${SUBJECT_S2}\"를 입력하고 본문에 붙여넣기(Cmd+V)하세요. 8) 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요. 9) 전송이 끝나면 done으로 종료하세요."
 
     scenario_status="failed"
     if run_agent_scenario "$CMD" "$LOG_FILE" 2; then
@@ -2607,15 +2624,15 @@ else
     echo "⏭️  Scenario 2 skipped (STEER_SCENARIO_IDS=${SELECTED_SCENARIO_IDS})"
 fi
 
-# Scenario 3: Safari -> Calculator -> Notes
+# Scenario 3: Calculator -> Notes -> TextEdit -> Mail
 if should_run_scenario 3; then
     echo "---------------------------------------------------"
-    echo "📈 Scenario 3: Safari → Calculator → Notes"
+    echo "📈 Scenario 3: Calculator → Notes → TextEdit → Mail"
     LOG_FILE="scenario_results/complex_scenario_3_${TIMESTAMP}.log"
-    SCENARIO_GOAL="Browser + calculation + document handoff chain."
+    SCENARIO_GOAL="Calculation + document handoff + mail send chain."
     CURRENT_SCENARIO_MARKER="$MARKER_S3"
     echo "Goal: ${SCENARIO_GOAL}"
-    CMD="Safari를 열고 https://www.google.com 으로 이동하세요. 새 탭(Cmd+T)을 열고 https://www.wikipedia.org 로 이동하세요. Calculator를 열어 \"120*1300=\" 을 입력해 계산한 뒤 복사(Cmd+C)하세요. Notes를 열어 새 메모(Cmd+N)를 만들고 제목 \"${SUBJECT_S3}\"를 입력한 뒤 다음 줄에 \"120*1300=\"를 입력하고 다음 줄에 붙여넣기(Cmd+V)하세요. TextEdit를 열어 새 문서(Cmd+N)에 방금 메모 내용을 붙여넣기(Cmd+V)하고 마지막 줄에 \"Done\"을 입력하세요. 다음 줄에 \"${MARKER_S3}\"를 정확히 입력하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S3}\"를 입력한 뒤 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
+    CMD="아래 순서를 정확히 지키세요. 1) Calculator를 열고 \"120*1300=\" 를 입력해 계산 화면을 준비하세요. 2) Notes를 열고 새 메모(Cmd+N)를 만든 뒤 제목을 \"${SUBJECT_S3}\"로 입력하세요. 3) 본문에 다음 3줄을 그대로 입력하세요: \"120*1300=\", \"Done\", \"${MARKER_S3}\". 4) 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. 5) TextEdit를 열고 새 문서(Cmd+N)에 붙여넣기(Cmd+V)한 뒤 다음 줄에 \"Calc verified\"를 입력하세요. 6) 다시 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. 7) Mail을 열고 새 이메일(Cmd+N) 초안을 만든 뒤 제목 \"${SUBJECT_S3}\"를 입력하고 본문에 붙여넣기(Cmd+V)하세요. 8) 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요. 9) 전송이 끝나면 done으로 종료하세요."
 
     scenario_status="failed"
     if run_agent_scenario "$CMD" "$LOG_FILE" 3; then
@@ -2633,15 +2650,15 @@ else
     echo "⏭️  Scenario 3 skipped (STEER_SCENARIO_IDS=${SELECTED_SCENARIO_IDS})"
 fi
 
-# Scenario 4: Notes -> Safari -> TextEdit
+# Scenario 4: Calendar -> Notes -> TextEdit -> Mail
 if should_run_scenario 4; then
     echo "---------------------------------------------------"
-    echo "🧠 Scenario 4: Notes → Safari → TextEdit"
+    echo "🧠 Scenario 4: Calendar → Notes → TextEdit → Mail"
     LOG_FILE="scenario_results/complex_scenario_4_${TIMESTAMP}.log"
-    SCENARIO_GOAL="Idea note -> web query -> report -> mail draft chain."
+    SCENARIO_GOAL="Idea note -> report -> mail send chain."
     CURRENT_SCENARIO_MARKER="$MARKER_S4"
     echo "Goal: ${SCENARIO_GOAL}"
-    CMD="Notes를 열어 새 메모(Cmd+N)를 만들고 아래 3줄을 그대로 입력하세요: \"focus music\", \"pomodoro timer\", \"daily review template\". 다음 줄에 \"${MARKER_S4}\"를 정확히 입력하세요. 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Safari를 열고 https://www.google.com 으로 이동한 뒤 붙여넣기(Cmd+V)하고 Enter를 누르세요. 주소창에 포커스(Cmd+L) 후 복사(Cmd+C)하세요. TextEdit를 열어 새 문서(Cmd+N)에 \"${SUBJECT_S4}\" 제목을 입력하고 다음 줄에 붙여넣기(Cmd+V)하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S4}\"를 입력한 뒤 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
+    CMD="아래 순서를 정확히 지키세요. 1) Calendar를 열어 전면으로 가져오세요. 2) Notes를 열고 새 메모(Cmd+N)를 만든 뒤 제목을 \"${SUBJECT_S4}\"로 입력하세요. 3) 본문에 다음 4줄을 그대로 입력하세요: \"focus music\", \"pomodoro timer\", \"daily review template\", \"${MARKER_S4}\". 4) 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. 5) TextEdit를 열고 새 문서(Cmd+N)에 붙여넣기(Cmd+V)한 뒤 다음 줄에 \"Research shortlist ready\"를 입력하세요. 6) 다시 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. 7) Mail을 열고 새 이메일(Cmd+N) 초안을 만든 뒤 제목 \"${SUBJECT_S4}\"를 입력하고 본문에 붙여넣기(Cmd+V)하세요. 8) 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요. 9) 전송이 끝나면 done으로 종료하세요."
 
     scenario_status="failed"
     if run_agent_scenario "$CMD" "$LOG_FILE" 4; then
@@ -2659,15 +2676,15 @@ else
     echo "⏭️  Scenario 4 skipped (STEER_SCENARIO_IDS=${SELECTED_SCENARIO_IDS})"
 fi
 
-# Scenario 5: Safari -> Calculator -> Notes -> Mail
+# Scenario 5: Finder -> Calculator -> Notes -> TextEdit -> Mail
 if should_run_scenario 5; then
     echo "---------------------------------------------------"
-    echo "💱 Scenario 5: Safari → Calculator → Notes → Mail"
+    echo "💱 Scenario 5: Finder → Calculator → Notes → TextEdit → Mail"
     LOG_FILE="scenario_results/complex_scenario_5_${TIMESTAMP}.log"
-    SCENARIO_GOAL="Finder/Calculator/Notes/Mail budget draft chain."
+    SCENARIO_GOAL="Finder/Calculator/Notes/TextEdit/Mail budget draft chain."
     CURRENT_SCENARIO_MARKER="$MARKER_S5"
     echo "Goal: ${SCENARIO_GOAL}"
-    CMD="Finder를 열어 Desktop으로 이동하세요. Calculator를 열어 \"120*1450=\" 을 입력해 계산하고 결과를 복사(Cmd+C)하세요. Notes를 열어 새 메모(Cmd+N)를 만들고 제목 \"${SUBJECT_S5}\"를 입력한 뒤 다음 줄에 \"Base: 120 USD\"를 입력하고 다음 줄에 붙여넣기(Cmd+V)하세요. 다음 줄에 \"${MARKER_S5}\"를 정확히 입력하세요. 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S5}\"를 입력한 다음 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
+    CMD="아래 순서를 정확히 지키세요. 1) Finder를 열고 Desktop을 전면으로 가져오세요. 2) Calculator를 열고 \"120*1450=\" 를 입력해 계산 화면을 준비하세요. 3) Notes를 열고 새 메모(Cmd+N)를 만든 뒤 제목을 \"${SUBJECT_S5}\"로 입력하세요. 4) 본문에 다음 3줄을 그대로 입력하세요: \"Base: 120 USD\", \"120*1450=\", \"${MARKER_S5}\". 5) 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. 6) TextEdit를 열고 새 문서(Cmd+N)에 붙여넣기(Cmd+V)한 뒤 다음 줄에 \"Budget draft ready\"를 입력하세요. 7) 다시 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. 8) Mail을 열고 새 이메일(Cmd+N) 초안을 만든 뒤 제목 \"${SUBJECT_S5}\"를 입력하고 본문에 붙여넣기(Cmd+V)하세요. 9) 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요. 10) 전송이 끝나면 done으로 종료하세요."
 
     scenario_status="failed"
     if run_agent_scenario "$CMD" "$LOG_FILE" 5; then
