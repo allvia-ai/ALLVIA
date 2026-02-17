@@ -293,16 +293,15 @@ compute_notifier_timeout() {
 compress_telegram_report() {
     local message="$1"
     local max_chars="${STEER_TELEGRAM_REPORT_MAX_CHARS:-3300}"
-    local max_evidence_lines="${STEER_TELEGRAM_EVIDENCE_MAX_LINES:-18}"
+    local max_evidence_lines="${STEER_TELEGRAM_EVIDENCE_MAX_LINES:-4}"
     if ! [[ "$max_chars" =~ ^[0-9]+$ ]]; then
         max_chars=3300
     fi
     if ! [[ "$max_evidence_lines" =~ ^[0-9]+$ ]]; then
-        max_evidence_lines=18
+        max_evidence_lines=4
     fi
     local compressed="$message"
-    if [ "${#compressed}" -gt "$max_chars" ]; then
-        compressed="$(printf '%s\n' "$compressed" | awk -v max_lines="$max_evidence_lines" '
+    compressed="$(printf '%s\n' "$compressed" | awk -v max_lines="$max_evidence_lines" '
 BEGIN { in_evidence=0; evidence_lines=0 }
 {
     if ($0 ~ /^근거:/) { in_evidence=1; print; next }
@@ -314,7 +313,6 @@ END {
         print "- ...(근거 축약, 상세는 로그/캡처 파일 참조)"
     }
 }')"
-    fi
     if [ "${#compressed}" -gt "$max_chars" ]; then
         compressed="${compressed:0:max_chars}"$'\n'"- ...(메시지 길이 축약)"
     fi
@@ -2451,7 +2449,7 @@ if [ "$textedit_required" = "1" ] && [ "$REQUIRE_TEXTEDIT_WRITE_VALUE" = "1" ]; 
     fi
 fi
 
-KEY_LOGS=$(grep -En "Goal completed by planner|Surf failed|Supervisor escalated|Preflight failed|Execution Error|SCHEMA_ERROR|PLAN_REJECTED|LLM Refused|fallback action|FALLBACK_ACTION:|Node evidence|MAIL_SEND_PROOF\\||EVIDENCE\\|" "$LOG_FILE" 2>/dev/null | tail -n 10 | sed -E 's/^[0-9]+://')
+KEY_LOGS=$(grep -En "Goal completed by planner|Surf failed|Supervisor escalated|Preflight failed|Execution Error|SCHEMA_ERROR|PLAN_REJECTED|LLM Refused|fallback action|FALLBACK_ACTION:|MAIL_SEND_PROOF\\||EVIDENCE\\|target=mail\\|event=send\\|" "$LOG_FILE" 2>/dev/null | tail -n 6 | sed -E 's/^[0-9]+://')
 if [ -z "$KEY_LOGS" ]; then
     KEY_LOGS=$(tail -n 4 "$LOG_FILE" 2>/dev/null | sed -E 's/^[[:space:]]+//')
 fi

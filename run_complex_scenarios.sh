@@ -672,16 +672,15 @@ compute_notifier_timeout() {
 compress_telegram_report() {
     local message="$1"
     local max_chars="${STEER_TELEGRAM_REPORT_MAX_CHARS:-3300}"
-    local max_evidence_lines="${STEER_TELEGRAM_EVIDENCE_MAX_LINES:-18}"
+    local max_evidence_lines="${STEER_TELEGRAM_EVIDENCE_MAX_LINES:-4}"
     if ! [[ "$max_chars" =~ ^[0-9]+$ ]]; then
         max_chars=3300
     fi
     if ! [[ "$max_evidence_lines" =~ ^[0-9]+$ ]]; then
-        max_evidence_lines=18
+        max_evidence_lines=4
     fi
     local compressed="$message"
-    if [ "${#compressed}" -gt "$max_chars" ]; then
-        compressed="$(printf '%s\n' "$compressed" | awk -v max_lines="$max_evidence_lines" '
+    compressed="$(printf '%s\n' "$compressed" | awk -v max_lines="$max_evidence_lines" '
 BEGIN { in_evidence=0; evidence_lines=0 }
 {
     if ($0 ~ /^근거:/) { in_evidence=1; print; next }
@@ -693,7 +692,6 @@ END {
         print "- ...(근거 축약, 상세는 로그/캡처 파일 참조)"
     }
 }')"
-    fi
     if [ "${#compressed}" -gt "$max_chars" ]; then
         compressed="${compressed:0:max_chars}"$'\n'"- ...(메시지 길이 축약)"
     fi
@@ -2256,7 +2254,7 @@ capture_and_notify() {
 
     # Build concise evidence lines from log for detailed Telegram report.
     local key_logs=""
-    key_logs=$(grep -En "Goal completed by planner|Surf failed|Supervisor escalated|Preflight failed|Execution Error|SCHEMA_ERROR|PLAN_REJECTED|LLM Refused|fallback action|FALLBACK_ACTION:|Node evidence|MAIL_SEND_PROOF\\||EVIDENCE\\|" "$log_file" 2>/dev/null | tail -n 8 | sed -E 's/^[0-9]+://')
+    key_logs=$(grep -En "Goal completed by planner|Surf failed|Supervisor escalated|Preflight failed|Execution Error|SCHEMA_ERROR|PLAN_REJECTED|LLM Refused|fallback action|FALLBACK_ACTION:|MAIL_SEND_PROOF\\||EVIDENCE\\|target=mail\\|event=send\\|" "$log_file" 2>/dev/null | tail -n 6 | sed -E 's/^[0-9]+://')
     if [ -z "$key_logs" ]; then
         key_logs=$(tail -n 3 "$log_file" 2>/dev/null | sed -E 's/^[[:space:]]+//')
     fi

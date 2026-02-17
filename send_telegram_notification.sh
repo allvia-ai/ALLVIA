@@ -19,6 +19,7 @@ TELEGRAM_RETRY_COUNT="${TELEGRAM_RETRY_COUNT:-3}"
 TELEGRAM_RETRY_DELAY_SEC="${TELEGRAM_RETRY_DELAY_SEC:-1}"
 TELEGRAM_VALIDATE_REPORT="${TELEGRAM_VALIDATE_REPORT:-0}"
 TELEGRAM_MAX_TEXT_LEN="${TELEGRAM_MAX_TEXT_LEN:-3800}"
+TELEGRAM_EXTRA_IMAGE_MAX="${TELEGRAM_EXTRA_IMAGE_MAX:-1}"
 
 MESSAGE="$1"
 IMAGE_PATH="$2"
@@ -326,6 +327,17 @@ send_extra_images() {
     if [ -z "$list_file" ] || [ ! -f "$list_file" ]; then
         return 0
     fi
+    local max_extra="$TELEGRAM_EXTRA_IMAGE_MAX"
+    if ! [[ "$max_extra" =~ ^[0-9]+$ ]]; then
+        max_extra=1
+    fi
+    if [ "$max_extra" -le 0 ]; then
+        return 0
+    fi
+
+    local send_list
+    send_list="$(mktemp -t steer_tg_extra_list.XXXXXX)"
+    tail -n "$max_extra" "$list_file" > "$send_list" 2>/dev/null || cp "$list_file" "$send_list"
 
     while IFS= read -r line || [ -n "$line" ]; do
         [ -z "$line" ] && continue
@@ -336,9 +348,11 @@ send_extra_images() {
         fi
         if ! send_photo_with_caption "$image_path" "$caption"; then
             echo "Failed to send extra node image: $image_path"
+            rm -f "$send_list"
             return 1
         fi
-    done < "$list_file"
+    done < "$send_list"
+    rm -f "$send_list"
     return 0
 }
 
