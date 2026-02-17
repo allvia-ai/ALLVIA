@@ -33,6 +33,7 @@ REQUIRE_PRIMARY_PLANNER_VALUE="${STEER_REQUIRE_PRIMARY_PLANNER:-1}"
 LOCK_DISABLED_VALUE="${STEER_LOCK_DISABLED:-0}"
 APPROVAL_ASK_FALLBACK_VALUE="${STEER_APPROVAL_ASK_FALLBACK:-deny}"
 TEST_MODE_VALUE="${STEER_TEST_MODE:-0}"
+COMPACT_SUCCESS_REPORT_VALUE="${STEER_TELEGRAM_COMPACT_SUCCESS:-1}"
 
 is_truthy() {
     case "${1:-}" in
@@ -109,6 +110,18 @@ normalize_scenario_ids() {
 should_run_scenario() {
     local id="$1"
     [[ " ${SELECTED_SCENARIO_IDS} " == *" ${id} "* ]]
+}
+
+complex_scenario_workflow_label() {
+    local scenario_num="$1"
+    case "$scenario_num" in
+        1) printf '%s\n' "Calendar -> Notes -> TextEdit -> Mail" ;;
+        2) printf '%s\n' "Finder(Downloads) -> Notes -> TextEdit -> Mail" ;;
+        3) printf '%s\n' "Calculator -> Notes -> TextEdit -> Mail" ;;
+        4) printf '%s\n' "Calendar -> Notes -> TextEdit -> Mail" ;;
+        5) printf '%s\n' "Finder(Desktop) -> Calculator -> Notes -> TextEdit -> Mail" ;;
+        *) printf '%s\n' "App chain workflow" ;;
+    esac
 }
 
 SELECTED_SCENARIO_IDS="$(normalize_scenario_ids "$SCENARIO_IDS_RAW")"
@@ -2465,8 +2478,25 @@ capture_and_notify() {
         brief_final_line="- 문제 없음 -> 성공"
     fi
 
+    local workflow_label
+    workflow_label="$(complex_scenario_workflow_label "$scenario_num")"
+
     local telegram_message
-    telegram_message=$(cat <<EOF
+    if [ "$status" = "success" ] && [ "$COMPACT_SUCCESS_REPORT_VALUE" = "1" ]; then
+        telegram_message=$(cat <<EOF
+📌 시나리오 ${scenario_num} - 성공 요약
+
+🔄 워크플로우
+- ${workflow_label}
+
+✅ 결과
+- ${result_info}
+${brief_mail_result_line}
+- 문제 없음 -> 성공
+EOF
+)
+    else
+        telegram_message=$(cat <<EOF
 📌 시나리오 ${scenario_num} - 쉽게 말한 요약
 
 🔄 뭘 했는지
@@ -2489,6 +2519,7 @@ ${brief_final_line}
 ${evidence_lines}- 로그: $(basename "$log_file")
 EOF
 )
+    fi
     telegram_message="$(compress_telegram_report "$telegram_message")"
 
     # Keep local audit copy of the raw pre-rewrite message.

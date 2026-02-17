@@ -41,6 +41,7 @@ fi
 : "${STEER_SEMANTIC_ENFORCE_RUST_ONLY:=1}"
 : "${STEER_SEMANTIC_FAIL_ON_TRUNCATION:=1}"
 : "${STEER_SEMANTIC_REQUIRE_APP_SCOPE:=1}"
+COMPACT_SUCCESS_REPORT_VALUE="${STEER_TELEGRAM_COMPACT_SUCCESS:-1}"
 
 require_terminal_context() {
     local require_terminal="${STEER_REQUIRE_TERMINAL:-1}"
@@ -2760,6 +2761,20 @@ if [ "$STATUS" = "success" ]; then
     BRIEF_FINAL_LINE="- 문제 없음 -> 성공"
 fi
 
+if [ "$STATUS" = "success" ] && [ "$COMPACT_SUCCESS_REPORT_VALUE" = "1" ]; then
+TELEGRAM_MESSAGE=$(cat <<EOF
+📌 ${TASK_NAME} - 성공 요약
+
+🔄 워크플로우
+- 자연어 요청 플랜 실행 -> 앱 액션 수행 -> 검증 -> 텔레그램 보고
+
+✅ 결과
+- ${RESULT_TEXT}
+${BRIEF_MAIL_RESULT_LINE}
+- 문제 없음 -> 성공
+EOF
+)
+else
 TELEGRAM_MESSAGE=$(cat <<EOF
 📌 ${TASK_NAME} - 쉽게 말한 요약
 
@@ -2783,6 +2798,7 @@ ${BRIEF_FINAL_LINE}
 ${EVIDENCE_LINES}- 로그: $(basename "$LOG_FILE")
 EOF
 )
+fi
 TELEGRAM_MESSAGE="$(compress_telegram_report "$TELEGRAM_MESSAGE")"
 
 printf '%s\n' "$TELEGRAM_MESSAGE" > "$RAW_MSG_FILE"

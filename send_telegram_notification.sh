@@ -64,17 +64,41 @@ validate_report_message() {
     local evidence_count
     local has_status
     local has_evidence_header
+    local has_workflow_header
+    local has_result_header
+    local has_success_word
 
     has_status=0
     has_evidence_header=0
+    has_workflow_header=0
+    has_result_header=0
+    has_success_word=0
     if printf '%s\n' "$text" | grep -Eq "^상태:[[:space:]]*(✅|❌)"; then
         has_status=1
     fi
     if printf '%s\n' "$text" | grep -Eq "^근거:"; then
         has_evidence_header=1
     fi
+    if printf '%s\n' "$text" | grep -Eq "^🔄[[:space:]]*워크플로우"; then
+        has_workflow_header=1
+    fi
+    if printf '%s\n' "$text" | grep -Eq "^✅[[:space:]]*결과"; then
+        has_result_header=1
+    fi
+    if printf '%s\n' "$text" | grep -Eq "문제 없음 -> 성공|완료 판정되었습니다"; then
+        has_success_word=1
+    fi
     evidence_count="$(printf '%s\n' "$text" | grep -Ec "^- ")"
     evidence_count="${evidence_count:-0}"
+
+    # Detailed report format (status + evidence) remains valid.
+    if [ "$has_status" -eq 1 ] && [ "$has_evidence_header" -eq 1 ] && [ "$evidence_count" -ge 3 ]; then
+        return 0
+    fi
+    # Compact success format (workflow + result) is also valid.
+    if [ "$has_workflow_header" -eq 1 ] && [ "$has_result_header" -eq 1 ] && [ "$has_success_word" -eq 1 ]; then
+        return 0
+    fi
 
     if [ "$has_status" -eq 0 ] || [ "$has_evidence_header" -eq 0 ] || [ "$evidence_count" -lt 3 ]; then
         echo "❌ Telegram report validation failed (status=$has_status evidence_header=$has_evidence_header bullets=$evidence_count)"
