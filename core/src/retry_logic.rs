@@ -56,15 +56,16 @@ pub fn classify_error(message: &str) -> FailoverReason {
     if msg_lower.contains("usage limit has been reached")
         || msg_lower.contains("upgrade to pro")
         || msg_lower.contains("purchase more credits")
+        || msg_lower.contains("insufficient_quota")
+        || msg_lower.contains("rate_limited:")
     {
         return FailoverReason::Auth;
     }
 
-    // Rate limit detection (from clawdbot)
+    // Rate limit detection (from clawdbot) — transient burst-only
     if msg_lower.contains("rate limit")
         || msg_lower.contains("429")
         || msg_lower.contains("too many requests")
-        || msg_lower.contains("quota exceeded")
     {
         return FailoverReason::RateLimit;
     }

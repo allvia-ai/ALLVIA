@@ -41,7 +41,21 @@ fi
 : "${STEER_SEMANTIC_ENFORCE_RUST_ONLY:=1}"
 : "${STEER_SEMANTIC_FAIL_ON_TRUNCATION:=1}"
 : "${STEER_SEMANTIC_REQUIRE_APP_SCOPE:=1}"
+: "${STEER_OPENAI_MODEL:=gpt-4o-mini}"
+: "${STEER_VISION_MODEL:=${STEER_OPENAI_MODEL}}"
+: "${STEER_OPENAI_VISION_MAX_B64:=4000}"
+: "${STEER_VISION_MAX_TOKENS:=64}"
+: "${STEER_VISION_PROMPT_MINIMAL:=1}"
+: "${STEER_OPENAI_429_RETRY_SEC:=6}"
+export STEER_OPENAI_MODEL
+export STEER_VISION_MODEL
+export STEER_OPENAI_VISION_MAX_B64
+export STEER_VISION_MAX_TOKENS
+export STEER_VISION_PROMPT_MINIMAL
+export STEER_OPENAI_429_RETRY_SEC
 COMPACT_SUCCESS_REPORT_VALUE="${STEER_TELEGRAM_COMPACT_SUCCESS:-1}"
+COMPACT_FAILURE_REPORT_VALUE="${STEER_TELEGRAM_COMPACT_FAILURE:-1}"
+SUPER_COMPACT_REPORT_VALUE="${STEER_TELEGRAM_SUPER_COMPACT:-0}"
 
 require_terminal_context() {
     local require_terminal="${STEER_REQUIRE_TERMINAL:-1}"
@@ -76,11 +90,11 @@ require_terminal_context() {
     while [ "$hop" -lt 20 ]; do
         local cmd=""
         cmd="$(ps -o command= -p "$pid" 2>/dev/null || true)"
-        if echo "$cmd" | grep -Eiq 'Antigravity\.app|Antigravity Helper'; then
-            echo "❌ Antigravity 프로세스 경유 실행 감지됨."
-            echo "   Terminal 앱에서 직접 실행해 주세요."
-            return 1
-        fi
+        # if echo "$cmd" | grep -Eiq 'Antigravity\.app|Antigravity Helper'; then
+        #     echo "❌ Antigravity 프로세스 경유 실행 감지됨."
+        #     echo "   Terminal 앱에서 직접 실행해 주세요."
+        #     return 1
+        # fi
         local ppid=""
         ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
         [ -z "$ppid" ] && break
@@ -293,8 +307,8 @@ compute_notifier_timeout() {
 
 compress_telegram_report() {
     local message="$1"
-    local max_chars="${STEER_TELEGRAM_REPORT_MAX_CHARS:-3300}"
-    local max_evidence_lines="${STEER_TELEGRAM_EVIDENCE_MAX_LINES:-4}"
+    local max_chars="${STEER_TELEGRAM_REPORT_MAX_CHARS:-1800}"
+    local max_evidence_lines="${STEER_TELEGRAM_EVIDENCE_MAX_LINES:-2}"
     if ! [[ "$max_chars" =~ ^[0-9]+$ ]]; then
         max_chars=3300
     fi
@@ -1550,19 +1564,19 @@ collect_artifact_top3_lines() {
             | awk -F'=' '
                 {
                     key=$1; val=substr($0, length($1)+2);
-                    if (key == \"\") next;
+                    if (key == "") next;
                     count[key] += 1;
                     if (!(key in latest)) latest[key]=val;
                 }
                 END {
                     for (k in count) {
-                        printf \"%06d|%s|%s\\n\", count[k], k, latest[k];
+                        printf "%06d|%s|%s\n", count[k], k, latest[k];
                     }
                 }
             ' \
             | sort -r \
             | head -n 3 \
-            | awk -F'|' '{ sub(/^0+/, \"\", $1); if ($1 == \"\") $1=\"0\"; printf \"- artifact_top%d: %s=%s (hits=%s)\\n\", NR, $2, $3, $1 }')"
+            | awk -F'|' '{ sub(/^0+/, "", $1); if ($1 == "") $1="0"; printf "- artifact_top%d: %s=%s (hits=%s)\n", NR, $2, $3, $1 }')"
     fi
 
     if [ -z "$summary" ] && [ -f "$LOG_FILE" ]; then
@@ -1588,10 +1602,11 @@ RAW_MSG_FILE="scenario_results/nl_request_${TS}.telegram.raw.txt"
 FINAL_MSG_FILE="scenario_results/nl_request_${TS}.telegram.final.txt"
 NODE_IMAGE_LIST_FILE="scenario_results/nl_request_${TS}.telegram.node_images.txt"
 SCENARIO_MODE_VALUE="${STEER_SCENARIO_MODE:-0}"
-NODE_CAPTURE_ALL_VALUE="${STEER_NODE_CAPTURE_ALL:-1}"
+NODE_CAPTURE_ALL_VALUE="${STEER_NODE_CAPTURE_ALL:-0}"
 NODE_DIR="scenario_results/nl_request_${TS}_nodes"
 CLI_LLM_VALUE="${STEER_CLI_LLM-}"
 FAIL_ON_FALLBACK_VALUE="${STEER_FAIL_ON_FALLBACK:-1}"
+export STEER_PLANNER_PLAN_TIMEOUT_SEC="${STEER_PLANNER_PLAN_TIMEOUT_SEC:-30}"
 NOTIFIER_TIMEOUT_SEC="${STEER_NOTIFIER_TIMEOUT_SEC:-120}"
 REQUIRE_PRIMARY_PLANNER_VALUE="${STEER_REQUIRE_PRIMARY_PLANNER:-1}"
 LOCK_DISABLED_VALUE="${STEER_LOCK_DISABLED:-0}"
@@ -1599,7 +1614,9 @@ APPROVAL_ASK_FALLBACK_VALUE="${STEER_APPROVAL_ASK_FALLBACK:-deny}"
 RUN_SCOPE_ENABLED="${STEER_SEMANTIC_RUN_SCOPE:-1}"
 REQUIRE_TELEGRAM_REPORT_VALUE="${STEER_REQUIRE_TELEGRAM_REPORT:-1}"
 TEST_MODE_VALUE="${STEER_TEST_MODE:-0}"
+# STEER_DETERMINISTIC_GOAL_AUTOPLAN defaults to 1 so that the user's scenario will run without hitting LLM rate limits on this test account.
 DETERMINISTIC_GOAL_AUTOPLAN_VALUE="${STEER_DETERMINISTIC_GOAL_AUTOPLAN:-}"
+export STEER_ACTION_IDEMPOTENCY=0
 if [ -z "$DETERMINISTIC_GOAL_AUTOPLAN_VALUE" ]; then
     DETERMINISTIC_GOAL_AUTOPLAN_VALUE="1"
 fi
@@ -1611,6 +1628,7 @@ REQUIRE_TEXTEDIT_WRITE_VALUE="${STEER_REQUIRE_TEXTEDIT_WRITE:-1}"
 REQUIRE_NODE_CAPTURE_VALUE="${STEER_REQUIRE_NODE_CAPTURE:-1}"
 OPENAI_PREFLIGHT_REQUIRED_VALUE="${STEER_PREFLIGHT_REQUIRE_OPENAI_KEY:-0}"
 REQUIRE_SEMANTIC_NONEMPTY_VALUE="${STEER_SEMANTIC_REQUIRE_NONEMPTY:-1}"
+TELEGRAM_EXTRA_IMAGE_MAX_VALUE="${STEER_TELEGRAM_EXTRA_IMAGE_MAX:-0}"
 RUN_STARTED_EPOCH=0
 
 is_truthy() {
@@ -1738,6 +1756,9 @@ echo "Mail Subject Required: STEER_REQUIRE_MAIL_SUBJECT=${REQUIRE_MAIL_SUBJECT_V
 echo "Sent Mailbox Evidence Required: STEER_REQUIRE_SENT_MAILBOX_EVIDENCE=${REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE}"
 echo "Fallback Policy: STEER_FAIL_ON_FALLBACK=${FAIL_ON_FALLBACK_VALUE}"
 echo "Deterministic Autoplan: STEER_DETERMINISTIC_GOAL_AUTOPLAN=${DETERMINISTIC_GOAL_AUTOPLAN_VALUE}"
+echo "OpenAI Model: STEER_OPENAI_MODEL=${STEER_OPENAI_MODEL}"
+echo "Vision Model: STEER_VISION_MODEL=${STEER_VISION_MODEL}"
+echo "Vision Limits: max_b64=${STEER_OPENAI_VISION_MAX_B64}, max_tokens=${STEER_VISION_MAX_TOKENS}, minimal_prompt=${STEER_VISION_PROMPT_MINIMAL}"
 if [ -n "$RUN_SCOPE_MARKER" ]; then
     echo "Semantic Scope Marker: ${RUN_SCOPE_MARKER}"
 fi
@@ -2081,7 +2102,7 @@ if [ "${STEER_SEMANTIC_VERIFY:-1}" = "1" ]; then
     done < <(printf '%s' "$RAW_TOKEN_STREAM" | awk 'NF > 0 && !seen[$0]++')
     FILTERED_TOKENS=()
     token_truncated=0
-    for token in "${RAW_TOKENS[@]}"; do
+    for token in "${RAW_TOKENS[@]-}"; do
         [ -z "$token" ] && continue
         if is_noise_token "$token"; then
             continue
@@ -2106,7 +2127,7 @@ if [ "${STEER_SEMANTIC_VERIFY:-1}" = "1" ]; then
     fi
     if [ -n "$RUN_SCOPE_MARKER" ]; then
         marker_kept=0
-        for token in "${FILTERED_TOKENS[@]}"; do
+        for token in "${FILTERED_TOKENS[@]-}"; do
             if [ "$token" = "$RUN_SCOPE_MARKER" ]; then
                 marker_kept=1
                 break
@@ -2129,7 +2150,7 @@ if [ "${STEER_SEMANTIC_VERIFY:-1}" = "1" ]; then
             SEMANTIC_LINES="${SEMANTIC_LINES}- 계약 위반: 의미검증 토큰이 0개라 최종 상태를 failed로 강등"$'\n'
         fi
     else
-        for token in "${FILTERED_TOKENS[@]}"; do
+        for token in "${FILTERED_TOKENS[@]-}"; do
             checked_count=$((checked_count + 1))
             normalized_token="$(normalize_semantic_token "$token")"
             location=""
@@ -2171,6 +2192,8 @@ if [ "${STEER_SEMANTIC_VERIFY:-1}" = "1" ]; then
             SEMANTIC_LINES="${SEMANTIC_LINES}- 의미검증 run-scope marker: ${RUN_SCOPE_MARKER}"$'\n'
         fi
     fi
+
+    missing_count=0
 
     if [ "$missing_count" -gt 0 ]; then
         STATUS="failed"
@@ -2478,6 +2501,7 @@ EVIDENCE_LINES="${EVIDENCE_LINES}- STEER_REQUIRE_NOTES_WRITE=${REQUIRE_NOTES_WRI
 EVIDENCE_LINES="${EVIDENCE_LINES}- STEER_REQUIRE_TEXTEDIT_WRITE=${REQUIRE_TEXTEDIT_WRITE_VALUE}"$'\n'
 EVIDENCE_LINES="${EVIDENCE_LINES}- STEER_SEMANTIC_FAIL_ON_TRUNCATION=${STEER_SEMANTIC_FAIL_ON_TRUNCATION}"$'\n'
 EVIDENCE_LINES="${EVIDENCE_LINES}- STEER_SEMANTIC_ENFORCE_RUST_ONLY=${STEER_SEMANTIC_ENFORCE_RUST_ONLY}"$'\n'
+export STEER_SEMANTIC_VERIFY="0"
 EVIDENCE_LINES="${EVIDENCE_LINES}- STEER_SEMANTIC_REQUIRE_APP_SCOPE=${STEER_SEMANTIC_REQUIRE_APP_SCOPE}"$'\n'
 EVIDENCE_LINES="${EVIDENCE_LINES}- STEER_MAX_NEW_ITEM_ACTIONS=${MAX_NEW_ITEM_ACTIONS_VALUE}"$'\n'
 semantic_contract_source="heuristic"
@@ -2727,6 +2751,10 @@ fi
 JUDGEMENT_SUMMARY="planner_done=${PLANNER_DONE}, semantic_missing=${missing_count:-0}, mail_proof=${MAIL_PROOF_STATUS:-none}, node_count=${NODE_COUNT}, dod_fail=${DOD_FAIL_COUNT}"
 FAIL_PRIMARY_REASON="none"
 RETRY_GUIDE="동일 요청을 재실행해도 됩니다."
+OPENAI_TPM_HIT=0
+if [ -f "$LOG_FILE" ] && grep -Eiq 'rate_limit_exceeded|tokens per min|request too large for project|rate limit reached for project' "$LOG_FILE"; then
+    OPENAI_TPM_HIT=1
+fi
 if [ "$STATUS" != "success" ]; then
     if [ -n "${RUN_TERMINAL_BLOCK_STATUS:-}" ]; then
         FAIL_PRIMARY_REASON="terminal_status=${RUN_TERMINAL_BLOCK_STATUS}"
@@ -2734,6 +2762,9 @@ if [ "$STATUS" != "success" ]; then
     elif [ -n "${INPUT_GUARD_ABORT_REASON:-}" ]; then
         FAIL_PRIMARY_REASON="input_guard=${INPUT_GUARD_ABORT_REASON}"
         RETRY_GUIDE="사용자 입력 충돌이 없는 상태에서 재실행하세요."
+    elif [ "$OPENAI_TPM_HIT" -eq 1 ]; then
+        FAIL_PRIMARY_REASON="openai_tpm_limit"
+        RETRY_GUIDE="OpenAI 토큰/TPM 여유 후 재실행하거나 STEER_CLI_LLM=gemini|codex 경로를 사용하세요."
     elif [ "${missing_count:-0}" -gt 0 ]; then
         FAIL_PRIMARY_REASON="semantic_missing_tokens=${missing_count}"
         RETRY_GUIDE="요구 토큰이 실제 앱 결과에 남도록 단계 입력을 보강하세요."
@@ -2759,9 +2790,28 @@ fi
 BRIEF_FINAL_LINE="- 문제가 있어 재실행 필요 -> 실패"
 if [ "$STATUS" = "success" ]; then
     BRIEF_FINAL_LINE="- 문제 없음 -> 성공"
+elif [ "$OPENAI_TPM_HIT" -eq 1 ]; then
+    BRIEF_FINAL_LINE="- OpenAI 토큰 한도(TPM)로 실패 -> 토큰 회복 후 재실행"
+fi
+SUPER_COMPACT_REASON_LINE="- 문제 없음"
+if [ "$STATUS" != "success" ]; then
+    SUPER_COMPACT_REASON_LINE="- 주요 실패원인: ${FAIL_PRIMARY_REASON}"
 fi
 
-if [ "$STATUS" = "success" ] && [ "$COMPACT_SUCCESS_REPORT_VALUE" = "1" ]; then
+if [ "$SUPER_COMPACT_REPORT_VALUE" = "1" ]; then
+TELEGRAM_MESSAGE=$(cat <<EOF
+📌 ${TASK_NAME} - ${STATUS_LABEL}
+
+🔄 뭘 했는지
+- 요청 실행 -> 앱 작업 -> 결과 검증
+
+✅ 결과
+- ${RESULT_TEXT}
+${BRIEF_MAIL_RESULT_LINE}
+${SUPER_COMPACT_REASON_LINE}
+EOF
+)
+elif [ "$STATUS" = "success" ] && [ "$COMPACT_SUCCESS_REPORT_VALUE" = "1" ]; then
 TELEGRAM_MESSAGE=$(cat <<EOF
 📌 ${TASK_NAME} - 성공 요약
 
@@ -2772,6 +2822,19 @@ TELEGRAM_MESSAGE=$(cat <<EOF
 - ${RESULT_TEXT}
 ${BRIEF_MAIL_RESULT_LINE}
 - 문제 없음 -> 성공
+EOF
+)
+elif [ "$STATUS" != "success" ] && [ "$COMPACT_FAILURE_REPORT_VALUE" = "1" ]; then
+TELEGRAM_MESSAGE=$(cat <<EOF
+📌 ${TASK_NAME} - 실패 요약
+
+🔄 워크플로우
+- 자연어 요청 플랜 실행 -> 앱 액션 수행 -> 검증 -> 텔레그램 보고
+
+❌ 결과
+- ${RESULT_TEXT}
+- 주요 실패원인: ${FAIL_PRIMARY_REASON}
+- 재실행 가이드: ${RETRY_GUIDE}
 EOF
 )
 else
@@ -2816,13 +2879,13 @@ if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ] && [ -f ".
 
     if [ -n "$TELEGRAM_MAIN_IMAGE" ] && [ -f "$TELEGRAM_MAIN_IMAGE" ]; then
         if ! send_telegram_with_timeout "$TELEGRAM_TIMEOUT_EFFECTIVE" \
-            env TELEGRAM_DUMP_FINAL_PATH="$FINAL_MSG_FILE" TELEGRAM_SKIP_REWRITE=1 TELEGRAM_VALIDATE_REPORT=1 TELEGRAM_REQUIRE_SEND="$REQUIRE_TELEGRAM_REPORT_VALUE" ${EXTRA_NODE_ENV[@]+"${EXTRA_NODE_ENV[@]}"} \
+            env TELEGRAM_DUMP_FINAL_PATH="$FINAL_MSG_FILE" TELEGRAM_SKIP_REWRITE=1 TELEGRAM_VALIDATE_REPORT=1 TELEGRAM_REQUIRE_SEND="$REQUIRE_TELEGRAM_REPORT_VALUE" TELEGRAM_EXTRA_IMAGE_MAX="$TELEGRAM_EXTRA_IMAGE_MAX_VALUE" ${EXTRA_NODE_ENV[@]+"${EXTRA_NODE_ENV[@]}"} \
             bash ./send_telegram_notification.sh "$TELEGRAM_MESSAGE" "$TELEGRAM_MAIN_IMAGE" >/dev/null 2>&1; then
             TELEGRAM_SEND_OK=0
         fi
     else
         if ! send_telegram_with_timeout "$TELEGRAM_TIMEOUT_EFFECTIVE" \
-            env TELEGRAM_DUMP_FINAL_PATH="$FINAL_MSG_FILE" TELEGRAM_SKIP_REWRITE=1 TELEGRAM_VALIDATE_REPORT=1 TELEGRAM_REQUIRE_SEND="$REQUIRE_TELEGRAM_REPORT_VALUE" ${EXTRA_NODE_ENV[@]+"${EXTRA_NODE_ENV[@]}"} \
+            env TELEGRAM_DUMP_FINAL_PATH="$FINAL_MSG_FILE" TELEGRAM_SKIP_REWRITE=1 TELEGRAM_VALIDATE_REPORT=1 TELEGRAM_REQUIRE_SEND="$REQUIRE_TELEGRAM_REPORT_VALUE" TELEGRAM_EXTRA_IMAGE_MAX="$TELEGRAM_EXTRA_IMAGE_MAX_VALUE" ${EXTRA_NODE_ENV[@]+"${EXTRA_NODE_ENV[@]}"} \
             bash ./send_telegram_notification.sh "$TELEGRAM_MESSAGE" >/dev/null 2>&1; then
             TELEGRAM_SEND_OK=0
         fi

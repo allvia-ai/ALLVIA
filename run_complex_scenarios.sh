@@ -14,6 +14,18 @@ fi
 # Semantic contract policy defaults: keep complex scenarios aligned with NL request runner.
 : "${STEER_SEMANTIC_FAIL_ON_TRUNCATION:=1}"
 : "${STEER_SEMANTIC_REQUIRE_APP_SCOPE:=1}"
+: "${STEER_OPENAI_MODEL:=gpt-4o-mini}"
+: "${STEER_VISION_MODEL:=${STEER_OPENAI_MODEL}}"
+: "${STEER_OPENAI_VISION_MAX_B64:=4000}"
+: "${STEER_VISION_MAX_TOKENS:=64}"
+: "${STEER_VISION_PROMPT_MINIMAL:=1}"
+: "${STEER_OPENAI_429_RETRY_SEC:=6}"
+export STEER_OPENAI_MODEL
+export STEER_VISION_MODEL
+export STEER_OPENAI_VISION_MAX_B64
+export STEER_VISION_MAX_TOKENS
+export STEER_VISION_PROMPT_MINIMAL
+export STEER_OPENAI_429_RETRY_SEC
 
 echo "🚀 Starting Complex Scenarios 1-5 Execution..."
 echo "⚠️  PLEASE DO NOT TOUCH THE MOUSE/KEYBOARD DURING EXECUTION"
@@ -25,7 +37,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 SUCCESS_COUNT=0
 FAIL_COUNT=0
 SCENARIO_MODE_VALUE="${STEER_SCENARIO_MODE:-0}"
-NODE_CAPTURE_ALL_VALUE="${STEER_NODE_CAPTURE_ALL:-1}"
+NODE_CAPTURE_ALL_VALUE="${STEER_NODE_CAPTURE_ALL:-0}"
 CLI_LLM_VALUE="${STEER_CLI_LLM-}"
 FAIL_ON_FALLBACK_VALUE="${STEER_FAIL_ON_FALLBACK:-1}"
 NOTIFIER_TIMEOUT_SEC="${STEER_NOTIFIER_TIMEOUT_SEC:-120}"
@@ -34,6 +46,9 @@ LOCK_DISABLED_VALUE="${STEER_LOCK_DISABLED:-0}"
 APPROVAL_ASK_FALLBACK_VALUE="${STEER_APPROVAL_ASK_FALLBACK:-deny}"
 TEST_MODE_VALUE="${STEER_TEST_MODE:-0}"
 COMPACT_SUCCESS_REPORT_VALUE="${STEER_TELEGRAM_COMPACT_SUCCESS:-1}"
+COMPACT_FAILURE_REPORT_VALUE="${STEER_TELEGRAM_COMPACT_FAILURE:-1}"
+SUPER_COMPACT_REPORT_VALUE="${STEER_TELEGRAM_SUPER_COMPACT:-0}"
+TELEGRAM_EXTRA_IMAGE_MAX_VALUE="${STEER_TELEGRAM_EXTRA_IMAGE_MAX:-0}"
 
 is_truthy() {
     case "${1:-}" in
@@ -115,11 +130,11 @@ should_run_scenario() {
 complex_scenario_workflow_label() {
     local scenario_num="$1"
     case "$scenario_num" in
-        1) printf '%s\n' "Calendar -> Notes -> TextEdit -> Mail" ;;
-        2) printf '%s\n' "Finder(Downloads) -> Notes -> TextEdit -> Mail" ;;
-        3) printf '%s\n' "Calculator -> Notes -> TextEdit -> Mail" ;;
-        4) printf '%s\n' "Calendar -> Notes -> TextEdit -> Mail" ;;
-        5) printf '%s\n' "Finder(Desktop) -> Calculator -> Notes -> TextEdit -> Mail" ;;
+        1) printf '%s\n' "Calendar -> TextEdit -> Mail" ;;
+        2) printf '%s\n' "Finder(Downloads) -> TextEdit -> Mail" ;;
+        3) printf '%s\n' "Calculator -> TextEdit -> Mail" ;;
+        4) printf '%s\n' "Calendar -> TextEdit -> Mail" ;;
+        5) printf '%s\n' "Finder(Desktop) -> Calculator -> TextEdit -> Mail" ;;
         *) printf '%s\n' "App chain workflow" ;;
     esac
 }
@@ -203,6 +218,8 @@ echo "📬 STEER_REQUIRE_SENT_MAILBOX_EVIDENCE=${REQUIRE_SENT_MAILBOX_EVIDENCE_V
 echo "🧩 STEER_SCENARIO_IDS=${SELECTED_SCENARIO_IDS}"
 echo "🧯 STEER_FAIL_ON_FALLBACK=${FAIL_ON_FALLBACK_VALUE} (1=mark failed on fallback action)"
 echo "🧭 STEER_DETERMINISTIC_GOAL_AUTOPLAN=${DETERMINISTIC_GOAL_AUTOPLAN_VALUE}"
+echo "🧠 STEER_OPENAI_MODEL=${STEER_OPENAI_MODEL}, STEER_VISION_MODEL=${STEER_VISION_MODEL}"
+echo "🖼️ Vision limits: max_b64=${STEER_OPENAI_VISION_MAX_B64}, max_tokens=${STEER_VISION_MAX_TOKENS}, minimal_prompt=${STEER_VISION_PROMPT_MINIMAL}"
 if [ -n "$CLI_LLM_VALUE" ]; then
     echo "🤖 STEER_CLI_LLM=${CLI_LLM_VALUE}"
 else
@@ -684,8 +701,8 @@ compute_notifier_timeout() {
 
 compress_telegram_report() {
     local message="$1"
-    local max_chars="${STEER_TELEGRAM_REPORT_MAX_CHARS:-3300}"
-    local max_evidence_lines="${STEER_TELEGRAM_EVIDENCE_MAX_LINES:-4}"
+    local max_chars="${STEER_TELEGRAM_REPORT_MAX_CHARS:-1800}"
+    local max_evidence_lines="${STEER_TELEGRAM_EVIDENCE_MAX_LINES:-2}"
     if ! [[ "$max_chars" =~ ^[0-9]+$ ]]; then
         max_chars=3300
     fi
@@ -2477,12 +2494,29 @@ capture_and_notify() {
     if [ "$status" = "success" ]; then
         brief_final_line="- 문제 없음 -> 성공"
     fi
+    local super_compact_reason_line="- 문제 없음"
+    if [ "$status" != "success" ]; then
+        super_compact_reason_line="- 주요 실패원인: ${fail_primary_reason}"
+    fi
 
     local workflow_label
     workflow_label="$(complex_scenario_workflow_label "$scenario_num")"
 
     local telegram_message
-    if [ "$status" = "success" ] && [ "$COMPACT_SUCCESS_REPORT_VALUE" = "1" ]; then
+    if [ "$SUPER_COMPACT_REPORT_VALUE" = "1" ]; then
+        telegram_message=$(cat <<EOF
+📌 시나리오 ${scenario_num} - ${status_label}
+
+🔄 뭘 했는지
+- ${workflow_label}
+
+✅ 결과
+- ${result_info}
+${brief_mail_result_line}
+${super_compact_reason_line}
+EOF
+)
+    elif [ "$status" = "success" ] && [ "$COMPACT_SUCCESS_REPORT_VALUE" = "1" ]; then
         telegram_message=$(cat <<EOF
 📌 시나리오 ${scenario_num} - 성공 요약
 
@@ -2493,6 +2527,19 @@ capture_and_notify() {
 - ${result_info}
 ${brief_mail_result_line}
 - 문제 없음 -> 성공
+EOF
+)
+    elif [ "$status" != "success" ] && [ "$COMPACT_FAILURE_REPORT_VALUE" = "1" ]; then
+        telegram_message=$(cat <<EOF
+📌 시나리오 ${scenario_num} - 실패 요약
+
+🔄 워크플로우
+- ${workflow_label}
+
+❌ 결과
+- ${result_info}
+- 주요 실패원인: ${fail_primary_reason}
+- 재실행 가이드: ${retry_guide}
 EOF
 )
     else
@@ -2545,13 +2592,13 @@ EOF
             notifier_timeout="$(compute_notifier_timeout "$NOTIFIER_TIMEOUT_SEC" "$node_image_count")"
             if [ -n "$telegram_main_image" ] && [ -f "$telegram_main_image" ]; then
                 if ! send_telegram_with_timeout "$notifier_timeout" \
-                    env TELEGRAM_DUMP_FINAL_PATH="$final_message_file" TELEGRAM_SKIP_REWRITE=1 TELEGRAM_VALIDATE_REPORT=1 TELEGRAM_REQUIRE_SEND="$REQUIRE_TELEGRAM_REPORT_VALUE" ${notify_env[@]+"${notify_env[@]}"} \
+                    env TELEGRAM_DUMP_FINAL_PATH="$final_message_file" TELEGRAM_SKIP_REWRITE=1 TELEGRAM_VALIDATE_REPORT=1 TELEGRAM_REQUIRE_SEND="$REQUIRE_TELEGRAM_REPORT_VALUE" TELEGRAM_EXTRA_IMAGE_MAX="$TELEGRAM_EXTRA_IMAGE_MAX_VALUE" ${notify_env[@]+"${notify_env[@]}"} \
                     bash "$notifier" "$telegram_message" "$telegram_main_image" >/dev/null 2>&1; then
                     telegram_send_ok=0
                 fi
             else
                 if ! send_telegram_with_timeout "$notifier_timeout" \
-                    env TELEGRAM_DUMP_FINAL_PATH="$final_message_file" TELEGRAM_SKIP_REWRITE=1 TELEGRAM_VALIDATE_REPORT=1 TELEGRAM_REQUIRE_SEND="$REQUIRE_TELEGRAM_REPORT_VALUE" ${notify_env[@]+"${notify_env[@]}"} \
+                    env TELEGRAM_DUMP_FINAL_PATH="$final_message_file" TELEGRAM_SKIP_REWRITE=1 TELEGRAM_VALIDATE_REPORT=1 TELEGRAM_REQUIRE_SEND="$REQUIRE_TELEGRAM_REPORT_VALUE" TELEGRAM_EXTRA_IMAGE_MAX="$TELEGRAM_EXTRA_IMAGE_MAX_VALUE" ${notify_env[@]+"${notify_env[@]}"} \
                     bash "$notifier" "$telegram_message" >/dev/null 2>&1; then
                     telegram_send_ok=0
                 fi
@@ -2601,15 +2648,15 @@ if ! preflight_checks; then
 fi
 echo ""
 
-# Scenario 1: Calendar -> Safari -> Notes -> Mail
+# Scenario 1: Calendar -> TextEdit -> Mail
 if should_run_scenario 1; then
     echo "---------------------------------------------------"
-    echo "📅 Scenario 1: Calendar → Safari → Notes → Mail"
+    echo "📅 Scenario 1: Calendar → TextEdit → Mail"
     LOG_FILE="scenario_results/complex_scenario_1_${TIMESTAMP}.log"
-    SCENARIO_GOAL="Multi-app draft chain without screen-reading dependency."
+    SCENARIO_GOAL="Calendar/TextEdit/Mail draft chain."
     CURRENT_SCENARIO_MARKER="$MARKER_S1"
     echo "Goal: ${SCENARIO_GOAL}"
-    CMD="Calendar를 열고 전면으로 가져오세요. Notes를 열어 새 메모(Cmd+N)를 만들고 제목을 \"${SUBJECT_S1}\"로 입력한 뒤 아래 3줄을 그대로 입력하세요: \"Calendar opened\", \"Notes draft ready\", \"Mail prep pending\". 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. TextEdit를 열어 새 문서(Cmd+N)에 붙여넣기(Cmd+V)하고 다음 줄에 \"Shared via TextEdit\"를 입력하세요. 다음 줄에 \"${MARKER_S1}\"를 정확히 입력하세요. 다시 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S1}\"를 입력한 뒤 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
+    CMD="Calendar를 열고 전면으로 가져오세요. TextEdit를 열어 새 문서(Cmd+N)를 만들고 첫 줄에 \"${SUBJECT_S1}\"를 입력하세요. 다음 줄부터 아래 4줄을 그대로 입력하세요: \"Calendar opened\", \"Draft ready\", \"Mail prep pending\", \"Shared via TextEdit\". 다음 줄에 \"${MARKER_S1}\"를 정확히 입력하세요. 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. Mail을 열어 새 이메일(Cmd+N) 초안을 만들고 제목 \"${SUBJECT_S1}\"를 입력한 뒤 본문에 붙여넣기(Cmd+V)하세요. 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요."
 
     scenario_status="failed"
     if run_agent_scenario "$CMD" "$LOG_FILE" 1; then
@@ -2627,15 +2674,15 @@ else
     echo "⏭️  Scenario 1 skipped (STEER_SCENARIO_IDS=${SELECTED_SCENARIO_IDS})"
 fi
 
-# Scenario 2: Finder -> Notes -> TextEdit -> Mail
+# Scenario 2: Finder -> TextEdit -> Mail
 if should_run_scenario 2; then
     echo "---------------------------------------------------"
-    echo "📂 Scenario 2: Finder → Notes → TextEdit → Mail"
+    echo "📂 Scenario 2: Finder → TextEdit → Mail"
     LOG_FILE="scenario_results/complex_scenario_2_${TIMESTAMP}.log"
-    SCENARIO_GOAL="Finder/Notes/TextEdit/Mail transfer chain."
+    SCENARIO_GOAL="Finder/TextEdit/Mail transfer chain."
     CURRENT_SCENARIO_MARKER="$MARKER_S2"
     echo "Goal: ${SCENARIO_GOAL}"
-    CMD="아래 순서를 정확히 지키세요. 1) Finder를 열고 Downloads 폴더를 전면으로 가져오세요. 2) Notes를 열고 새 메모(Cmd+N)를 만든 뒤 제목을 \"${SUBJECT_S2}\"로 입력하세요. 3) 본문에 다음 4줄을 그대로 입력하세요: \"1. invoice.pdf\", \"2. screenshot.png\", \"3. notes.txt\", \"${MARKER_S2}\". 4) 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. 5) TextEdit를 열고 새 문서(Cmd+N)에 붙여넣기(Cmd+V)한 뒤 다음 줄에 \"Shared via Notes\"를 입력하세요. 6) 다시 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. 7) Mail을 열고 새 이메일(Cmd+N) 초안을 만든 뒤 제목 \"${SUBJECT_S2}\"를 입력하고 본문에 붙여넣기(Cmd+V)하세요. 8) 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요. 9) 전송이 끝나면 done으로 종료하세요."
+    CMD="아래 순서를 정확히 지키세요. 1) Finder를 열고 Downloads 폴더를 전면으로 가져오세요. 2) TextEdit를 열고 새 문서(Cmd+N)를 만든 뒤 본문에 다음 5줄을 그대로 입력하세요: \"1. invoice.pdf\", \"2. screenshot.png\", \"3. readme.txt\", \"Shared from Finder\", \"${MARKER_S2}\". 3) 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. 4) Mail을 열고 새 이메일(Cmd+N) 초안을 만든 뒤 제목 \"${SUBJECT_S2}\"를 입력하고 본문에 붙여넣기(Cmd+V)하세요. 5) 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요. 6) 전송이 끝나면 done으로 종료하세요."
 
     scenario_status="failed"
     if run_agent_scenario "$CMD" "$LOG_FILE" 2; then
@@ -2653,15 +2700,15 @@ else
     echo "⏭️  Scenario 2 skipped (STEER_SCENARIO_IDS=${SELECTED_SCENARIO_IDS})"
 fi
 
-# Scenario 3: Calculator -> Notes -> TextEdit -> Mail
+# Scenario 3: Calculator -> TextEdit -> Mail
 if should_run_scenario 3; then
     echo "---------------------------------------------------"
-    echo "📈 Scenario 3: Calculator → Notes → TextEdit → Mail"
+    echo "📈 Scenario 3: Calculator → TextEdit → Mail"
     LOG_FILE="scenario_results/complex_scenario_3_${TIMESTAMP}.log"
-    SCENARIO_GOAL="Calculation + document handoff + mail send chain."
+    SCENARIO_GOAL="Calculation + textedit handoff + mail send chain."
     CURRENT_SCENARIO_MARKER="$MARKER_S3"
     echo "Goal: ${SCENARIO_GOAL}"
-    CMD="아래 순서를 정확히 지키세요. 1) Calculator를 열고 \"120*1300=\" 를 입력해 계산 화면을 준비하세요. 2) Notes를 열고 새 메모(Cmd+N)를 만든 뒤 제목을 \"${SUBJECT_S3}\"로 입력하세요. 3) 본문에 다음 3줄을 그대로 입력하세요: \"120*1300=\", \"Done\", \"${MARKER_S3}\". 4) 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. 5) TextEdit를 열고 새 문서(Cmd+N)에 붙여넣기(Cmd+V)한 뒤 다음 줄에 \"Calc verified\"를 입력하세요. 6) 다시 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. 7) Mail을 열고 새 이메일(Cmd+N) 초안을 만든 뒤 제목 \"${SUBJECT_S3}\"를 입력하고 본문에 붙여넣기(Cmd+V)하세요. 8) 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요. 9) 전송이 끝나면 done으로 종료하세요."
+    CMD="아래 순서를 정확히 지키세요. 1) Calculator를 열고 \"120*1300=\" 를 입력해 계산 화면을 준비하세요. 2) TextEdit를 열고 새 문서(Cmd+N)를 만든 뒤 본문에 다음 4줄을 그대로 입력하세요: \"120*1300=\", \"Done\", \"Calc verified\", \"${MARKER_S3}\". 3) 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. 4) Mail을 열고 새 이메일(Cmd+N) 초안을 만든 뒤 제목 \"${SUBJECT_S3}\"를 입력하고 본문에 붙여넣기(Cmd+V)하세요. 5) 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요. 6) 전송이 끝나면 done으로 종료하세요."
 
     scenario_status="failed"
     if run_agent_scenario "$CMD" "$LOG_FILE" 3; then
@@ -2679,15 +2726,15 @@ else
     echo "⏭️  Scenario 3 skipped (STEER_SCENARIO_IDS=${SELECTED_SCENARIO_IDS})"
 fi
 
-# Scenario 4: Calendar -> Notes -> TextEdit -> Mail
+# Scenario 4: Calendar -> TextEdit -> Mail
 if should_run_scenario 4; then
     echo "---------------------------------------------------"
-    echo "🧠 Scenario 4: Calendar → Notes → TextEdit → Mail"
+    echo "🧠 Scenario 4: Calendar → TextEdit → Mail"
     LOG_FILE="scenario_results/complex_scenario_4_${TIMESTAMP}.log"
-    SCENARIO_GOAL="Idea note -> report -> mail send chain."
+    SCENARIO_GOAL="Idea draft -> report -> mail send chain."
     CURRENT_SCENARIO_MARKER="$MARKER_S4"
     echo "Goal: ${SCENARIO_GOAL}"
-    CMD="아래 순서를 정확히 지키세요. 1) Calendar를 열어 전면으로 가져오세요. 2) Notes를 열고 새 메모(Cmd+N)를 만든 뒤 제목을 \"${SUBJECT_S4}\"로 입력하세요. 3) 본문에 다음 4줄을 그대로 입력하세요: \"focus music\", \"pomodoro timer\", \"daily review template\", \"${MARKER_S4}\". 4) 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. 5) TextEdit를 열고 새 문서(Cmd+N)에 붙여넣기(Cmd+V)한 뒤 다음 줄에 \"Research shortlist ready\"를 입력하세요. 6) 다시 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. 7) Mail을 열고 새 이메일(Cmd+N) 초안을 만든 뒤 제목 \"${SUBJECT_S4}\"를 입력하고 본문에 붙여넣기(Cmd+V)하세요. 8) 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요. 9) 전송이 끝나면 done으로 종료하세요."
+    CMD="아래 순서를 정확히 지키세요. 1) Calendar를 열어 전면으로 가져오세요. 2) TextEdit를 열고 새 문서(Cmd+N)를 만든 뒤 본문에 다음 5줄을 그대로 입력하세요: \"focus music\", \"pomodoro timer\", \"daily review template\", \"Research shortlist ready\", \"${MARKER_S4}\". 3) 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. 4) Mail을 열고 새 이메일(Cmd+N) 초안을 만든 뒤 제목 \"${SUBJECT_S4}\"를 입력하고 본문에 붙여넣기(Cmd+V)하세요. 5) 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요. 6) 전송이 끝나면 done으로 종료하세요."
 
     scenario_status="failed"
     if run_agent_scenario "$CMD" "$LOG_FILE" 4; then
@@ -2705,15 +2752,15 @@ else
     echo "⏭️  Scenario 4 skipped (STEER_SCENARIO_IDS=${SELECTED_SCENARIO_IDS})"
 fi
 
-# Scenario 5: Finder -> Calculator -> Notes -> TextEdit -> Mail
+# Scenario 5: Finder -> Calculator -> TextEdit -> Mail
 if should_run_scenario 5; then
     echo "---------------------------------------------------"
-    echo "💱 Scenario 5: Finder → Calculator → Notes → TextEdit → Mail"
+    echo "💱 Scenario 5: Finder → Calculator → TextEdit → Mail"
     LOG_FILE="scenario_results/complex_scenario_5_${TIMESTAMP}.log"
-    SCENARIO_GOAL="Finder/Calculator/Notes/TextEdit/Mail budget draft chain."
+    SCENARIO_GOAL="Finder/Calculator/TextEdit/Mail budget draft chain."
     CURRENT_SCENARIO_MARKER="$MARKER_S5"
     echo "Goal: ${SCENARIO_GOAL}"
-    CMD="아래 순서를 정확히 지키세요. 1) Finder를 열고 Desktop을 전면으로 가져오세요. 2) Calculator를 열고 \"120*1450=\" 를 입력해 계산 화면을 준비하세요. 3) Notes를 열고 새 메모(Cmd+N)를 만든 뒤 제목을 \"${SUBJECT_S5}\"로 입력하세요. 4) 본문에 다음 3줄을 그대로 입력하세요: \"Base: 120 USD\", \"120*1450=\", \"${MARKER_S5}\". 5) 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. 6) TextEdit를 열고 새 문서(Cmd+N)에 붙여넣기(Cmd+V)한 뒤 다음 줄에 \"Budget draft ready\"를 입력하세요. 7) 다시 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. 8) Mail을 열고 새 이메일(Cmd+N) 초안을 만든 뒤 제목 \"${SUBJECT_S5}\"를 입력하고 본문에 붙여넣기(Cmd+V)하세요. 9) 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요. 10) 전송이 끝나면 done으로 종료하세요."
+    CMD="아래 순서를 정확히 지키세요. 1) Finder를 열고 Desktop을 전면으로 가져오세요. 2) Calculator를 열고 \"120*1450=\" 를 입력해 계산 화면을 준비하세요. 3) TextEdit를 열고 새 문서(Cmd+N)를 만든 뒤 본문에 다음 4줄을 그대로 입력하세요: \"Base: 120 USD\", \"120*1450=\", \"Budget draft ready\", \"${MARKER_S5}\". 4) 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. 5) Mail을 열고 새 이메일(Cmd+N) 초안을 만든 뒤 제목 \"${SUBJECT_S5}\"를 입력하고 본문에 붙여넣기(Cmd+V)하세요. 6) 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요. 7) 전송이 끝나면 done으로 종료하세요."
 
     scenario_status="failed"
     if run_agent_scenario "$CMD" "$LOG_FILE" 5; then

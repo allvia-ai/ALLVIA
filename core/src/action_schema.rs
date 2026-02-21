@@ -123,6 +123,10 @@ fn normalize_action_name(raw: &str) -> String {
         "get_clipboard" => "read_clipboard".to_string(),
         "copy_between_apps" => "transfer".to_string(),
         "mail_send" | "send_mail" | "email_send" | "send_email" => "mail_send".to_string(),
+        "telegram_send" | "send_telegram" | "telegram_notify" | "notify_telegram" => {
+            "telegram_send".to_string()
+        }
+        "notion_create" => "notion_write".to_string(),
         other => other.to_string(),
     }
 }
@@ -357,6 +361,41 @@ pub fn normalize_action(plan: &Value) -> ActionValidation {
         "paste" => {}
         "read_clipboard" => {}
         "mail_send" => {}
+        "telegram_send" => {
+            if let Some(message) = get_string_any(obj, &["message", "text", "content"]) {
+                obj.insert("message".to_string(), Value::String(message));
+            } else {
+                obj.insert(
+                    "message".to_string(),
+                    Value::String("요청 작업이 완료되었습니다.".to_string()),
+                );
+            }
+            if let Some(chat_id) = get_string_any(obj, &["chat_id", "chatId", "target"]) {
+                obj.insert("chat_id".to_string(), Value::String(chat_id));
+            }
+        }
+        "notion_write" => {
+            let title = get_string_any(obj, &["title"]).unwrap_or_else(|| "Steer Note".to_string());
+            obj.insert("title".to_string(), Value::String(title));
+            if let Some(content) = get_string_any(obj, &["content", "text", "body", "message"]) {
+                obj.insert("content".to_string(), Value::String(content));
+            } else {
+                error = Some("notion_write requires 'content'".to_string());
+            }
+        }
+        "n8n_create_workflow" => {
+            if let Some(name) = get_string_any(obj, &["name", "title"]) {
+                obj.insert("name".to_string(), Value::String(name));
+            } else {
+                obj.insert(
+                    "name".to_string(),
+                    Value::String("Steer Workflow".to_string()),
+                );
+            }
+            if let Some(marker) = get_string_any(obj, &["marker", "text", "scope"]) {
+                obj.insert("marker".to_string(), Value::String(marker));
+            }
+        }
         "transfer" => {
             let from = get_string_any(obj, &["from"]);
             let to = get_string_any(obj, &["to"]);
@@ -491,5 +530,29 @@ mod tests {
         let plan = json!({"action": "unknown"});
         let result = normalize_action(&plan);
         assert!(result.error.is_some());
+    }
+
+    #[test]
+    fn normalize_telegram_send_alias() {
+        let plan = json!({"action": "send_telegram", "text": "hello"});
+        let result = normalize_action(&plan);
+        assert!(result.error.is_none());
+        assert_eq!(
+            result.normalized["action"].as_str().unwrap(),
+            "telegram_send"
+        );
+        assert_eq!(result.normalized["message"].as_str().unwrap(), "hello");
+    }
+
+    #[test]
+    fn normalize_notion_create_alias() {
+        let plan = json!({"action": "notion_create", "title": "t", "text": "body"});
+        let result = normalize_action(&plan);
+        assert!(result.error.is_none());
+        assert_eq!(
+            result.normalized["action"].as_str().unwrap(),
+            "notion_write"
+        );
+        assert_eq!(result.normalized["content"].as_str().unwrap(), "body");
     }
 }

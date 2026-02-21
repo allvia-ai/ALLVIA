@@ -282,6 +282,15 @@ export const AgentApproveResponseSchema = z.object({
     policy: z.string(),
 });
 
+export const AgentGoalRunResponseSchema = z.object({
+    run_id: z.string(),
+    planner_complete: z.boolean(),
+    execution_complete: z.boolean(),
+    business_complete: z.boolean(),
+    status: z.string(),
+    summary: z.string().nullable().optional(),
+});
+
 export const ApprovalPolicySchema = z.object({
     policy_key: z.string(),
     decision: z.string(),
@@ -449,6 +458,7 @@ export type ExecutionProfile = z.infer<typeof ExecutionProfileSchema>;
 export type AgentExecuteResponse = z.infer<typeof AgentExecuteResponseSchema>;
 export type AgentVerifyResponse = z.infer<typeof AgentVerifyResponseSchema>;
 export type AgentApproveResponse = z.infer<typeof AgentApproveResponseSchema>;
+export type AgentGoalRunResponse = z.infer<typeof AgentGoalRunResponseSchema>;
 export type ApprovalPolicy = z.infer<typeof ApprovalPolicySchema>;
 export type NLRunMetrics = z.infer<typeof NLRunMetricsSchema>;
 export type NLRun = z.infer<typeof NLRunSchema>;

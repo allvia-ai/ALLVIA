@@ -101,13 +101,51 @@ impl NotionClient {
         title: &str,
         content: &str,
     ) -> Result<String> {
-        let children = vec![json!({
-            "object": "block",
-            "type": "paragraph",
-            "paragraph": {
-                "rich_text": [{ "type": "text", "text": { "content": content } }]
+        // Notion rich_text content is limited to 2000 chars per text object.
+        // Split by lines first, then by char window to stay below the limit.
+        let mut chunks: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let max_len = 1800usize;
+        for line in content.lines() {
+            let candidate = if current.is_empty() {
+                line.to_string()
+            } else {
+                format!("{}\n{}", current, line)
+            };
+            if candidate.chars().count() <= max_len {
+                current = candidate;
+            } else {
+                if !current.trim().is_empty() {
+                    chunks.push(current.clone());
+                }
+                let mut remaining = line.to_string();
+                while remaining.chars().count() > max_len {
+                    let part: String = remaining.chars().take(max_len).collect();
+                    chunks.push(part);
+                    remaining = remaining.chars().skip(max_len).collect();
+                }
+                current = remaining;
             }
-        })];
+        }
+        if !current.trim().is_empty() {
+            chunks.push(current);
+        }
+        if chunks.is_empty() {
+            chunks.push(content.to_string());
+        }
+
+        let children: Vec<Value> = chunks
+            .into_iter()
+            .map(|chunk| {
+                json!({
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": [{ "type": "text", "text": { "content": chunk } }]
+                    }
+                })
+            })
+            .collect();
         self.create_database_page_with_children(database_id, title, &children)
             .await
     }

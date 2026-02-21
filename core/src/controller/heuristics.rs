@@ -1,5 +1,4 @@
 use crate::applescript;
-use crate::visual_driver::VisualDriver;
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 
@@ -37,14 +36,44 @@ pub fn preflight_permissions() -> Result<()> {
 }
 
 pub fn verify_screen_capture() -> Result<()> {
-    // Preflight: verify Screen Recording can capture the screen
-    if let Err(e) = VisualDriver::capture_screen() {
-        println!("❌ Preflight failed: Screen capture unavailable (check Screen Recording permission). Error: {}", e);
+    // 1. First, rely on the native macOS permission check via PermissionManager
+    let has_permission = crate::permission_manager::PermissionManager::check_screen_recording();
+
+    if !has_permission {
         return Err(anyhow::anyhow!(
-            "Screen capture unavailable (permission missing): {}",
-            e
+            "Screen capture unavailable (Native permission missing). {}",
+            permission_help()
         ));
     }
+
+    // 2. We can optionally do a quick probe if we want to ensure the binary is able to write,
+    // but the native check passing is the real source of truth for "vision permission".
+    let shot_path = format!(
+        "/tmp/steer_preflight_capture_{}_{}.png",
+        std::process::id(),
+        chrono::Utc::now().timestamp_millis()
+    );
+
+    let _status = std::process::Command::new("screencapture")
+        .args(["-x", shot_path.as_str()])
+        .status();
+
+    // Clean up if it worked
+    let exists = std::fs::metadata(&shot_path)
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false);
+    if exists {
+        let _ = std::fs::remove_file(&shot_path);
+    }
+    let _ = std::fs::remove_file(&shot_path);
+
+    if !exists {
+        return Err(anyhow::anyhow!(
+            "Screen capture probe produced no file. {}",
+            permission_help()
+        ));
+    }
+
     Ok(())
 }
 

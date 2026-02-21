@@ -9,7 +9,6 @@ use std::env;
 
 use async_trait::async_trait;
 use std::time::Duration;
-use tokio::time::sleep;
 
 // =====================================================
 // Phase 30: Intelligence Upgrade (Supervisor + Thinking)
@@ -154,11 +153,26 @@ impl OpenAILLMClient {
             .connect_timeout(Duration::from_secs(10)) // [Fix] Connection timeout
             .build()?;
 
+        let default_model = env::var("STEER_OPENAI_MODEL")
+            .or_else(|_| env::var("OPENAI_MODEL"))
+            .ok()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| "gpt-4o-mini".to_string());
+
         Ok(Self {
             client,
             api_key,
-            model: "gpt-4o".to_string(),
+            model: default_model,
         })
+    }
+
+    fn vision_model(&self) -> String {
+        env::var("STEER_VISION_MODEL")
+            .ok()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| self.model.clone())
     }
 
     fn history_contains_case_insensitive(history: &[String], needle: &str) -> bool {
@@ -373,40 +387,88 @@ impl OpenAILLMClient {
     }
 
     /// Internal helper for robust API calls (Retry Logic)
+    /// Internal helper for robust API calls (Retry Logic)
+    /// Returns parsed JSON Value on success.
+    /// Returns specific errors for Rate Limit (Quota vs Burst) or HTTP errors.
     pub async fn post_with_retry(
         &self,
         url: &str,
         body: &serde_json::Value,
-    ) -> Result<reqwest::Response, anyhow::Error> {
-        let max_retries = 3;
+    ) -> Result<serde_json::Value, anyhow::Error> {
+        let max_retries = std::env::var("STEER_OPENAI_MAX_RETRIES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v >= 1 && *v <= 10)
+            .unwrap_or(1); // Default reduced to 1 for faster fallback
+        let retry_429_sec = std::env::var("STEER_OPENAI_429_RETRY_SEC")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v >= 1 && *v <= 120)
+            .unwrap_or(2); // Default reduced to 2s
         let mut attempt = 0;
-        let mut backoff = Duration::from_secs(1);
+        let mut backoff = tokio::time::Duration::from_secs(1);
 
         loop {
             attempt += 1;
-            match self
+            let mut wait_override: Option<tokio::time::Duration> = None;
+
+            let req = self
                 .client
                 .post(url)
                 .header("Authorization", format!("Bearer {}", self.api_key))
-                .json(body)
-                .send()
-                .await
-            {
+                .json(body);
+
+            match req.send().await {
                 Ok(resp) => {
-                    if resp.status().is_server_error()
-                        || resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
-                    {
-                        // Retry on 5xx or 429
-                        if attempt > max_retries {
-                            return Ok(resp); // Return the error response after max retries
+                    let status = resp.status();
+                    if status.is_success() {
+                        return Ok(resp.json().await?);
+                    }
+
+                    // Clone headers before consuming body
+                    let headers = resp.headers().clone();
+                    // Read error body
+                    let error_text = resp.text().await.unwrap_or_default();
+
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        // Check for hard quota vs soft rate limit
+                        if error_text.to_lowercase().contains("quota")
+                            || error_text.to_lowercase().contains("billing")
+                            || error_text.contains("access_terminated")
+                        {
+                            return Err(anyhow::anyhow!("RATE_LIMITED_QUOTA: {}", error_text));
                         }
+
+                        if attempt > max_retries {
+                            return Err(anyhow::anyhow!(
+                                "RATE_LIMITED_EXHAUSTED: OpenAI 429 after {} retries. Error: {}",
+                                max_retries,
+                                error_text
+                            ));
+                        }
+
+                        let retry_after_header = headers
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.trim().parse::<u64>().ok())
+                            .filter(|v| *v >= 1 && *v <= 300);
+                        let retry_after = retry_after_header.unwrap_or(retry_429_sec);
+                        wait_override = Some(tokio::time::Duration::from_secs(retry_after));
+                        eprintln!(
+                            "⚠️ LLM rate limited (429). Body: '{}'. Retrying in {}s (attempt {}/{})...",
+                            error_text.replace('\n', " "), retry_after, attempt, max_retries
+                        );
+                    } else if status.is_server_error() {
+                        if attempt > max_retries {
+                            return Err(anyhow::anyhow!("HTTP {}: {}", status, error_text));
+                        }
+                        // retry 5xx
                     } else {
-                        // Success or client error (4xx) - don't retry 4xx (except 429)
-                        return Ok(resp);
+                        // 4xx (Client Error) - Fail immediately
+                        return Err(anyhow::anyhow!("HTTP {}: {}", status, error_text));
                     }
                 }
                 Err(e) => {
-                    // Network error
                     if attempt > max_retries {
                         return Err(anyhow::anyhow!("Max retries exceeded: {}", e));
                     }
@@ -417,8 +479,9 @@ impl OpenAILLMClient {
                 }
             }
 
-            sleep(backoff).await;
-            backoff *= 2; // Exponential backoff (1s, 2s, 4s)
+            let sleep_for = wait_override.unwrap_or(backoff);
+            tokio::time::sleep(sleep_for).await;
+            backoff = std::cmp::max(backoff * 2, sleep_for);
         }
     }
 
@@ -578,16 +641,56 @@ Output internal monologue in <think>...</think> followed by ONLY valid JSON.
             "temperature": 0.0
         });
 
-        let response = self
+        let body = match self
             .post_with_retry("https://api.openai.com/v1/chat/completions", &request_body)
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) if e.to_string().contains("RATE_LIMITED") => {
+                eprintln!("⚠️ [plan_next_step] OpenAI rate limited (quota/exhausted), invoking fallback chain...");
+                let messages = vec![
+                    json!({"role": "system", "content": system_prompt}),
+                    json!({"role": "user", "content": user_msg}),
+                ];
+                let fallback_result = crate::cli_llm::fallback_chat_completion(&messages).await?;
+                let action_json = match recover_json(&fallback_result) {
+                    Some(v) => v,
+                    None => {
+                        let fallback_action = self.fallback_vision_action(goal, action_history);
+                        eprintln!(
+                            "⚠️ [plan_next_step] Failed to parse fallback JSON; using deterministic fallback: {}",
+                            fallback_action
+                        );
+                        fallback_action
+                    }
+                };
+                return Ok(action_json);
+            }
+            Err(e) => {
+                eprintln!(
+                    "⚠️ [plan_next_step] OpenAI error: {}. Invoking fallback chain...",
+                    e
+                );
+                let messages = vec![
+                    json!({"role": "system", "content": system_prompt}),
+                    json!({"role": "user", "content": user_msg}),
+                ];
+                let fallback_result = crate::cli_llm::fallback_chat_completion(&messages).await?;
+                let action_json = match recover_json(&fallback_result) {
+                    Some(v) => v,
+                    None => {
+                        let fallback_action = self.fallback_vision_action(goal, action_history);
+                        eprintln!(
+                            "⚠️ [plan_next_step] Failed to parse fallback JSON; using deterministic fallback: {}",
+                            fallback_action
+                        );
+                        fallback_action
+                    }
+                };
+                return Ok(action_json);
+            }
+        };
 
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            return Err(anyhow::anyhow!("OpenAI API Error: {}", error_text));
-        }
-
-        let body: Value = response.json().await?;
         let content_opt = body["choices"][0]["message"]["content"].as_str();
 
         let content_str = match content_opt {
@@ -616,22 +719,27 @@ Output internal monologue in <think>...</think> followed by ONLY valid JSON.
     }
 
     /// Generic Chat Completion (for Architect/Chat features)
+    /// Falls back to CLI LLM chain (Gemini→Codex→llama-server) on 429.
     async fn chat_completion(&self, messages: Vec<Value>) -> Result<String> {
         let body = json!({
             "model": self.model,
             "messages": messages
         });
 
-        let res = self
+        let res_json = match self
             .post_with_retry("https://api.openai.com/v1/chat/completions", &body)
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "⚠️ [chat_completion] OpenAI error/rate-limit: {}. Invoking fallback chain...",
+                    e
+                );
+                return crate::cli_llm::fallback_chat_completion(&messages).await;
+            }
+        };
 
-        if !res.status().is_success() {
-            let error_text = res.text().await?;
-            return Err(anyhow::anyhow!("Chat Completion API Error: {}", error_text));
-        }
-
-        let res_json: serde_json::Value = res.json().await?;
         let content = res_json["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or("")
@@ -883,10 +991,8 @@ Respond with ONE JSON object only.
                 let primary_failed =
                     match cli_client.execute_with_vision(&final_image_b64, &cli_prompt) {
                         Ok(response) => {
-                            log::info!(
-                                "[CLI LLM] Response: {}",
-                                &response[..response.len().min(200)]
-                            );
+                            let preview = response.chars().take(200).collect::<String>();
+                            log::info!("[CLI LLM] Response: {}", preview);
                             if let Some(action) = parse_cli_action(&response) {
                                 return Ok(action);
                             }
@@ -915,10 +1021,8 @@ Respond with ONE JSON object only.
 
                     match codex_client.execute_with_vision(&final_image_b64, &cli_prompt) {
                         Ok(response) => {
-                            log::info!(
-                                "[CLI LLM:codex failover] Response: {}",
-                                &response[..response.len().min(200)]
-                            );
+                            let preview = response.chars().take(200).collect::<String>();
+                            log::info!("[CLI LLM:codex failover] Response: {}", preview);
                             if let Some(action) = parse_cli_action(&response) {
                                 println!("✅ [Vision] Codex CLI failover succeeded.");
                                 return Ok(action);
@@ -938,12 +1042,105 @@ Respond with ONE JSON object only.
             } // End else
         } // End if let Some
 
-        let system_prompt = crate::prompts::VISION_PLANNING_PROMPT
-            .replace("{goal}", goal)
-            .replace("{mcp_tools}", &mcp_tools_doc);
+        let mut openai_image_b64 = image_b64.to_string();
+        let openai_max_b64 = std::env::var("STEER_OPENAI_VISION_MAX_B64")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|v| *v >= 4_000)
+            .unwrap_or(8_000);
+
+        if openai_image_b64.len() > openai_max_b64 {
+            println!(
+                "⚠️ [Vision] OpenAI payload large ({} bytes). Attempting to downscale...",
+                openai_image_b64.len()
+            );
+            use base64::{engine::general_purpose, Engine as _};
+            use std::io::Cursor;
+
+            if let Ok(data) = general_purpose::STANDARD.decode(&openai_image_b64) {
+                if let Ok(img) = image::load_from_memory(&data) {
+                    let profiles: &[(u32, u32, u8)] = &[
+                        (1024, 768, 60),
+                        (800, 600, 50),
+                        (640, 480, 42),
+                        (512, 384, 36),
+                        (384, 288, 30),
+                        (320, 240, 28),
+                        (256, 192, 24),
+                        (224, 168, 22),
+                        (192, 144, 20),
+                        (160, 120, 18),
+                        (128, 96, 16),
+                    ];
+                    for (w, h, q) in profiles {
+                        let resized = img.resize(*w, *h, image::imageops::FilterType::Triangle);
+                        let mut buffer = Cursor::new(Vec::new());
+                        if resized
+                            .write_to(&mut buffer, image::ImageOutputFormat::Jpeg(*q))
+                            .is_ok()
+                        {
+                            let candidate_b64 = general_purpose::STANDARD.encode(buffer.get_ref());
+                            if candidate_b64.len() < openai_image_b64.len() {
+                                println!(
+                                    "      📉 OpenAI downscaled: {} -> {} bytes ({}x{}, q={})",
+                                    openai_image_b64.len(),
+                                    candidate_b64.len(),
+                                    w,
+                                    h,
+                                    q
+                                );
+                                openai_image_b64 = candidate_b64;
+                            }
+                            if openai_image_b64.len() <= openai_max_b64 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let minimal_prompt = std::env::var("STEER_VISION_PROMPT_MINIMAL")
+            .ok()
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+        let system_prompt = if minimal_prompt {
+            format!(
+                "You are a desktop automation agent.\n\
+                 Goal: \"{}\"\n\
+                 Decide ONLY the next single action from this set: \
+                 click_visual, click_ref, type, shortcut, read, scroll, open_app, open_url, \
+                 select_all, copy, paste, read_clipboard, done.\n\
+                 IMPORTANT: open_app must include a non-empty name field.\n\
+                 Example: {{\"action\":\"open_app\",\"name\":\"Calendar\"}}\n\
+                 Return JSON object only with keys: thought, action.\n\
+                 If goal is fully satisfied, return done.",
+                goal
+            )
+        } else {
+            crate::prompts::VISION_PLANNING_PROMPT
+                .replace("{goal}", goal)
+                .replace("{mcp_tools}", &mcp_tools_doc)
+        };
 
         let history_str = if history.is_empty() {
             "None".to_string()
+        } else if minimal_prompt {
+            history
+                .iter()
+                .rev()
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n- ")
         } else {
             history.join("\n- ")
         };
@@ -957,11 +1154,12 @@ Respond with ONE JSON object only.
         let vision_max_tokens = std::env::var("STEER_VISION_MAX_TOKENS")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .filter(|v| *v >= 80 && *v <= 800)
-            .unwrap_or(180);
+            .filter(|v| *v >= 32 && *v <= 800)
+            .unwrap_or(64);
 
+        let vision_model = self.vision_model();
         let body = json!({
-            "model": "gpt-4o",
+            "model": vision_model,
             "messages": [
                 { "role": "system", "content": system_prompt },
                 {
@@ -971,7 +1169,7 @@ Respond with ONE JSON object only.
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": format!("data:image/jpeg;base64,{}", image_b64),
+                                "url": format!("data:image/jpeg;base64,{}", openai_image_b64),
                                 "detail": vision_detail
                             }
                         }
@@ -982,16 +1180,33 @@ Respond with ONE JSON object only.
             "response_format": { "type": "json_object" }
         });
 
-        let res = self
+        let res_json = match self
             .post_with_retry("https://api.openai.com/v1/chat/completions", &body)
-            .await?;
-
-        if !res.status().is_success() {
-            let error_text = res.text().await?;
-            return Err(anyhow::anyhow!("Vision Planning API Error: {}", error_text));
-        }
-
-        let res_json: serde_json::Value = res.json().await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("⚠️ [plan_vision_step] OpenAI error/rate-limited: {}. Invoking fallback chain (text-only)...", e);
+                let text_messages = vec![
+                    json!({"role": "system", "content": system_prompt}),
+                    json!({"role": "user", "content": user_msg}),
+                ];
+                let fallback_result =
+                    crate::cli_llm::fallback_chat_completion(&text_messages).await?;
+                let action_json = match recover_json(&fallback_result) {
+                    Some(v) => v,
+                    None => {
+                        let fallback_action = self.fallback_vision_action(goal, history);
+                        eprintln!(
+                            "⚠️ [plan_vision_step] Failed to parse fallback JSON; using deterministic fallback: {}",
+                            fallback_action
+                        );
+                        fallback_action
+                    }
+                };
+                return Ok(action_json);
+            }
+        };
 
         // Handle Refusal (Safety Filter) - Try CLI LLM Fallback
         if let Some(refusal) = res_json["choices"][0]["message"]["refusal"].as_str() {
@@ -1100,11 +1315,9 @@ Respond with ONE JSON object only.
             ]
         });
 
-        let res = self
+        let res_json = self
             .post_with_retry("https://api.openai.com/v1/chat/completions", &body)
             .await?;
-
-        let res_json: serde_json::Value = res.json().await?;
         let content = res_json["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or("No analysis generated.")
@@ -1154,11 +1367,9 @@ Respond with ONE JSON object only.
             ]
         });
 
-        let res = self
+        let res_json = self
             .post_with_retry("https://api.openai.com/v1/chat/completions", &body)
             .await?;
-
-        let res_json: serde_json::Value = res.json().await?;
         let content = res_json["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or("No recommendation generated.")
@@ -1219,15 +1430,29 @@ You are an expert n8n Workflow Architect. Generate VALID, EXECUTABLE n8n workflo
             ]
         });
 
-        let res = self
+        let content = match self
             .post_with_retry("https://api.openai.com/v1/chat/completions", &body)
-            .await?;
-
-        let res_json: serde_json::Value = res.json().await?;
-        let content = res_json["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("{}")
-            .to_string();
+            .await
+        {
+            Ok(res_json) => res_json["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("{}")
+                .to_string(),
+            Err(e) => {
+                eprintln!(
+                    "⚠️ [build_n8n_workflow] OpenAI error: {}. Invoking fallback...",
+                    e
+                );
+                let messages = vec![
+                    json!({"role": "system", "content": system_prompt}),
+                    json!({"role": "user", "content": user_prompt}),
+                ];
+                let fallback_res = crate::cli_llm::fallback_chat_completion(&messages).await?;
+                let parsed: Value = recover_json(&fallback_res)
+                    .ok_or_else(|| anyhow::anyhow!("Failed to parse JSON from fallback"))?;
+                parsed.to_string()
+            }
+        };
 
         // Clean up markdown if model disobeys
         let clean_json = content
@@ -1276,11 +1501,9 @@ Now output the CORRECTED JSON.
             ]
         });
 
-        let res = self
+        let res_json = self
             .post_with_retry("https://api.openai.com/v1/chat/completions", &body)
             .await?;
-
-        let res_json: serde_json::Value = res.json().await?;
         let content = res_json["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or("{}")
@@ -1300,8 +1523,9 @@ Now output the CORRECTED JSON.
         prompt: &str,
         image_b64: &str,
     ) -> Result<String, Box<dyn std::error::Error>> {
+        let vision_model = self.vision_model();
         let body = json!({
-            "model": "gpt-4o",
+            "model": vision_model,
             "messages": [
                 {
                     "role": "user",
@@ -1319,11 +1543,9 @@ Now output the CORRECTED JSON.
             "max_tokens": 500
         });
 
-        let res = self
+        let res_json = self
             .post_with_retry("https://api.openai.com/v1/chat/completions", &body)
             .await?;
-
-        let res_json: serde_json::Value = res.json().await?;
 
         if let Some(err) = res_json.get("error") {
             return Err(anyhow::anyhow!("OpenAI API Error: {:?}", err).into());
@@ -1362,8 +1584,9 @@ Now output the CORRECTED JSON.
 
         let user_msg = format!("Find this element: {}", element_description);
 
+        let vision_model = self.vision_model();
         let body = json!({
-            "model": "gpt-4o",
+            "model": vision_model,
             "messages": [
                 { "role": "system", "content": system_prompt },
                 {
@@ -1383,16 +1606,9 @@ Now output the CORRECTED JSON.
             "response_format": { "type": "json_object" }
         });
 
-        let res = self
+        let res_json = self
             .post_with_retry("https://api.openai.com/v1/chat/completions", &body)
             .await?;
-
-        if !res.status().is_success() {
-            let error_text = res.text().await?;
-            return Err(anyhow::anyhow!("Vision API Error: {}", error_text));
-        }
-
-        let res_json: serde_json::Value = res.json().await?;
         let content = res_json["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or("{}");
@@ -1414,7 +1630,7 @@ Now output the CORRECTED JSON.
         payload: &serde_json::Value,
     ) -> Result<String> {
         let body = json!({
-            "model": "gpt-4o",
+            "model": self.model,
             "messages": [
                 { "role": "system", "content": system_prompt },
                 { "role": "user", "content": payload.to_string() }
@@ -1423,16 +1639,9 @@ Now output the CORRECTED JSON.
             "response_format": { "type": "json_object" }
         });
 
-        let response = self
+        let body = self
             .post_with_retry("https://api.openai.com/v1/chat/completions", &body)
             .await?;
-
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            return Err(anyhow::anyhow!("Quality scoring API Error: {}", error_text));
-        }
-
-        let body: Value = response.json().await?;
         let content = body["choices"][0]["message"]["content"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("No content in quality scoring response"))?;
@@ -1496,16 +1705,32 @@ Your goal is to detect Repetitive Manual Work (Toil) from user logs and propose 
             "response_format": { "type": "json_object" }
         });
 
-        let res = self
+        let res_json = match self
             .post_with_retry("https://api.openai.com/v1/chat/completions", &body)
-            .await?;
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "⚠️ [propose_workflow] OpenAI error: {}. Invoking fallback...",
+                    e
+                );
+                let messages = vec![
+                    json!({"role": "system", "content": system_prompt}),
+                    json!({"role": "user", "content": prompt}),
+                ];
+                let fallback_res = crate::cli_llm::fallback_chat_completion(&messages).await?;
+                let parsed: Value = recover_json(&fallback_res)
+                    .ok_or_else(|| anyhow::anyhow!("Failed to parse JSON from fallback"))?;
 
-        if !res.status().is_success() {
-            let error_text = res.text().await?;
-            return Err(anyhow::anyhow!("Proposal API Error: {}", error_text).into());
-        }
-
-        let res_json: serde_json::Value = res.json().await?;
+                // Wrap in fake response to match structure expected below
+                json!({
+                    "choices": [{
+                        "message": { "content": serde_json::to_string(&parsed).unwrap() }
+                    }]
+                })
+            }
+        };
         let content = res_json["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or("{}");
@@ -1535,7 +1760,7 @@ Output format: Just the intent description in 1-2 sentences.
         let user_msg = format!("LOGS:\n{}", log_text);
 
         let request_body = json!({
-            "model": "gpt-4o", // Strong model for reasoning
+            "model": self.model,
             "messages": [
                 { "role": "system", "content": system_prompt },
                 { "role": "user", "content": user_msg }
@@ -1543,16 +1768,24 @@ Output format: Just the intent description in 1-2 sentences.
             "temperature": 0.3
         });
 
-        let response = self
+        let body: Value = match self
             .post_with_retry("https://api.openai.com/v1/chat/completions", &request_body)
-            .await?;
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "⚠️ [analyze_tendency] OpenAI error: {}. Invoking fallback...",
+                    e
+                );
+                let messages = vec![
+                    json!({"role": "system", "content": system_prompt}),
+                    json!({"role": "user", "content": user_msg}),
+                ];
+                return crate::cli_llm::fallback_chat_completion(&messages).await;
+            }
+        };
 
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            return Err(anyhow::anyhow!("Analysis API Error: {}", error_text));
-        }
-
-        let body: Value = response.json().await?;
         let content = body["choices"][0]["message"]["content"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("No content"))?;
@@ -1618,22 +1851,31 @@ Return JSON only:
         messages.push(json!({ "role": "user", "content": user_input }));
 
         let request_body = json!({
-            "model": "gpt-4o-mini",
+            "model": self.model,
             "messages": messages,
             "temperature": 0.1,
             "response_format": { "type": "json_object" }
         });
 
-        let response = self
+        // Parse intent fallback
+        let body: Value = match self
             .post_with_retry("https://api.openai.com/v1/chat/completions", &request_body)
-            .await?;
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "⚠️ [parse_intent] OpenAI error: {}. Invoking fallback...",
+                    e
+                );
+                // Fallback
+                let fallback_res = crate::cli_llm::fallback_chat_completion(&messages).await?;
+                let parsed = recover_json(&fallback_res)
+                    .ok_or_else(|| anyhow::anyhow!("Failed to parse JSON from fallback"))?;
+                return Ok(parsed);
+            }
+        };
 
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            return Err(anyhow::anyhow!("Intent Parse API Error: {}", error_text));
-        }
-
-        let body: Value = response.json().await?;
         let content = body["choices"][0]["message"]["content"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("No content"))?;
@@ -1650,16 +1892,10 @@ Return JSON only:
             //"dimensions": 1536 // Default
         });
 
-        let response = self
+        let body: Value = self
             .post_with_retry("https://api.openai.com/v1/embeddings", &request_body)
             .await?;
 
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            return Err(anyhow::anyhow!("Embedding API Error: {}", error_text));
-        }
-
-        let body: Value = response.json().await?;
         let vector = body["data"][0]["embedding"]
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("Invalid embedding response"))?
@@ -1708,7 +1944,7 @@ Guidelines:
         );
 
         let request_body = json!({
-            "model": "gpt-4o-mini",
+            "model": self.model,
             "messages": [
                 { "role": "system", "content": system_prompt },
                 { "role": "user", "content": user_msg }
@@ -1717,19 +1953,34 @@ Guidelines:
             "response_format": { "type": "json_object" }
         });
 
-        let response = self
+        let body: Value = match self
             .post_with_retry("https://api.openai.com/v1/chat/completions", &request_body)
-            .await?;
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "⚠️ [generate_recommendation] OpenAI error: {}. Invoking fallback...",
+                    e
+                );
+                let messages = vec![
+                    json!({"role": "system", "content": system_prompt}),
+                    json!({"role": "user", "content": user_msg}),
+                ];
+                let fallback_res = crate::cli_llm::fallback_chat_completion(&messages).await?;
+                let parsed: Value = recover_json(&fallback_res)
+                    .ok_or_else(|| anyhow::anyhow!("Failed to recover JSON from fallback"))?;
 
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            return Err(anyhow::anyhow!(
-                "Recommendation generation error: {}",
-                error_text
-            ));
-        }
+                json!({
+                    "choices": [{
+                        "message": {
+                            "content": serde_json::to_string(&parsed).unwrap()
+                        }
+                    }]
+                })
+            }
+        };
 
-        let body: Value = response.json().await?;
         let content = body["choices"][0]["message"]["content"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("No content"))?;
@@ -1775,7 +2026,7 @@ Guidelines:
         );
 
         let body = json!({
-            "model": "gpt-4o",
+            "model": self.model,
             "messages": [
                 { "role": "system", "content": "You are a Solution Architect. Propose the best stack for the user's goal." },
                 { "role": "user", "content": prompt }
@@ -1783,11 +2034,10 @@ Guidelines:
             "response_format": { "type": "json_object" }
         });
 
-        let res = self
+        let res_json = self
             .post_with_retry("https://api.openai.com/v1/chat/completions", &body)
             .await?;
 
-        let res_json: serde_json::Value = res.json().await?;
         let content = res_json["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or("{}");
@@ -1850,7 +2100,7 @@ Guidelines:
             || lower.contains("code")
             || lower.contains("debug")
         {
-            return (false, "gpt-4o".to_string());
+            return (false, self.model.clone());
         }
 
         // Default to Local for simple chat/summarization to save cost
@@ -1878,7 +2128,7 @@ Guidelines:
         let user_msg = format!("History: {}\nUser feedback: {}", history_summary, feedback);
 
         let request_body = json!({
-            "model": "gpt-4o-mini",
+            "model": self.model,
             "messages": [
                 { "role": "system", "content": system_prompt },
                 { "role": "user", "content": user_msg }

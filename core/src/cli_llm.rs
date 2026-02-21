@@ -46,6 +46,15 @@ pub struct CLILLMClient {
 }
 
 impl CLILLMClient {
+    fn codex_model() -> String {
+        std::env::var("STEER_CLI_CODEX_MODEL")
+            .or_else(|_| std::env::var("STEER_CODEX_MODEL"))
+            .ok()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| "gpt-5.3-codex-spark".to_string())
+    }
+
     pub fn new(provider: LLMProvider) -> Self {
         let timeout = std::env::var("STEER_CLI_TIMEOUT")
             .ok()
@@ -121,8 +130,11 @@ impl CLILLMClient {
         // Configure arguments based on provider
         let use_stdin = match self.provider {
             LLMProvider::Codex => {
+                let model = Self::codex_model();
                 cmd.args(&[
                     "exec",
+                    "-m",
+                    &model,
                     "--sandbox",
                     "danger-full-access",
                     "--skip-git-repo-check",
@@ -271,18 +283,23 @@ impl CLILLMClient {
     #[allow(dead_code)]
     fn build_command(&self) -> (String, Vec<String>) {
         match self.provider {
-            LLMProvider::Codex => (
-                "codex".to_string(),
-                vec![
-                    "exec".to_string(),
-                    "--sandbox".to_string(),
-                    "danger-full-access".to_string(),
-                    "--skip-git-repo-check".to_string(),
-                    "--color".to_string(),
-                    "never".to_string(),
-                    "-".to_string(),
-                ],
-            ),
+            LLMProvider::Codex => {
+                let model = Self::codex_model();
+                (
+                    "codex".to_string(),
+                    vec![
+                        "exec".to_string(),
+                        "-m".to_string(),
+                        model,
+                        "--sandbox".to_string(),
+                        "danger-full-access".to_string(),
+                        "--skip-git-repo-check".to_string(),
+                        "--color".to_string(),
+                        "never".to_string(),
+                        "-".to_string(),
+                    ],
+                )
+            }
             LLMProvider::Gemini => ("gemini".to_string(), vec!["-s".to_string()]),
             LLMProvider::Claude => (
                 "claude".to_string(),
@@ -294,6 +311,176 @@ impl CLILLMClient {
             ),
         }
     }
+}
+
+impl CLILLMClient {
+    /// Execute prompt and return raw text output (no JSON extraction).
+    /// Useful for chat_completion fallback where response is natural language.
+    pub fn execute_raw(&self, prompt: &str) -> Result<String> {
+        debug!("Preparing to execute CLI LLM (raw mode)...");
+        let mut cmd = match self.provider {
+            LLMProvider::Codex => std::process::Command::new("codex"),
+            LLMProvider::Gemini => std::process::Command::new("gemini"),
+            LLMProvider::Claude => std::process::Command::new("claude"),
+        };
+
+        let use_stdin = match self.provider {
+            LLMProvider::Codex => {
+                let model = Self::codex_model();
+                cmd.args(&[
+                    "exec",
+                    "-m",
+                    &model,
+                    "--sandbox",
+                    "danger-full-access",
+                    "--skip-git-repo-check",
+                    "--color",
+                    "never",
+                    "-",
+                ]);
+                true
+            }
+            LLMProvider::Gemini => {
+                cmd.arg("--sandbox");
+                cmd.arg(prompt);
+                false
+            }
+            LLMProvider::Claude => {
+                cmd.args(&["--dangerously-skip-permissions", "-p", "-"]);
+                true
+            }
+        };
+
+        if let Some(cwd) = &self.cwd {
+            if !matches!(self.provider, LLMProvider::Gemini) {
+                cmd.current_dir(cwd);
+            }
+        }
+
+        if use_stdin {
+            cmd.stdin(std::process::Stdio::piped());
+        } else {
+            cmd.stdin(std::process::Stdio::null());
+        }
+
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let mut child = cmd.spawn()?;
+
+        if use_stdin {
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                stdin.write_all(prompt.as_bytes())?;
+            }
+        }
+
+        let output = child.wait_with_output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!("CLI Error (raw): {}", stderr));
+        }
+
+        let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(raw)
+    }
+}
+
+/// Convert OpenAI-format messages to a plain-text prompt for CLI tools
+pub fn messages_to_prompt(messages: &[Value]) -> String {
+    let mut parts = Vec::new();
+    for msg in messages {
+        let role = msg["role"].as_str().unwrap_or("user");
+        let content = msg["content"].as_str().unwrap_or("");
+        match role {
+            "system" => parts.push(format!("[System Instructions]\n{}\n", content)),
+            "user" => parts.push(format!("[User]\n{}\n", content)),
+            "assistant" => parts.push(format!("[Assistant]\n{}\n", content)),
+            _ => parts.push(format!("[{}]\n{}\n", role, content)),
+        }
+    }
+    parts.join("\n")
+}
+
+/// Fallback chain: tries Gemini CLI → Codex CLI → local llama-server
+/// Called when OpenAI API is rate-limited (429) or unavailable.
+pub async fn fallback_chat_completion(messages: &[Value]) -> Result<String> {
+    let prompt = messages_to_prompt(messages);
+
+    // Read fallback chain from env, default: gemini,codex,local
+    let chain = std::env::var("STEER_LLM_FALLBACK_CHAIN")
+        .unwrap_or_else(|_| "gemini,codex,local".to_string());
+
+    let providers: Vec<&str> = chain.split(',').map(|s| s.trim()).collect();
+
+    for provider_name in &providers {
+        match *provider_name {
+            "gemini" | "codex" | "claude" => {
+                if let Some(llm_provider) = LLMProvider::from_str(provider_name) {
+                    let mut client = CLILLMClient::new(llm_provider);
+                    client.cwd = Some("/tmp".to_string());
+
+                    // Check if CLI is available
+                    if client.check_version().is_err() {
+                        eprintln!(
+                            "⚠️ [fallback] {} CLI not available, skipping",
+                            provider_name
+                        );
+                        continue;
+                    }
+
+                    eprintln!("🔄 [fallback] Trying {} CLI...", provider_name);
+                    match client.execute_raw(&prompt) {
+                        Ok(response) if !response.is_empty() => {
+                            eprintln!(
+                                "✅ [fallback] {} succeeded ({} chars)",
+                                provider_name,
+                                response.len()
+                            );
+                            return Ok(response);
+                        }
+                        Ok(_) => {
+                            eprintln!(
+                                "⚠️ [fallback] {} returned empty, trying next",
+                                provider_name
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("⚠️ [fallback] {} failed: {}, trying next", provider_name, e);
+                        }
+                    }
+                }
+            }
+            "local" => {
+                eprintln!("🔄 [fallback] Trying local llama-server...");
+                if !crate::llama_local::ensure_running().await {
+                    eprintln!("⚠️ [fallback] llama-server not available, skipping");
+                    continue;
+                }
+                match crate::llama_local::chat_completion(messages).await {
+                    Ok(response) => {
+                        eprintln!(
+                            "✅ [fallback] local llama-server succeeded ({} chars)",
+                            response.len()
+                        );
+                        return Ok(response);
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️ [fallback] local llama-server failed: {}", e);
+                    }
+                }
+            }
+            _ => {
+                eprintln!("⚠️ [fallback] Unknown provider: {}", provider_name);
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "All LLM fallback providers failed. Chain: {}",
+        chain
+    ))
 }
 
 /// Convenience function for quick execution
@@ -329,5 +516,18 @@ mod tests {
         let (cmd, args) = client.build_command();
         assert_eq!(cmd, "gemini");
         assert!(args.contains(&"-s".to_string()));
+    }
+
+    #[test]
+    fn test_messages_to_prompt() {
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "You are helpful."}),
+            serde_json::json!({"role": "user", "content": "Hello!"}),
+        ];
+        let prompt = messages_to_prompt(&messages);
+        assert!(prompt.contains("[System Instructions]"));
+        assert!(prompt.contains("You are helpful."));
+        assert!(prompt.contains("[User]"));
+        assert!(prompt.contains("Hello!"));
     }
 }

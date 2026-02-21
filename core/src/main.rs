@@ -700,6 +700,22 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if args.len() >= 2 && (args[1] == "telegram_listen" || args[1] == "telegram-listen") {
+        if let Some(llm) = llm_client.clone() {
+            if let Some(bot) = local_os_agent::telegram::TelegramBot::from_env(llm, None) {
+                println!("🤖 Telegram listener mode started. Waiting for commands...");
+                std::sync::Arc::new(bot).start_polling().await;
+            } else {
+                eprintln!(
+                    "❌ Telegram listener requires TELEGRAM_BOT_TOKEN (optional: TELEGRAM_USER_ID)."
+                );
+            }
+        } else {
+            eprintln!("❌ LLM not available for Telegram listener.");
+        }
+        return Ok(());
+    }
+
     // 2. Start Scheduler (Brain)
     if let Some(llm) = &llm_client {
         let scheduler = scheduler::Scheduler::new(llm.clone());
@@ -788,6 +804,27 @@ async fn main() -> anyhow::Result<()> {
         println!("👀 Watching for active application changes...");
     }
 
+    let mut telegram_listener_started = false;
+    if env_flag("STEER_TELEGRAM_POLLING") {
+        if let Some(llm) = llm_client.clone() {
+            if let Some(bot) =
+                local_os_agent::telegram::TelegramBot::from_env(llm, Some(log_tx.clone()))
+            {
+                println!("🤖 Telegram polling enabled (STEER_TELEGRAM_POLLING=1).");
+                tokio::spawn(async move {
+                    std::sync::Arc::new(bot).start_polling().await;
+                });
+                telegram_listener_started = true;
+            } else {
+                println!(
+                    "⚠️  STEER_TELEGRAM_POLLING=1 but TELEGRAM_BOT_TOKEN is missing; listener not started."
+                );
+            }
+        } else {
+            println!("⚠️  STEER_TELEGRAM_POLLING=1 but LLM is unavailable; listener not started.");
+        }
+    }
+
     let mut policy = policy::PolicyEngine::new(); // Starts LOCKED
     let mut res_mon = monitor::ResourceMonitor::new();
 
@@ -840,6 +877,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("  analyze_patterns      - Detect behavior patterns and generate recommendations");
                 println!("  quality               - Show workflow quality metrics");
                 println!("  telegram <msg>        - Send Telegram message");
+                println!("  telegram_listen       - Start Telegram natural-language listener");
                 println!("  notion <title>|<body> - Create Notion page");
                 println!("  gmail list [N]        - List recent N emails");
                 println!("  gmail read <id>       - Read email by ID");
@@ -1349,6 +1387,29 @@ async fn main() -> anyhow::Result<()> {
                         Err(e) => println!("❌ Failed: {}", e),
                     },
                     Err(e) => println!("⚠️  Telegram not configured: {}", e),
+                }
+            }
+            "telegram_listen" | "telegram-listen" => {
+                if telegram_listener_started {
+                    println!("ℹ️  Telegram listener is already running.");
+                    continue;
+                }
+                if let Some(llm) = llm_client.clone() {
+                    if let Some(bot) =
+                        local_os_agent::telegram::TelegramBot::from_env(llm, Some(log_tx.clone()))
+                    {
+                        println!("🤖 Telegram listener started.");
+                        tokio::spawn(async move {
+                            std::sync::Arc::new(bot).start_polling().await;
+                        });
+                        telegram_listener_started = true;
+                    } else {
+                        println!(
+                            "⚠️  Telegram listener requires TELEGRAM_BOT_TOKEN (optional: TELEGRAM_USER_ID)."
+                        );
+                    }
+                } else {
+                    println!("⚠️  LLM Client not available.");
                 }
             }
             "notion" => {

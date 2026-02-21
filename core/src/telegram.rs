@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::sync::Semaphore;
 // Duplicate removed
 use log::{error, info};
 
@@ -45,19 +47,52 @@ pub struct TelegramBot {
     token: String,
     allowed_user_id: Option<u64>,
     client: reqwest::Client,
+    poll_timeout_sec: u64,
     llm: Arc<dyn LLMClient>,
     tx_analyzer: Option<mpsc::Sender<String>>,
 }
 
 impl TelegramBot {
+    fn task_timeout_sec() -> u64 {
+        std::env::var("STEER_TELEGRAM_TASK_TIMEOUT_SEC")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|v| v.clamp(30, 1800))
+            .unwrap_or(240)
+    }
+
+    fn run_semaphore() -> Arc<Semaphore> {
+        static SEM: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
+        SEM.get_or_init(|| {
+            let max_parallel = std::env::var("STEER_TELEGRAM_MAX_CONCURRENT")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .map(|v| v.clamp(1, 8))
+                .unwrap_or(1);
+            Arc::new(Semaphore::new(max_parallel))
+        })
+        .clone()
+    }
+
     pub fn new(
         token: String,
         allowed_user_id: Option<u64>,
         llm: Arc<dyn LLMClient>,
         tx_analyzer: Option<mpsc::Sender<String>>,
     ) -> Self {
+        let poll_timeout_sec = std::env::var("STEER_TELEGRAM_POLL_TIMEOUT_SEC")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|v| v.clamp(3, 60))
+            .unwrap_or(12);
+        let http_timeout_sec = std::env::var("STEER_TELEGRAM_HTTP_TIMEOUT_SEC")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|v| v.clamp(10, 120))
+            .unwrap_or((poll_timeout_sec + 8).clamp(10, 120));
+
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(http_timeout_sec))
             .build()
             .unwrap_or_default();
 
@@ -65,6 +100,7 @@ impl TelegramBot {
             token,
             allowed_user_id,
             client,
+            poll_timeout_sec,
             llm,
             tx_analyzer,
         }
@@ -99,25 +135,52 @@ impl TelegramBot {
                                     let bot_clone = self.clone();
                                     let chat_id = msg.chat.id;
                                     let text_clone = text.clone();
+                                    let run_sem = Self::run_semaphore();
+                                    let queued = run_sem.available_permits() == 0;
 
                                     // Ack reception
+                                    let ack = if queued {
+                                        "🤖 Command received. Queued after current task..."
+                                    } else {
+                                        "🤖 Command received. Processing..."
+                                    };
                                     let _ = self
-                                        .send_message(chat_id, "🤖 Command received. Processing...")
-                                        .await;
+                                        .send_message(chat_id, ack)
+                                        .await
+                                        .map_err(|e| {
+                                            error!("⚠️ Telegram ack send failed: {}", e);
+                                            e
+                                        });
 
                                     // Spawn agent task
                                     tokio::spawn(async move {
+                                        let sem = Self::run_semaphore();
+                                        let _permit = match sem.acquire_owned().await {
+                                            Ok(v) => v,
+                                            Err(_) => {
+                                                let _ = bot_clone
+                                                    .send_message_chunked(
+                                                        chat_id,
+                                                        "❌ Task Failed: internal queue unavailable",
+                                                    )
+                                                    .await;
+                                                return;
+                                            }
+                                        };
                                         let planner = crate::controller::planner::Planner::new(
                                             bot_clone.llm.clone(),
                                             bot_clone.tx_analyzer.clone(),
                                         );
                                         let session_key = format!("telegram_chat_{}", chat_id);
+                                        let timeout_sec = Self::task_timeout_sec();
 
-                                        match planner
-                                            .run_goal_tracked(&text_clone, Some(&session_key))
-                                            .await
+                                        match tokio::time::timeout(
+                                            Duration::from_secs(timeout_sec),
+                                            planner.run_goal_tracked(&text_clone, Some(&session_key)),
+                                        )
+                                        .await
                                         {
-                                            Ok(outcome) => {
+                                            Ok(Ok(outcome)) => {
                                                 let stage_runs = crate::db::list_task_stage_runs(
                                                     &outcome.run_id,
                                                 )
@@ -136,11 +199,22 @@ impl TelegramBot {
                                                     .send_message_chunked(chat_id, &reply)
                                                     .await;
                                             }
-                                            Err(e) => {
+                                            Ok(Err(e)) => {
                                                 let _ = bot_clone
                                                     .send_message_chunked(
                                                         chat_id,
                                                         &format!("❌ Task Failed: {}", e),
+                                                    )
+                                                    .await;
+                                            }
+                                            Err(_) => {
+                                                let _ = bot_clone
+                                                    .send_message_chunked(
+                                                        chat_id,
+                                                        &format!(
+                                                            "❌ Task Failed: timeout (>{}s). 다음 명령으로 넘어갑니다.",
+                                                            timeout_sec
+                                                        ),
                                                     )
                                                     .await;
                                             }
@@ -157,8 +231,16 @@ impl TelegramBot {
                     }
                 }
                 Err(e) => {
-                    error!("⚠️ Telegram Poll Error: {}", e);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    let msg = e.to_string();
+                    // Long-poll timeout can happen on unstable networks.
+                    // Treat it as a soft timeout so next poll starts quickly.
+                    if msg.to_ascii_lowercase().contains("timed out") {
+                        info!("ℹ️ Telegram poll timeout; retrying quickly.");
+                        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                    } else {
+                        error!("⚠️ Telegram Poll Error: {}", msg);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    }
                 }
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -167,8 +249,8 @@ impl TelegramBot {
 
     async fn get_updates(&self, offset: u64) -> Result<Vec<Update>> {
         let url = format!(
-            "https://api.telegram.org/bot{}/getUpdates?offset={}&timeout=30",
-            self.token, offset
+            "https://api.telegram.org/bot{}/getUpdates?offset={}&timeout={}",
+            self.token, offset, self.poll_timeout_sec
         );
         let resp = self.client.get(&url).send().await?;
         if !resp.status().is_success() {

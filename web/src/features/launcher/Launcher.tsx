@@ -18,6 +18,8 @@ import {
 import {
     sendChatMessage,
     approveRecommendation,
+    agentGoalRun,
+    executeGoal,
     agentIntent,
     agentPlan,
     agentExecute,
@@ -238,6 +240,56 @@ const profileLabel = (profile: ExecutionProfile): string => {
     return found?.label ?? profile;
 };
 
+const isGoalRunEndpointUnavailable = (error: unknown): boolean => {
+    if (!axios.isAxiosError(error)) return false;
+    const status = error.response?.status;
+    if (status === 404 || status === 405 || status === 501) return true;
+    const responseData = error.response?.data as { error?: unknown } | undefined;
+    const text = [
+        error.message ?? "",
+        String(responseData ?? ""),
+        String(responseData?.error ?? ""),
+    ]
+        .join(" ")
+        .toLowerCase();
+    return (
+        text.includes("goal/run") ||
+        text.includes("goal-run") ||
+        text.includes("not found") ||
+        text.includes("no route")
+    );
+};
+
+const isNlChatFallbackEnabled = (): boolean => {
+    if (typeof import.meta === "undefined") return false;
+    // Default ON in demo builds: if NL execution path fails, degrade gracefully to chat reply.
+    // Set VITE_ENABLE_NL_CHAT_FALLBACK=0 to force strict failure.
+    return import.meta.env.VITE_ENABLE_NL_CHAT_FALLBACK !== "0";
+};
+
+const shouldTryNlChatFallback = (error: unknown): boolean => {
+    if (!isNlChatFallbackEnabled()) return false;
+    if (!axios.isAxiosError(error)) return false;
+    const status = error.response?.status;
+    if (status == null) return true; // transient network issue
+    if (status === 404 || status === 405 || status === 501) return true; // route unavailable
+    const payload = error.response?.data as
+        | { error?: unknown; message?: unknown; detail?: unknown }
+        | undefined;
+    const text = [
+        String(payload?.error ?? ""),
+        String(payload?.message ?? ""),
+        String(payload?.detail ?? ""),
+        error.message ?? "",
+    ]
+        .join(" ")
+        .toLowerCase();
+    return (
+        (text.includes("goal/run") || text.includes("goal-run")) &&
+        (text.includes("not found") || text.includes("no route"))
+    );
+};
+
 const markdownComponents: Components = {
     code({ children, ...props }) {
         const inline = 'inline' in props && props.inline;
@@ -255,6 +307,8 @@ const markdownComponents: Components = {
 
 export default function Launcher() {
     const [input, setInput] = useState("");
+    const [isComposing, setIsComposing] = useState(false);
+    const composingSinceRef = useRef<number>(0);
     const [composerMode, setComposerMode] = useState<ComposerMode>("nl");
     const [executionProfile, setExecutionProfile] =
         useState<ExecutionProfile>("strict");
@@ -295,6 +349,7 @@ export default function Launcher() {
     const [dispatchBlockedUntilMs, setDispatchBlockedUntilMs] = useState<number | null>(null);
     const [dispatchNowMs, setDispatchNowMs] = useState<number>(Date.now());
     const [pendingDispatch, setPendingDispatch] = useState<PendingDispatch | null>(null);
+    const [goalRunAvailable, setGoalRunAvailable] = useState<boolean | null>(null);
     const [runSnapshot, setRunSnapshot] = useState<ExecutionSnapshot | null>(null);
     const [stageRuns, setStageRuns] = useState<TaskStageRun[]>([]);
     const [stageAssertions, setStageAssertions] = useState<TaskStageAssertion[]>([]);
@@ -340,6 +395,7 @@ export default function Launcher() {
         handsOffReady: false,
     });
     const lastDispatchRef = useRef<{ promptKey: string; ts: number } | null>(null);
+    const sendThrottleRef = useRef<number>(0);
     const inputRef = useRef<HTMLInputElement>(null);
     const scrollRef = useRef<HTMLDivElement>(null);
     const { data: recs, refetch } = useRecommendations();
@@ -1691,6 +1747,115 @@ export default function Launcher() {
         }
 
         try {
+            const useGoalRunPath =
+                (composerMode === "nl" || composerMode === "program") &&
+                goalRunAvailable !== false;
+            let fallbackToLegacyFromGoalRun = false;
+            if (useGoalRunPath) {
+                try {
+                    const goalRes = await agentGoalRun(prompt);
+                    if (goalRunAvailable !== true) {
+                        setGoalRunAvailable(true);
+                    }
+                    setLastPlanId(null);
+                    setLastStatus(goalRes.status);
+                    updateExecutionState({
+                        status: goalRes.status,
+                        runId: goalRes.run_id,
+                        resumeToken: null,
+                        plannerComplete: !!goalRes.planner_complete,
+                        executionComplete: !!goalRes.execution_complete,
+                        businessComplete: !!goalRes.business_complete,
+                        verifyOk: !!goalRes.business_complete,
+                        verifyIssues: goalRes.business_complete ? [] : ["business_complete=false"],
+                        completionScore: null,
+                    });
+                    await loadRunDiagnostics(goalRes.run_id);
+                    await loadDodHistory();
+
+                    const summaryLines = [
+                        `**Mode**: goal-run (${composerMode})`,
+                        `**Status**: ${goalRes.status}`,
+                        `**Run ID**: ${goalRes.run_id}`,
+                        `**Planner Complete**: ${goalRes.planner_complete ? "yes" : "no"}`,
+                        `**Execution Complete**: ${goalRes.execution_complete ? "yes" : "no"}`,
+                        `**Business Complete**: ${goalRes.business_complete ? "yes" : "no"}`,
+                        goalRes.summary ? `**Summary**: ${goalRes.summary}` : "",
+                    ];
+
+                    setResults([{
+                        type: goalRes.business_complete ? "response" : "error",
+                        content: summaryLines.filter(Boolean).join("\n"),
+                    }]);
+                    setInput("");
+
+                    if (goalRes.status === "approval_required") {
+                        setRunPhase("approval_required");
+                    } else if (goalRes.status === "manual_required") {
+                        setRunPhase("manual_required");
+                    } else if (goalRes.business_complete) {
+                        setRunPhase("completed");
+                        triggerSuccess();
+                    } else {
+                        setRunPhase("failed");
+                        triggerError();
+                    }
+                    return;
+                } catch (goalRunError) {
+                    if (!isGoalRunEndpointUnavailable(goalRunError)) {
+                        throw goalRunError;
+                    }
+                    setGoalRunAvailable(false);
+                    fallbackToLegacyFromGoalRun = true;
+                    console.warn(
+                        "goal-run endpoint unavailable. Falling back to legacy goal path.",
+                        goalRunError
+                    );
+                }
+            }
+
+            if (fallbackToLegacyFromGoalRun) {
+                try {
+                    const legacyRes = await executeGoal(prompt);
+                    const legacyStatus = (legacyRes.status || "started").toLowerCase();
+                    setLastPlanId(null);
+                    setLastStatus(legacyRes.status);
+                    setRunSnapshot({
+                        status: legacyRes.status || "started",
+                        runId: null,
+                        resumeToken: null,
+                        plannerComplete: legacyStatus !== "error",
+                        executionComplete: false,
+                        businessComplete: false,
+                        verifyOk: legacyStatus !== "error",
+                        verifyIssues: legacyStatus === "error" ? [legacyRes.message] : [],
+                        completionScore: null,
+                    });
+                    setResults([{
+                        type: legacyStatus === "error" ? "error" : "response",
+                        content: [
+                            `**Mode**: legacy-goal (${composerMode})`,
+                            `**Status**: ${legacyRes.status || "started"}`,
+                            `**Message**: ${legacyRes.message || "Goal started."}`,
+                        ].join("\n"),
+                    }]);
+                    if (legacyStatus === "error") {
+                        setRunPhase("failed");
+                        triggerError();
+                    } else {
+                        setRunPhase("running");
+                        triggerSuccess();
+                        setInput("");
+                    }
+                    return;
+                } catch (legacyGoalError) {
+                    console.warn(
+                        "legacy goal endpoint failed. Trying intent/plan/execute fallback.",
+                        legacyGoalError
+                    );
+                }
+            }
+
             const intentRes = await agentIntent(prompt);
             if (intentRes.missing_slots && intentRes.missing_slots.length > 0) {
                 const followUp = intentRes.follow_up || "추가 정보가 필요합니다.";
@@ -1732,6 +1897,9 @@ export default function Launcher() {
             await loadDodHistory();
 
             const summaryLines = [
+                fallbackToLegacyFromGoalRun
+                    ? `**Mode**: legacy fallback (${composerMode})`
+                    : "",
                 `**Intent**: ${intentRes.intent} (${Math.round(intentRes.confidence * 100)}%)`,
                 `**Status**: ${execRes.status}`,
                 `**Profile**: ${execRes.profile ?? effectiveProfile}${execRes.collision_policy ? ` (collision=${execRes.collision_policy})` : ""}`,
@@ -1798,6 +1966,7 @@ export default function Launcher() {
                     data?: {
                         error?: string;
                         message?: string;
+                        detail?: string;
                         lock_scope?: string;
                         active_plan_id?: string;
                     };
@@ -1835,17 +2004,44 @@ export default function Launcher() {
                 triggerError();
                 return;
             }
-            try {
-                const res = await sendChatMessage(prompt);
-                setResults([{ type: 'response', content: res.response }]);
-                setInput("");
-                setRunPhase("completed");
-                triggerSuccess();
-            } catch {
-                setResults([{ type: 'error', content: "Failed to reach agent." }]);
-                setRunPhase("failed");
-                triggerError();
+            if (shouldTryNlChatFallback(error)) {
+                try {
+                    const res = await sendChatMessage(prompt);
+                    setResults([{ type: 'response', content: res.response }]);
+                    setInput("");
+                    setRunPhase("completed");
+                    triggerSuccess();
+                    return;
+                } catch {
+                    // fall through to explicit error below
+                }
             }
+            const statusCode = maybe.response?.status;
+            const errorDetail =
+                maybe.response?.data?.detail &&
+                typeof maybe.response.data.detail === "string"
+                    ? maybe.response.data.detail
+                    : "";
+            const lowerErr = `${maybe.response?.data?.error ?? ""} ${errorDetail} ${maybe.message ?? ""}`.toLowerCase();
+            const detailMsg =
+                errorDetail ||
+                maybe.response?.data?.message ||
+                maybe.response?.data?.error ||
+                maybe.message ||
+                "Failed to reach agent.";
+            const normalizedMsg =
+                lowerErr.includes("screen capture unavailable") ||
+                lowerErr.includes("permission missing")
+                    ? "화면 캡처 권한이 없어 실행이 중단됐습니다. 시스템 설정에서 Steer OS/Terminal의 화면 기록 권한을 켠 뒤 다시 시도하세요."
+                    : detailMsg;
+            setResults([
+                {
+                    type: "error",
+                    content: `실행 실패${statusCode ? ` (${statusCode})` : ""}: ${normalizedMsg}`,
+                },
+            ]);
+            setRunPhase("failed");
+            triggerError();
         } finally {
             setLoading(false);
         }
@@ -1866,10 +2062,32 @@ export default function Launcher() {
     }, [pendingDispatch]);
 
     const handleSend = async () => {
-        await dispatchPrompt(input);
+        const prompt = input.trim();
+        if (!prompt || loading || isExecutionLocked) {
+            return;
+        }
+        // IME composition state가 드물게 고착되는 케이스를 방어한다.
+        if (isComposing) {
+            const composingMs = Date.now() - (composingSinceRef.current || Date.now());
+            if (composingMs < 1500) {
+                return;
+            }
+            setIsComposing(false);
+            composingSinceRef.current = 0;
+        }
+        if (isComposing) {
+            return;
+        }
+        const now = Date.now();
+        if (now - sendThrottleRef.current < 650) {
+            return;
+        }
+        sendThrottleRef.current = now;
+        await dispatchPrompt(prompt);
     };
 
     const handleSuggestionClick = (suggestion: string) => {
+        setIsComposing(false);
         setInput(suggestion);
         inputRef.current?.focus();
     };
@@ -2190,7 +2408,17 @@ export default function Launcher() {
     };
 
     // Keyboard Handler
-    const handleKeyDown = async (e: React.KeyboardEvent) => {
+    const handleKeyDown = async (e: React.KeyboardEvent<HTMLInputElement>) => {
+        const nativeEvent = e.nativeEvent as KeyboardEvent;
+        const composingMs = Date.now() - (composingSinceRef.current || Date.now());
+        const composingHot = isComposing && composingMs < 1500;
+        if (composingHot || nativeEvent.isComposing || nativeEvent.keyCode === 229) {
+            return;
+        }
+        if (isComposing && !composingHot) {
+            setIsComposing(false);
+            composingSinceRef.current = 0;
+        }
         if (isExecutionLocked && e.key === "Enter") {
             e.preventDefault();
             return;
@@ -2204,8 +2432,8 @@ export default function Launcher() {
             e.preventDefault();
             setSelectedIndex(prev => (prev - 1 + navigableItems.length) % navigableItems.length);
         } else if (e.key === "Enter") {
-            if (input.trim() && navigableItems.length === 0) {
-                e.preventDefault();
+            e.preventDefault();
+            if (input.trim()) {
                 await handleSend();
                 return;
             }
@@ -2213,14 +2441,32 @@ export default function Launcher() {
             if (navigableItems.length > 0) {
                 const selected = navigableItems[selectedIndex];
                 if (selected && selected.type === 'recommendation') {
-                    e.preventDefault();
                     const rec = selected.data as { id: number; title: string; summary: string; status: string };
                     await handleApprove(rec.id);
                 }
-            } else if (input.trim()) {
-                await handleSend();
             }
         }
+    };
+
+    const handleInputPaste = (e: React.ClipboardEvent<HTMLInputElement>) => {
+        const pasted = e.clipboardData.getData("text");
+        if (!pasted) return;
+        e.preventDefault();
+        const normalized = pasted.replace(/\s+/g, " ").trim();
+        const target = e.currentTarget;
+        const start = target.selectionStart ?? target.value.length;
+        const end = target.selectionEnd ?? target.value.length;
+        const nextValue =
+            target.value.slice(0, start) + normalized + target.value.slice(end);
+        setInput(nextValue);
+        requestAnimationFrame(() => {
+            const caret = start + normalized.length;
+            try {
+                target.setSelectionRange(caret, caret);
+            } catch {
+                // no-op
+            }
+        });
     };
 
     const handleBackgroundClick = async (e: React.MouseEvent) => {
@@ -2266,7 +2512,10 @@ export default function Launcher() {
                     <div className="flex items-center gap-3">
                         <div className="inline-flex items-center gap-1 rounded-xl bg-white/6 p-1 shrink-0">
                             <button
-                                onClick={() => setComposerMode("nl")}
+                                onClick={() => {
+                                    setIsComposing(false);
+                                    setComposerMode("nl");
+                                }}
                                 disabled={isExecutionLocked}
                                 className={`px-3 py-1.5 text-xs rounded-lg font-medium transition-colors ${composerMode === "nl"
                                     ? "bg-white/15 text-white"
@@ -2276,7 +2525,10 @@ export default function Launcher() {
                                 자연어
                             </button>
                             <button
-                                onClick={() => setComposerMode("chat")}
+                                onClick={() => {
+                                    setIsComposing(false);
+                                    setComposerMode("chat");
+                                }}
                                 disabled={isExecutionLocked}
                                 className={`px-3 py-1.5 text-xs rounded-lg font-medium transition-colors ${composerMode === "chat"
                                     ? "bg-white/15 text-white"
@@ -2286,7 +2538,10 @@ export default function Launcher() {
                                 대화
                             </button>
                             <button
-                                onClick={() => setComposerMode("program")}
+                                onClick={() => {
+                                    setIsComposing(false);
+                                    setComposerMode("program");
+                                }}
                                 disabled={isExecutionLocked}
                                 className={`px-3 py-1.5 text-xs rounded-lg font-medium transition-colors ${composerMode === "program"
                                     ? "bg-white/15 text-white"
@@ -2413,15 +2668,29 @@ export default function Launcher() {
                                 }
                                 value={input}
                                 onChange={(e) => setInput(e.target.value)}
+                                onCompositionStart={() => {
+                                    composingSinceRef.current = Date.now();
+                                    setIsComposing(true);
+                                }}
+                                onCompositionEnd={() => {
+                                    composingSinceRef.current = 0;
+                                    setIsComposing(false);
+                                }}
+                                onBlur={() => setIsComposing(false)}
+                                onPaste={handleInputPaste}
                                 onKeyDown={handleKeyDown}
                                 disabled={isExecutionLocked}
+                                autoComplete="off"
+                                autoCorrect="off"
+                                autoCapitalize="none"
+                                spellCheck={false}
                                 autoFocus
                             />
                         </div>
 
                         <button
                             onClick={handleSend}
-                            disabled={!input.trim() || isExecutionLocked}
+                            disabled={!input.trim() || isExecutionLocked || loading}
                             className="w-11 h-11 sm:w-12 sm:h-12 rounded-full bg-white/18 hover:bg-white/30 disabled:opacity-40 text-white flex items-center justify-center transition-colors"
                         >
                             {loading ? (
@@ -2522,6 +2791,24 @@ export default function Launcher() {
                                                         className="px-2 py-1 rounded border border-amber-300/40 bg-amber-400/20 hover:bg-amber-400/30 disabled:opacity-50"
                                                     >
                                                         {preflightFixBusy === "open_screen_capture_settings" ? "처리 중..." : "화면 기록 설정 열기"}
+                                                    </button>
+                                                )}
+                                                {screenCapturePreflight && !screenCapturePreflight.ok && (
+                                                    <button
+                                                        onClick={() => void handlePreflightFix("reveal_core_binary")}
+                                                        disabled={!!preflightFixBusy || preflightLoading || isExecutionLocked}
+                                                        className="px-2 py-1 rounded border border-amber-300/40 bg-amber-400/20 hover:bg-amber-400/30 disabled:opacity-50"
+                                                    >
+                                                        {preflightFixBusy === "reveal_core_binary" ? "처리 중..." : "코어 파일 보기"}
+                                                    </button>
+                                                )}
+                                                {screenCapturePreflight && !screenCapturePreflight.ok && (
+                                                    <button
+                                                        onClick={() => void handlePreflightFix("request_screen_capture_access")}
+                                                        disabled={!!preflightFixBusy || preflightLoading || isExecutionLocked}
+                                                        className="px-2 py-1 rounded border border-amber-300/40 bg-amber-400/20 hover:bg-amber-400/30 disabled:opacity-50"
+                                                    >
+                                                        {preflightFixBusy === "request_screen_capture_access" ? "처리 중..." : "권한 요청"}
                                                     </button>
                                                 )}
                                             </div>

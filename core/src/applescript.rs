@@ -4,9 +4,12 @@ use std::process::Command;
 pub fn run(script: &str) -> Result<String> {
     #[cfg(target_os = "macos")]
     {
+        // Wrap all scripts in a timeout block to prevent indefinite AppleEvent (-1712) hangs.
+        let wrapped_script = format!("with timeout of 15 seconds\n{}\nend timeout", script);
+
         let output = Command::new("osascript")
             .arg("-e")
-            .arg(script)
+            .arg(&wrapped_script)
             .output()
             .context("Failed to run AppleScript")?;
 
@@ -132,10 +135,24 @@ pub fn get_active_window_context() -> Result<(String, String)> {
 fn run_lines_with_args(lines: &[&str], args: &[String]) -> Result<String> {
     #[cfg(target_os = "macos")]
     {
-        let mut cmd = Command::new("osascript");
+        let mut script_body = String::new();
         for line in lines {
-            cmd.arg("-e").arg(line);
+            if line.starts_with("on run argv") {
+                script_body.push_str(line);
+                script_body.push('\n');
+                script_body.push_str("with timeout of 15 seconds\n");
+            } else if line.starts_with("end run") {
+                script_body.push_str("end timeout\n");
+                script_body.push_str(line);
+                script_body.push('\n');
+            } else {
+                script_body.push_str(line);
+                script_body.push('\n');
+            }
         }
+
+        let mut cmd = Command::new("osascript");
+        cmd.arg("-e").arg(&script_body);
         cmd.arg("--");
         for arg in args {
             cmd.arg(arg);

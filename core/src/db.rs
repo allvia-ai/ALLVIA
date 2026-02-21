@@ -1873,6 +1873,27 @@ fn parse_task_run_stale_minutes() -> i64 {
         .unwrap_or(120)
 }
 
+pub fn mark_stale_running_task_runs_finished() -> Result<usize> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        let stale_window = format!("-{} minutes", parse_task_run_stale_minutes());
+        let finished_at = chrono::Utc::now().to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE task_runs
+             SET status = 'business_failed',
+                 finished_at = COALESCE(finished_at, ?1),
+                 summary = COALESCE(summary, 'auto-finalized stale running run'),
+                 details = COALESCE(details, '{\"source\":\"db.mark_stale_running_task_runs_finished\",\"reason\":\"stale_running_run\"}')
+             WHERE status = 'running'
+               AND finished_at IS NULL
+               AND julianday(created_at) < julianday('now', ?2)",
+            params![finished_at, stale_window],
+        )?;
+        return Ok(rows);
+    }
+    Ok(0)
+}
+
 fn parse_stage_max_retries() -> i64 {
     std::env::var("STEER_STAGE_MAX_RETRIES")
         .ok()

@@ -229,14 +229,41 @@ pub async fn execute_approved_recommendation(
     let workflow_json_str = match workflow_json_str_result {
         Ok(v) => v,
         Err(e) => {
-            let _ = db::mark_workflow_provision_failed(
-                provision_op_id,
-                &format!("workflow json generation failed: {}", e),
-            );
-            if !force_recreate {
-                let _ = db::release_recommendation_provisioning_claim(id, &claim_token);
+            if parse_bool_env("STEER_N8N_MINIMAL_ON_LLM_FAILURE", true) {
+                eprintln!(
+                    "⚠️ workflow generation failed for recommendation {}: {}. Falling back to minimal template.",
+                    id, e
+                );
+                match serde_json::to_string(&mock_workflow_json(&rec.title)) {
+                    Ok(fallback) => fallback,
+                    Err(serr) => {
+                        let _ = db::mark_workflow_provision_failed(
+                            provision_op_id,
+                            &format!(
+                                "workflow json generation failed: {}; fallback serialization failed: {}",
+                                e, serr
+                            ),
+                        );
+                        if !force_recreate {
+                            let _ = db::release_recommendation_provisioning_claim(id, &claim_token);
+                        }
+                        return Err(anyhow!(
+                            "workflow generation failed: {}; fallback serialization failed: {}",
+                            e,
+                            serr
+                        ));
+                    }
+                }
+            } else {
+                let _ = db::mark_workflow_provision_failed(
+                    provision_op_id,
+                    &format!("workflow json generation failed: {}", e),
+                );
+                if !force_recreate {
+                    let _ = db::release_recommendation_provisioning_claim(id, &claim_token);
+                }
+                return Err(e);
             }
-            return Err(e);
         }
     };
 

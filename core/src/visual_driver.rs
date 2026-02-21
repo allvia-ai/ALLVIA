@@ -76,6 +76,14 @@ pub struct VisualDriver {
     pub steps: Vec<SmartStep>,
 }
 
+fn should_fallback_to_native_type(err_text: &str) -> bool {
+    let lower = err_text.to_lowercase();
+    lower.contains("1002")
+        || lower.contains("keystroke")
+        || lower.contains("허용되지 않습니다")
+        || lower.contains("not allowed to send keystrokes")
+}
+
 impl VisualDriver {
     pub fn new() -> Self {
         Self { steps: Vec::new() }
@@ -340,6 +348,7 @@ impl VisualDriver {
                 }
                 UiAction::Type(text) => {
                     let text_clone = text.clone();
+                    let text_for_native_fallback = text.clone();
                     let compact: String =
                         text_clone.chars().filter(|c| !c.is_whitespace()).collect();
                     let calc_like = !compact.is_empty()
@@ -377,7 +386,54 @@ impl VisualDriver {
 
                     match tokio::time::timeout(std::time::Duration::from_secs(5), task).await {
                         Ok(Ok(Ok(_))) => {}
-                        Ok(Ok(Err(e))) => return Err(anyhow::anyhow!("Type Failed: {}", e)),
+                        Ok(Ok(Err(e))) => {
+                            #[cfg(target_os = "macos")]
+                            {
+                                let err_text = e.to_string();
+                                if should_fallback_to_native_type(&err_text) {
+                                    warn!(
+                                        "      (Type permission issue detected, trying native fallback)"
+                                    );
+                                    let fallback_text = text_for_native_fallback.clone();
+                                    let fallback = tokio::task::spawn_blocking(move || {
+                                        crate::macos::actions::type_text(&fallback_text)
+                                    });
+                                    match tokio::time::timeout(
+                                        std::time::Duration::from_secs(5),
+                                        fallback,
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(Ok(_))) => {}
+                                        Ok(Ok(Err(e2))) => {
+                                            return Err(anyhow::anyhow!(
+                                                "Type Failed: {} | Native fallback failed: {}",
+                                                err_text,
+                                                e2
+                                            ));
+                                        }
+                                        Ok(Err(_)) => {
+                                            return Err(anyhow::anyhow!(
+                                                "Type Failed: {} | Native fallback task panic",
+                                                err_text
+                                            ));
+                                        }
+                                        Err(_) => {
+                                            return Err(anyhow::anyhow!(
+                                                "Type Failed: {} | Native fallback timed out",
+                                                err_text
+                                            ));
+                                        }
+                                    }
+                                } else {
+                                    return Err(anyhow::anyhow!("Type Failed: {}", err_text));
+                                }
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            {
+                                return Err(anyhow::anyhow!("Type Failed: {}", e));
+                            }
+                        }
                         Ok(Err(_)) => return Err(anyhow::anyhow!("Task Panic")),
                         Err(_) => return Err(anyhow::anyhow!("Type Timed Out")),
                     }

@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 use anyhow::Result;
 use reqwest::{Client, Response, StatusCode};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -138,6 +139,37 @@ fn n8n_test_context() -> bool {
 }
 
 impl N8nApi {
+    fn local_latest_api_key_from_db() -> Option<String> {
+        let db_path = if let Ok(custom) = std::env::var("STEER_N8N_DB_PATH") {
+            let trimmed = custom.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            PathBuf::from(trimmed)
+        } else {
+            let home = std::env::var("HOME").ok()?;
+            PathBuf::from(home).join(".n8n").join("database.sqlite")
+        };
+
+        if !db_path.exists() {
+            return None;
+        }
+
+        let conn = Connection::open(db_path).ok()?;
+        let key: String = conn
+            .query_row(
+                "SELECT apiKey FROM user_api_keys ORDER BY createdAt DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()?;
+        let trimmed = key.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(trimmed.to_string())
+    }
+
     fn n8n_cli_binary_available() -> bool {
         Command::new("n8n")
             .arg("--version")
@@ -220,7 +252,16 @@ Set STEER_N8N_ALLOW_NPX_CLI=1 (or enable npx runtime explicitly)."
         let base_url = std::env::var("N8N_API_URL")
             .unwrap_or_else(|_| "http://localhost:5678/api/v1".to_string());
         // Allow missing key only when CLI fallback is explicitly enabled.
-        let api_key = std::env::var("N8N_API_KEY").unwrap_or_default();
+        let mut api_key = std::env::var("N8N_API_KEY").unwrap_or_default();
+        let prefer_db_key = parse_bool_env_with_default("STEER_N8N_PREFER_LOCAL_DB_KEY", true);
+        let local_target = base_url.contains("localhost") || base_url.contains("127.0.0.1");
+        if prefer_db_key && local_target {
+            if let Some(db_key) = Self::local_latest_api_key_from_db() {
+                if api_key.trim() != db_key {
+                    api_key = db_key;
+                }
+            }
+        }
         Ok(Self::new(&base_url, &api_key))
     }
 

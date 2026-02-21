@@ -23,6 +23,7 @@ import {
     AgentExecuteResponseSchema,
     AgentVerifyResponseSchema,
     AgentApproveResponseSchema,
+    AgentGoalRunResponseSchema,
     AgentPreflightResponseSchema,
     AgentPreflightFixResponseSchema,
     AgentRecoveryEventResponseSchema,
@@ -61,6 +62,7 @@ import {
     type AgentExecuteResponse,
     type AgentVerifyResponse,
     type AgentApproveResponse,
+    type AgentGoalRunResponse,
     type AgentPreflightResponse,
     type AgentPreflightFixResponse,
     type AgentRecoveryEventResponse,
@@ -79,9 +81,13 @@ import {
 } from "./types";
 import { z } from "zod";
 
-export const API_BASE_URL =
-    import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, "") ??
-    "http://localhost:5680/api";
+const normalizeApiBaseUrl = (raw?: string): string => {
+    const cleaned = raw?.trim().replace(/\/+$/, "");
+    if (!cleaned) return "http://127.0.0.1:5680/api";
+    return cleaned.endsWith("/api") ? cleaned : `${cleaned}/api`;
+};
+
+export const API_BASE_URL = normalizeApiBaseUrl(import.meta.env.VITE_API_BASE_URL);
 
 const api = axios.create({
     baseURL: API_BASE_URL,
@@ -350,8 +356,20 @@ export async function agentApprove(
     return AgentApproveResponseSchema.parse(data);
 }
 
+export async function agentGoalRun(
+    goal: string,
+    sessionKey?: string
+): Promise<AgentGoalRunResponse> {
+    const payload: Record<string, string> = { goal };
+    if (sessionKey?.trim()) {
+        payload.session_key = sessionKey.trim();
+    }
+    const { data } = await api.post("/agent/goal/run", payload, { timeout: 300000 });
+    return AgentGoalRunResponseSchema.parse(data);
+}
+
 export async function fetchAgentPreflight(): Promise<AgentPreflightResponse> {
-    const { data } = await api.get("/agent/preflight");
+    const { data } = await api.get("/agent/preflight", { timeout: 20000 });
     return AgentPreflightResponseSchema.parse(data);
 }
 
@@ -369,7 +387,7 @@ export async function runAgentPreflightFix(
     if (options?.run_id) payload.run_id = options.run_id;
     if (options?.stage_name) payload.stage_name = options.stage_name;
     if (options?.assertion_key) payload.assertion_key = options.assertion_key;
-    const { data } = await api.post("/agent/preflight/fix", payload);
+    const { data } = await api.post("/agent/preflight/fix", payload, { timeout: 20000 });
     return AgentPreflightFixResponseSchema.parse(data);
 }
 
@@ -476,13 +494,21 @@ export async function analyzePatterns(): Promise<string[]> {
 
 export async function sendChatMessage(message: string): Promise<{ response: string; command?: string }> {
     try {
-        const { data } = await api.post("/chat", { message });
+        const { data } = await api.post("/chat", { message }, { timeout: 30000 });
         return data;
     } catch (e) {
         if (axios.isAxiosError(e)) {
+            const status = e.response?.status;
+            const data = e.response?.data as { error?: string; message?: string; detail?: string } | undefined;
+            const detail =
+                data?.detail ||
+                data?.error ||
+                data?.message ||
+                e.message ||
+                "Network or server error";
             console.error("Chat Error:", e.response?.data || e.message);
-            return { response: "❌ Network or Server Error. Check console logs." };
+            throw new Error(`Chat request failed (${status ?? "unknown"}): ${detail}`);
         }
-        return { response: "❌ Unknown Error" };
+        throw new Error("Unknown chat error");
     }
 }

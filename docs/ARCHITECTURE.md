@@ -14,9 +14,9 @@
 ### B. Web UI (`web/`)
 - Role: operator UI for launch/chat/dashboard/verification.
 - Stack: React + Vite + TypeScript.
-- Talks to core through `http://localhost:5680/api` (configurable via `VITE_API_BASE_URL`).
+- Talks to core through `http://127.0.0.1:5680/api` (configurable via `VITE_API_BASE_URL`).
 
-### C. Desktop Wrapper (`desktop/`, `desktop/src-tauri/`)
+### C. Desktop Wrapper (`web/src-tauri/`)
 - Role: desktop shell and native windowing/packaging.
 - Stack: Tauri + Vite.
 - Hosts the same web front-end and invokes core capabilities.
@@ -26,7 +26,7 @@
 - Legacy Swift adapter references are historical and not part of the active runtime path.
 
 ## 3. Data Flow
-1. User action enters via web/desktop UI or CLI.
+1. User action enters via web/Tauri UI or CLI.
 2. Core validates request using policy/security layers.
 3. Planner/executor performs shell/UI/native actions.
 4. Results are stored (SQLite / memory modules) and exposed through API.

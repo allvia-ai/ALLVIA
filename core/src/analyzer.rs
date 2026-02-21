@@ -86,10 +86,15 @@ pub fn spawn(
                                                     path
                                                 );
                                                 if let Err(e) = mem.add(&content, meta).await {
-                                                    eprintln!(
-                                                        "⚠️ [Analyzer] Mem Ingest Failed: {}",
-                                                        e
-                                                    );
+                                                    if e.to_string().contains("RATE_LIMITED_QUOTA")
+                                                    {
+                                                        eprintln!("⚠️ [Analyzer] Mem Ingest Paused (Quota)");
+                                                    } else {
+                                                        eprintln!(
+                                                            "⚠️ [Analyzer] Mem Ingest Failed: {}",
+                                                            e
+                                                        );
+                                                    }
                                                 }
                                             }
                                             Err(e) => eprintln!(
@@ -178,7 +183,11 @@ async fn process_buffer(
             });
 
             if let Err(e) = mem.add(&summary, meta).await {
-                eprintln!("⚠️ [Memory] Ingestion Failed: {}", e);
+                if e.to_string().contains("RATE_LIMITED_QUOTA") {
+                    eprintln!("⚠️ [Memory] Ingestion Paused (Quota)");
+                } else {
+                    eprintln!("⚠️ [Memory] Ingestion Failed: {}", e);
+                }
             }
         }
     }

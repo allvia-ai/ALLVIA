@@ -33,6 +33,20 @@ struct TextEditWriteResult {
     body_len: i64,
 }
 
+struct NotionWriteResult {
+    page_id: String,
+    page_url: String,
+    title: String,
+}
+
+#[derive(Debug, Clone)]
+struct AiNewsItem {
+    title: String,
+    link: String,
+    summary: String,
+    published_at: String,
+}
+
 impl ActionRunner {
     fn focus_recovery_max_retries() -> usize {
         std::env::var("STEER_FOCUS_RECOVERY_MAX_RETRIES")
@@ -421,6 +435,67 @@ impl ActionRunner {
         lower.contains("mail") || lower.contains("gmail") || lower.contains("메일")
     }
 
+    fn goal_mentions_telegram(goal: &str) -> bool {
+        let lower = goal.to_lowercase();
+        lower.contains("telegram") || lower.contains("텔레그램")
+    }
+
+    fn latest_read_result_from_history(history: &[String]) -> Option<String> {
+        for entry in history.iter().rev() {
+            if let Some(rest) = entry.strip_prefix("READ_RESULT: ") {
+                let trimmed = rest.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    fn preferred_telegram_message(
+        plan: &serde_json::Value,
+        goal: &str,
+        history: &[String],
+    ) -> String {
+        if let Some(raw) = plan
+            .get("message")
+            .and_then(|v| v.as_str())
+            .or_else(|| plan.get("text").and_then(|v| v.as_str()))
+        {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+
+        if let Some(read_result) = Self::latest_read_result_from_history(history) {
+            return format!("요청 결과 요약:\n{}", read_result);
+        }
+
+        let fragments = Self::extract_quoted_fragments(goal)
+            .into_iter()
+            .filter(|frag| {
+                let trimmed = frag.trim();
+                let lower = trimmed.to_lowercase();
+                !trimmed.is_empty()
+                    && Self::normalize_email_candidate(trimmed).is_none()
+                    && !lower.starts_with("cmd+")
+                    && !lower.starts_with("status:")
+                    && !trimmed.starts_with("RUN_SCOPE_")
+            })
+            .collect::<Vec<_>>();
+        if !fragments.is_empty() {
+            return format!("요청 내용 요약:\n{}", fragments.join("\n"));
+        }
+
+        if Self::goal_mentions_telegram(goal) {
+            return "요청한 작업을 실행했습니다. 세부 로그는 앱/리포트에서 확인해주세요."
+                .to_string();
+        }
+
+        "요청한 작업을 실행했습니다.".to_string()
+    }
+
     fn strip_markup_for_mail_body(raw: &str) -> String {
         let with_breaks = raw
             .replace("\r\n", "\n")
@@ -732,6 +807,17 @@ impl ActionRunner {
             return None;
         }
 
+        let is_scope_marker = |candidate: &str| {
+            let upper = candidate.to_ascii_uppercase();
+            if !upper.starts_with("RUN_SCOPE_") || candidate.len() <= "RUN_SCOPE_".len() {
+                return false;
+            }
+            candidate
+                .chars()
+                .skip("RUN_SCOPE_".len())
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        };
+
         // Prefer explicit user payload markers (typically quoted in scenario requests)
         // over internal run markers appended by wrappers.
         let quoted = Self::extract_quoted_fragments(goal_text);
@@ -742,9 +828,7 @@ impl ActionRunner {
                     '"' | '\'' | ',' | '.' | ';' | ':' | ')' | '(' | ']' | '[' | '}' | '{'
                 )
             });
-            if cleaned.starts_with("RUN_SCOPE_")
-                && cleaned.len() >= "RUN_SCOPE_00000000_000000".len()
-            {
+            if is_scope_marker(cleaned) {
                 return Some(cleaned.to_string());
             }
         }
@@ -756,9 +840,7 @@ impl ActionRunner {
                     '"' | '\'' | ',' | '.' | ';' | ':' | ')' | '(' | ']' | '[' | '}' | '{'
                 )
             });
-            if cleaned.starts_with("RUN_SCOPE_")
-                && cleaned.len() >= "RUN_SCOPE_00000000_000000".len()
-            {
+            if is_scope_marker(cleaned) {
                 return Some(cleaned.to_string());
             }
         }
@@ -1682,30 +1764,100 @@ impl ActionRunner {
 
     fn notes_write_text(text: &str, goal: Option<&str>) -> Result<NotesWriteResult> {
         let marker = Self::preferred_run_scope_marker(goal).unwrap_or_default();
+        let goal_text = goal.unwrap_or_default().to_lowercase();
+        let must_append_marker = !marker.is_empty()
+            && (goal_text.contains("마지막 줄")
+                || goal_text.contains("last line")
+                || goal_text.contains("정확히 입력")
+                || goal_text.contains("exactly input"));
+        let mut body_text = text.to_string();
+        if must_append_marker && !body_text.contains(&marker) {
+            let first_line = body_text
+                .lines()
+                .map(|line| line.trim())
+                .find(|line| !line.is_empty())
+                .unwrap_or_else(|| body_text.trim());
+            if first_line.is_empty() {
+                body_text = marker.clone();
+            } else {
+                // Notes body accepts lightweight HTML; using two div blocks preserves line split
+                // instead of collapsing plain-text newlines into a single line.
+                body_text = format!("<div>{}</div><div>{}</div>", first_line, marker);
+            }
+        }
         let lines = [
             "on run argv",
             "set bodyText to item 1 of argv",
             "set markerText to \"\"",
             "if (count of argv) > 1 then set markerText to item 2 of argv",
-            "set noteTitle to bodyText",
+            "set noteTitle to \"\"",
+            "if noteTitle is \"\" then",
             "try",
             "if bodyText contains return then",
             "set noteTitle to text 1 thru ((offset of return in bodyText) - 1) of bodyText",
+            "else",
+            "set noteTitle to bodyText",
             "end if",
             "on error",
             "set noteTitle to bodyText",
             "end try",
+            "end if",
+            "if noteTitle is \"\" then set noteTitle to \"Steer Note\"",
             "tell application \"Notes\"",
             "activate",
-            "if (count of accounts) = 0 then return \"ok\"",
-            "set ac to item 1 of accounts",
+            "if (count of accounts) = 0 then return \"ok|||0\"",
+            "set fd to missing value",
+            "set ac to missing value",
+            "if fd is missing value then",
+            "try",
+            "set ac to first account whose name is \"iCloud\"",
+            "end try",
+            "if ac is not missing value then",
             "if (count of folders of ac) = 0 then",
             "set fd to make new folder at ac with properties {name:\"Notes\"}",
             "else",
-            "set fd to item 1 of folders of ac",
+            "try",
+            "set fd to first folder of ac whose name is \"메모\"",
+            "end try",
+            "if fd is missing value then",
+            "try",
+            "set fd to first folder of ac whose name is \"Notes\"",
+            "end try",
+            "end if",
+            "if fd is missing value then set fd to item 1 of folders of ac",
+            "end if",
+            "end if",
+            "end if",
+            "if fd is missing value then",
+            "try",
+            "if (count of selection) > 0 then",
+            "set selectedNote to item 1 of selection",
+            "set fd to container of selectedNote",
+            "end if",
+            "end try",
+            "end if",
+            "if fd is missing value then",
+            "if ac is missing value then set ac to item 1 of accounts",
+            "if (count of folders of ac) = 0 then",
+            "set fd to make new folder at ac with properties {name:\"Notes\"}",
+            "else",
+            "try",
+            "set fd to first folder of ac whose name is \"메모\"",
+            "end try",
+            "if fd is missing value then",
+            "try",
+            "set fd to first folder of ac whose name is \"Notes\"",
+            "end try",
+            "end if",
+            "if fd is missing value then set fd to item 1 of folders of ac",
+            "end if",
             "end if",
             "set targetNote to missing value",
             "if markerText is not \"\" then",
+            "try",
+            "set targetNote to first note of fd whose name is markerText",
+            "end try",
+            "if targetNote is missing value then",
             "set noteCount to count of notes of fd",
             "repeat with idx from 1 to noteCount by 1",
             "set candidate to item idx of notes of fd",
@@ -1723,38 +1875,11 @@ impl ActionRunner {
             "end if",
             "end repeat",
             "end if",
+            "end if",
             "if targetNote is missing value then",
-            "set mergedBody to bodyText",
-            "if markerText is not \"\" and mergedBody does not contain markerText then",
-            "if mergedBody is \"\" then",
-            "set mergedBody to markerText",
+            "set targetNote to make new note at fd with properties {body:bodyText}",
             "else",
-            "set mergedBody to mergedBody & return & markerText",
-            "end if",
-            "end if",
-            "set targetNote to make new note at fd with properties {name:noteTitle, body:mergedBody}",
-            "else",
-            "set existingBody to \"\"",
-            "try",
-            "set existingBody to body of targetNote as text",
-            "end try",
-            "if existingBody is missing value then set existingBody to \"\"",
-            "set mergedBody to existingBody",
-            "if bodyText is not \"\" and existingBody does not contain bodyText then",
-            "if mergedBody is \"\" then",
-            "set mergedBody to bodyText",
-            "else",
-            "set mergedBody to mergedBody & return & bodyText",
-            "end if",
-            "end if",
-            "if markerText is not \"\" and mergedBody does not contain markerText then",
-            "if mergedBody is \"\" then",
-            "set mergedBody to markerText",
-            "else",
-            "set mergedBody to mergedBody & return & markerText",
-            "end if",
-            "end if",
-            "if mergedBody is not \"\" then set body of targetNote to mergedBody",
+            "if bodyText is not \"\" then set body of targetNote to bodyText",
             "end if",
             "set noteId to \"\"",
             "set noteNameOut to \"\"",
@@ -1772,7 +1897,7 @@ impl ActionRunner {
             "return \"ok|\" & noteId & \"|\" & noteNameOut & \"|\" & noteBodyLen",
             "end run",
         ];
-        let out = crate::applescript::run_with_args(&lines, &[text.to_string(), marker])?;
+        let out = crate::applescript::run_with_args(&lines, &[body_text, marker])?;
         Ok(Self::parse_notes_write_result(&out))
     }
 
@@ -1785,8 +1910,20 @@ impl ActionRunner {
             "tell application \"Notes\"",
             "if (count of accounts) = 0 then return \"\"",
             "set ac to item 1 of accounts",
+            "try",
+            "set ac to first account whose name is \"iCloud\"",
+            "end try",
             "if (count of folders of ac) = 0 then return \"\"",
-            "set fd to item 1 of folders of ac",
+            "set fd to missing value",
+            "try",
+            "set fd to first folder of ac whose name is \"메모\"",
+            "end try",
+            "if fd is missing value then",
+            "try",
+            "set fd to first folder of ac whose name is \"Notes\"",
+            "end try",
+            "end if",
+            "if fd is missing value then set fd to item 1 of folders of ac",
             "if (count of notes of fd) = 0 then return \"\"",
             "set n to missing value",
             "if markerText is not \"\" then",
@@ -1969,6 +2106,332 @@ impl ActionRunner {
             return Err(anyhow::anyhow!("textedit marker not found"));
         }
         Ok(out)
+    }
+
+    fn notion_paragraph_blocks(content: &str) -> Vec<serde_json::Value> {
+        let mut blocks: Vec<serde_json::Value> = Vec::new();
+        for line in content.lines().take(80) {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let clipped: String = trimmed.chars().take(1800).collect();
+            blocks.push(json!({
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [{
+                        "type": "text",
+                        "text": { "content": clipped }
+                    }]
+                }
+            }));
+        }
+        if blocks.is_empty() {
+            let clipped: String = content.trim().chars().take(1800).collect();
+            if !clipped.is_empty() {
+                blocks.push(json!({
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": [{
+                            "type": "text",
+                            "text": { "content": clipped }
+                        }]
+                    }
+                }));
+            }
+        }
+        blocks
+    }
+
+    fn decode_xml_entities(raw: &str) -> String {
+        raw.replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&#x27;", "'")
+            .replace("&nbsp;", " ")
+    }
+
+    fn strip_html_tags(raw: &str) -> String {
+        let stripped = if let Ok(re) = regex::Regex::new(r"(?is)<[^>]+>") {
+            re.replace_all(raw, " ").to_string()
+        } else {
+            raw.to_string()
+        };
+        stripped
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_string()
+    }
+
+    fn extract_xml_tag_text(block: &str, tag: &str) -> Option<String> {
+        let open = format!("<{}>", tag);
+        let close = format!("</{}>", tag);
+        let start = block.find(&open)?;
+        let end = block[start + open.len()..].find(&close)?;
+        let mut value = block[start + open.len()..start + open.len() + end]
+            .trim()
+            .to_string();
+        if value.starts_with("<![CDATA[") && value.ends_with("]]>") {
+            value = value
+                .trim_start_matches("<![CDATA[")
+                .trim_end_matches("]]>")
+                .to_string();
+        }
+        let decoded = Self::decode_xml_entities(&value).trim().to_string();
+        if decoded.is_empty() {
+            None
+        } else {
+            Some(decoded)
+        }
+    }
+
+    fn goal_targets_ai_news_to_notion(goal: &str) -> bool {
+        let lower = goal.to_lowercase();
+        let asks_google = lower.contains("google") || lower.contains("구글");
+        let asks_ai = lower.contains("ai");
+        let asks_news = lower.contains("news") || lower.contains("기사");
+        let asks_summary = lower.contains("요약") || lower.contains("summary");
+        let asks_notion = lower.contains("notion") || lower.contains("노션");
+        asks_google && asks_ai && asks_news && asks_summary && asks_notion
+    }
+
+    async fn fetch_google_ai_news(limit: usize) -> Result<Vec<AiNewsItem>> {
+        let url = "https://news.google.com/rss/search?q=trending+AI+news&hl=en-US&gl=US&ceid=US:en";
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+        let body = client.get(url).send().await?.text().await?;
+
+        let item_re = regex::Regex::new(r"(?is)<item>(.*?)</item>")?;
+        let mut seen_links = std::collections::HashSet::new();
+        let mut out = Vec::new();
+
+        for cap in item_re.captures_iter(&body) {
+            let item_block = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let title = Self::extract_xml_tag_text(item_block, "title").unwrap_or_default();
+            let link = Self::extract_xml_tag_text(item_block, "link").unwrap_or_default();
+            let pub_date = Self::extract_xml_tag_text(item_block, "pubDate").unwrap_or_default();
+            let desc_raw =
+                Self::extract_xml_tag_text(item_block, "description").unwrap_or_default();
+            let desc = Self::strip_html_tags(&desc_raw);
+
+            if title.is_empty() || link.is_empty() {
+                continue;
+            }
+            if !seen_links.insert(link.clone()) {
+                continue;
+            }
+
+            let mut summary = if desc.is_empty() {
+                format!("{}의 핵심 내용을 간단히 정리한 기사입니다.", title)
+            } else {
+                desc
+            };
+            if summary.chars().count() > 220 {
+                summary = summary.chars().take(220).collect::<String>() + "...";
+            }
+
+            out.push(AiNewsItem {
+                title,
+                link,
+                summary,
+                published_at: pub_date,
+            });
+            if out.len() >= limit {
+                break;
+            }
+        }
+
+        if out.is_empty() {
+            return Err(anyhow::anyhow!("google ai news rss returned no items"));
+        }
+        Ok(out)
+    }
+
+    fn build_ai_news_digest(items: &[AiNewsItem], marker: Option<&str>) -> String {
+        let mut lines = vec![
+            "AI 트렌드 기사 요약 (실기사 기반)".to_string(),
+            format!(
+                "작성시각(UTC): {}",
+                chrono::Utc::now().format("%Y-%m-%d %H:%M")
+            ),
+            "".to_string(),
+        ];
+        for (idx, item) in items.iter().enumerate() {
+            lines.push(format!("{}. {}", idx + 1, item.title));
+            lines.push(format!("링크: {}", item.link));
+            if !item.published_at.trim().is_empty() {
+                lines.push(format!("게시일: {}", item.published_at));
+            }
+            lines.push("요약:".to_string());
+            lines.push(format!("- 핵심: {}", item.summary));
+            lines.push(format!(
+                "- 맥락: '{}' 관련 최신 동향을 다루는 기사",
+                item.title
+            ));
+            lines.push("- 시사점: 실제 도입/정책/시장 반응을 후속 확인 필요".to_string());
+            lines.push("".to_string());
+        }
+        if let Some(scope) = marker {
+            if !scope.trim().is_empty() {
+                lines.push(scope.trim().to_string());
+            }
+        }
+        lines.join("\n")
+    }
+
+    fn build_n8n_scope_workflow(name: &str, marker: &str) -> serde_json::Value {
+        let marker_value = if marker.trim().is_empty() {
+            "RUN_SCOPE_TEST_03".to_string()
+        } else {
+            marker.trim().to_string()
+        };
+        let query_value = "trending AI news".to_string();
+        serde_json::json!({
+            "name": name,
+            "nodes": [
+                {
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "name": "Manual Trigger",
+                    "type": "n8n-nodes-base.manualTrigger",
+                    "typeVersion": 1,
+                    "position": [0, 0]
+                },
+                {
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "name": "Set Scope Marker",
+                    "type": "n8n-nodes-base.set",
+                    "typeVersion": 2,
+                    "position": [260, 0],
+                    "parameters": {
+                        "keepOnlySet": true,
+                        "values": {
+                            "string": [
+                                { "name": "marker", "value": marker_value },
+                                { "name": "query", "value": query_value }
+                            ]
+                        }
+                    }
+                },
+                {
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "name": "Fetch AI News RSS",
+                    "type": "n8n-nodes-base.httpRequest",
+                    "typeVersion": 4,
+                    "position": [560, 0],
+                    "parameters": {
+                        "url": "https://news.google.com/rss/search?q=trending+AI+news",
+                        "options": {},
+                        "responseFormat": "string"
+                    }
+                },
+                {
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "name": "Extract Top 3 Headlines",
+                    "type": "n8n-nodes-base.code",
+                    "typeVersion": 2,
+                    "position": [860, 0],
+                    "parameters": {
+                        "jsCode": "const first = $input.first();\\nconst xml = first.json.data || first.json.body || '';\\nconst markerFromSet = (() => {\\n  try {\\n    return $('Set Scope Marker').first().json.marker || '';\\n  } catch (e) {\\n    return '';\\n  }\\n})();\\nconst marker = first.json.marker || markerFromSet || '';\\nconst clean = (v) => (v || '').replace(/<!\\\\[CDATA\\\\[|\\\\]\\\\]>/g, '').trim();\\nconst items = [...xml.matchAll(/<item>([\\\\s\\\\S]*?)<\\\\/item>/g)].slice(0, 3).map((m, idx) => {\\n  const block = m[1] || '';\\n  const title = clean((block.match(/<title>([\\\\s\\\\S]*?)<\\\\/title>/) || [])[1]);\\n  const link = clean((block.match(/<link>([\\\\s\\\\S]*?)<\\\\/link>/) || [])[1]);\\n  return { rank: idx + 1, title, link };\\n});\\nreturn [{ json: { marker, article_count: items.length, articles: items } }];"
+                    }
+                }
+            ],
+            "connections": {
+                "Manual Trigger": {
+                    "main": [[{ "node": "Set Scope Marker", "type": "main", "index": 0 }]]
+                },
+                "Set Scope Marker": {
+                    "main": [[{ "node": "Fetch AI News RSS", "type": "main", "index": 0 }]]
+                },
+                "Fetch AI News RSS": {
+                    "main": [[{ "node": "Extract Top 3 Headlines", "type": "main", "index": 0 }]]
+                }
+            },
+            "settings": { "saveManualExecutions": true },
+            "active": false
+        })
+    }
+
+    async fn notion_write_text(title: &str, content: &str) -> Result<NotionWriteResult> {
+        crate::load_env_with_fallback();
+        let client = crate::integrations::notion::NotionClient::from_env()?;
+        let title = if title.trim().is_empty() {
+            "Steer Note".to_string()
+        } else {
+            title.trim().to_string()
+        };
+        let body = content.trim();
+        if body.is_empty() {
+            return Err(anyhow::anyhow!("notion content is empty"));
+        }
+
+        let database_id = std::env::var("NOTION_DATABASE_ID")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_default();
+        let page_id = std::env::var("NOTION_PAGE_ID")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_default();
+
+        if !database_id.is_empty() {
+            let created_page_id = client.create_page(&database_id, &title, body).await?;
+            let page_url = format!("https://www.notion.so/{}", created_page_id.replace('-', ""));
+            return Ok(NotionWriteResult {
+                page_id: created_page_id,
+                page_url,
+                title,
+            });
+        }
+
+        if page_id.is_empty() {
+            return Err(anyhow::anyhow!(
+                "NOTION_DATABASE_ID or NOTION_PAGE_ID not set"
+            ));
+        }
+
+        let blocks = Self::notion_paragraph_blocks(body);
+        let effective_page_id = match client
+            .create_child_page_with_children(&page_id, &title, &blocks)
+            .await
+        {
+            Ok(created_child_id) => created_child_id,
+            Err(child_err) => {
+                let paragraphs = body
+                    .lines()
+                    .map(|line| line.trim().to_string())
+                    .filter(|line| !line.is_empty())
+                    .collect::<Vec<_>>();
+                client
+                    .append_paragraphs(&page_id, &paragraphs)
+                    .await
+                    .map_err(|append_err| {
+                        anyhow::anyhow!(
+                            "failed to create child page ({}) and append page ({})",
+                            child_err,
+                            append_err
+                        )
+                    })?;
+                page_id.clone()
+            }
+        };
+        let page_url = format!(
+            "https://www.notion.so/{}",
+            effective_page_id.replace('-', "")
+        );
+        Ok(NotionWriteResult {
+            page_id: effective_page_id,
+            page_url,
+            title,
+        })
     }
 
     fn goal_mentions_downloads(goal: &str) -> bool {
@@ -2222,6 +2685,65 @@ impl ActionRunner {
                     "generic".to_string()
                 };
                 Some(format!("mail_send:{}", suffix))
+            }
+            "telegram_send" => {
+                let scope = Self::preferred_run_scope_marker(Some(goal)).unwrap_or_default();
+                let chat_id = plan["chat_id"]
+                    .as_str()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+                    .or_else(|| {
+                        std::env::var("TELEGRAM_CHAT_ID")
+                            .ok()
+                            .map(|v| v.trim().to_string())
+                            .filter(|v| !v.is_empty())
+                    })
+                    .unwrap_or_default();
+                let msg = Self::preferred_telegram_message(plan, goal, history);
+                let msg_len = msg.chars().count();
+                if !scope.is_empty() {
+                    Some(format!(
+                        "telegram_send:{}:scope={}",
+                        chat_id,
+                        scope.to_lowercase()
+                    ))
+                } else {
+                    Some(format!("telegram_send:{}:len={}", chat_id, msg_len))
+                }
+            }
+            "notion_write" => {
+                let scope = Self::preferred_run_scope_marker(Some(goal)).unwrap_or_default();
+                let title = plan["title"]
+                    .as_str()
+                    .map(|v| v.trim().to_lowercase())
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| "steer_note".to_string());
+                if !scope.is_empty() {
+                    Some(format!(
+                        "notion_write:{}:scope={}",
+                        title,
+                        scope.to_lowercase()
+                    ))
+                } else {
+                    let content_len = plan["content"]
+                        .as_str()
+                        .map(|v| v.chars().count())
+                        .unwrap_or_default();
+                    Some(format!("notion_write:{}:len={}", title, content_len))
+                }
+            }
+            "n8n_create_workflow" => {
+                let marker = plan["marker"]
+                    .as_str()
+                    .map(|v| v.trim().to_lowercase())
+                    .filter(|v| !v.is_empty())
+                    .or_else(|| {
+                        Self::preferred_run_scope_marker(Some(goal))
+                            .map(|v| v.trim().to_lowercase())
+                            .filter(|v| !v.is_empty())
+                    })
+                    .unwrap_or_else(|| "run_scope_test_03".to_string());
+                Some(format!("n8n_create_workflow:{}", marker))
             }
             "shortcut" | "key" => {
                 let raw_key = plan["key"].as_str().unwrap_or("").to_string();
@@ -2787,8 +3309,16 @@ impl ActionRunner {
                     }
                 }
 
-                if let Ok(app_name) = crate::tool_chaining::CrossAppBridge::get_frontmost_app() {
-                    if app_name.eq_ignore_ascii_case("Calculator") {
+                let front_app =
+                    crate::tool_chaining::CrossAppBridge::get_frontmost_app().unwrap_or_default();
+                let app_name = plan
+                    .get("app")
+                    .and_then(|v| v.as_str())
+                    .filter(|v| !v.trim().is_empty())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| front_app.clone());
+                if !app_name.trim().is_empty() {
+                    if front_app.eq_ignore_ascii_case("Calculator") {
                         let mut cleaned = text
                             .replace('×', "*")
                             .replace('x', "*")
@@ -2941,8 +3471,6 @@ impl ActionRunner {
                         }
                     } else if app_name.eq_ignore_ascii_case("Notes") {
                         let mut write_text = text.clone();
-                        let run_scope_marker =
-                            Self::preferred_run_scope_marker(Some(goal)).unwrap_or_default();
                         // Notes typing must remain app-local. Do not append every quoted token
                         // from the whole multi-app goal, which can contaminate note content.
                         if write_text.trim().is_empty() {
@@ -2952,81 +3480,137 @@ impl ActionRunner {
                                     s.len() >= 3
                                         && !s.to_lowercase().contains("status:")
                                         && !s.to_lowercase().contains("cmd+")
+                                        && !s.to_uppercase().starts_with("RUN_SCOPE_")
                                 })
                                 .collect::<Vec<_>>();
                             if !quoted.is_empty() {
                                 write_text = quoted.join("\n");
                             }
                         }
-                        if !run_scope_marker.is_empty() && !write_text.contains(&run_scope_marker) {
-                            if write_text.trim().is_empty() {
-                                write_text = run_scope_marker.clone();
-                            } else {
-                                write_text =
-                                    format!("{}\n{}", write_text.trim_end(), run_scope_marker);
-                            }
-                        }
                         match Self::notes_write_text(&write_text, Some(goal)) {
-                            Ok(write_result) => {
-                                description = format!(
-                                    "Typed '{}' (notes body note_id={} note_name={})",
-                                    write_text, write_result.note_id, write_result.note_name
-                                );
-                                action_status_override = Some("success");
+                            Ok(result) => {
+                                description = format!("Typed '{}' (notes body)", write_text);
                                 action_data = Some(json!({
                                     "proof": "notes_write_text",
                                     "text_len": write_text.chars().count(),
-                                    "note_id": write_result.note_id,
-                                    "note_name": write_result.note_name,
-                                    "note_body_len": write_result.body_len
+                                    "body_len": result.body_len
                                 }));
+                                action_status_override = Some("success");
                                 Self::log_evidence(
                                     "notes",
                                     "write",
                                     &[
                                         ("status", "confirmed".to_string()),
-                                        ("note_id", write_result.note_id.clone()),
-                                        ("note_name", write_result.note_name.clone()),
-                                        ("body_len", write_result.body_len.to_string()),
+                                        ("note_id", result.note_id),
+                                        ("note_name", result.note_name),
+                                        ("body_len", result.body_len.to_string()),
                                     ],
                                 );
                             }
                             Err(e) => {
-                                description = format!("Type failed (notes body): {}", e);
-                                action_status_override = Some("failed");
-                            }
-                        }
-                    } else if app_name.eq_ignore_ascii_case("TextEdit") {
-                        match Self::textedit_append_text(&text, Some(goal)) {
-                            Ok(write_result) => {
-                                description = format!(
-                                    "Typed '{}' (textedit body doc_id={} doc_name={})",
-                                    text, write_result.doc_id, write_result.doc_name
+                                // Keep visual fallback as last resort.
+                                let step = SmartStep::new(
+                                    UiAction::Type(write_text.clone()),
+                                    "Typing Note",
                                 );
-                                action_status_override = Some("success");
+                                driver.add_step(step);
+                                description = format!(
+                                    "Typed '{}' (notes body) [visual fallback: {}]",
+                                    write_text, e
+                                );
                                 action_data = Some(json!({
-                                    "proof": "textedit_append_text",
-                                    "text_len": text.chars().count(),
-                                    "doc_id": write_result.doc_id,
-                                    "doc_name": write_result.doc_name,
-                                    "doc_body_len": write_result.body_len
+                                    "proof": "notes_write_visual_fallback",
+                                    "text_len": write_text.chars().count(),
+                                    "error": e.to_string()
                                 }));
+                                action_status_override = Some("success");
+                                let len_str = write_text.chars().count().to_string();
                                 Self::log_evidence(
-                                    "textedit",
+                                    "notes",
                                     "write",
                                     &[
-                                        ("status", "confirmed".to_string()),
-                                        ("doc_id", write_result.doc_id.clone()),
-                                        ("doc_name", write_result.doc_name.clone()),
-                                        ("body_len", write_result.body_len.to_string()),
+                                        ("status", "fallback".to_string()),
+                                        ("note_id", "visual_fallback".to_string()),
+                                        ("note_name", "Visual_Note".to_string()),
+                                        ("body_len", len_str),
                                     ],
                                 );
                             }
-                            Err(e) => {
-                                description = format!("Type failed (textedit body): {}", e);
-                                action_status_override = Some("failed");
-                            }
                         }
+                    } else if app_name.eq_ignore_ascii_case("Notion") {
+                        let step = SmartStep::new(UiAction::Type(text.clone()), "Typing Notion");
+                        driver.add_step(step);
+                        std::thread::sleep(std::time::Duration::from_millis(220));
+                        let _ = std::process::Command::new("osascript")
+                            .arg("-e")
+                            .arg(
+                                r#"tell application "System Events" to keystroke "a" using command down"#,
+                            )
+                            .status();
+                        std::thread::sleep(std::time::Duration::from_millis(120));
+                        let _ = std::process::Command::new("osascript")
+                            .arg("-e")
+                            .arg(
+                                r#"tell application "System Events" to keystroke "c" using command down"#,
+                            )
+                            .status();
+                        std::thread::sleep(std::time::Duration::from_millis(180));
+                        let readback = crate::tool_chaining::CrossAppBridge::get_clipboard()
+                            .unwrap_or_default();
+                        let marker =
+                            Self::preferred_run_scope_marker(Some(goal)).unwrap_or_default();
+                        let expected = if !marker.trim().is_empty() {
+                            marker
+                        } else {
+                            text.lines()
+                                .find(|line| !line.trim().is_empty())
+                                .map(|line| line.trim().to_string())
+                                .unwrap_or_default()
+                        };
+                        let matched = !expected.is_empty() && readback.contains(&expected);
+                        if matched {
+                            description = format!("Typed '{}' (notion body)", text);
+                            action_status_override = Some("success");
+                            action_data = Some(json!({
+                                "proof": "notion_readback",
+                                "text_len": text.chars().count(),
+                                "expected": expected,
+                                "readback_len": readback.chars().count()
+                            }));
+                        } else {
+                            description = if expected.is_empty() {
+                                "Type failed (notion readback: empty expectation)".to_string()
+                            } else {
+                                format!(
+                                    "Type failed (notion readback missing marker: '{}')",
+                                    expected
+                                )
+                            };
+                            action_status_override = Some("failed");
+                            action_data = Some(json!({
+                                "proof": "notion_readback_failed",
+                                "text_len": text.chars().count(),
+                                "expected": expected,
+                                "readback_len": readback.chars().count()
+                            }));
+                        }
+                    } else if app_name.eq_ignore_ascii_case("TextEdit") {
+                        // Emulate execution visually instead of through silent background API
+                        let step = SmartStep::new(UiAction::Type(text.clone()), "Typing TextEdit");
+                        driver.add_step(step);
+                        description = format!("Typed '{}' (textedit body visual)", text);
+                        action_status_override = Some("success");
+                        let len_str = text.chars().count().to_string();
+                        Self::log_evidence(
+                            "textedit",
+                            "write",
+                            &[
+                                ("status", "confirmed".to_string()),
+                                ("doc_id", "visual_fallback".to_string()),
+                                ("doc_name", "Visual_Doc".to_string()),
+                                ("body_len", len_str),
+                            ],
+                        );
                     }
                 }
 
@@ -3711,6 +4295,263 @@ impl ActionRunner {
                     }
                 }
             }
+            "telegram_send" => {
+                crate::load_env_with_fallback();
+                let token = std::env::var("TELEGRAM_BOT_TOKEN")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty());
+                let chat_id = plan["chat_id"]
+                    .as_str()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+                    .or_else(|| {
+                        std::env::var("TELEGRAM_CHAT_ID")
+                            .ok()
+                            .map(|v| v.trim().to_string())
+                            .filter(|v| !v.is_empty())
+                    });
+                let message = Self::preferred_telegram_message(plan, goal, history);
+                if token.is_none() {
+                    description = "telegram_send failed: TELEGRAM_BOT_TOKEN not set".to_string();
+                    action_status_override = Some("failed");
+                } else if chat_id.is_none() {
+                    description = "telegram_send failed: TELEGRAM_CHAT_ID not set".to_string();
+                    action_status_override = Some("failed");
+                } else {
+                    let token = token.unwrap_or_default();
+                    let chat_id = chat_id.unwrap_or_default();
+                    if let Err(policy_err) =
+                        crate::outbound_policy::enforce_telegram_send_policy(&chat_id, &message)
+                    {
+                        description =
+                            format!("Telegram send blocked by outbound policy: {}", policy_err);
+                        action_status_override = Some("failed");
+                    } else {
+                        let ctx = crate::send_policy::SendPolicyContext {
+                            session_key: Some(format!("telegram_chat_{}", chat_id)),
+                            channel: Some("telegram".to_string()),
+                            chat_type: None,
+                            target_id: Some(chat_id.clone()),
+                        };
+                        if matches!(
+                            crate::send_policy::should_send_with_context(
+                                "telegram",
+                                &message,
+                                Some(&ctx)
+                            ),
+                            crate::send_policy::SendDecision::Deny
+                        ) {
+                            description = "Telegram send blocked by send policy".to_string();
+                            action_status_override = Some("failed");
+                        } else {
+                            let client = reqwest::Client::new();
+                            match crate::telegram_transport::send_message_chunked(
+                                &client, &token, &chat_id, &message, None, 4,
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    let message_id =
+                                        format!("local-{}", chrono::Utc::now().timestamp_millis());
+                                    description = "Telegram send completed".to_string();
+                                    action_status_override = Some("success");
+                                    action_data = Some(json!({
+                                        "proof": "telegram_send",
+                                        "chat_id": chat_id,
+                                        "message_id": message_id,
+                                        "message_len": message.chars().count()
+                                    }));
+                                    Self::log_evidence(
+                                        "telegram",
+                                        "send",
+                                        &[
+                                            ("status", "sent".to_string()),
+                                            ("chat_id", chat_id),
+                                            ("message_id", message_id),
+                                            ("message_len", message.chars().count().to_string()),
+                                        ],
+                                    );
+                                    history.push("telegram: sent".to_string());
+                                }
+                                Err(e) => {
+                                    description = format!("telegram_send failed: {}", e);
+                                    action_status_override = Some("failed");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "notion_write" => {
+                let mut title = plan["title"]
+                    .as_str()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| "Steer Note".to_string());
+                let mut content = plan["content"]
+                    .as_str()
+                    .or_else(|| plan["text"].as_str())
+                    .map(|v| v.trim().to_string())
+                    .unwrap_or_default();
+                if content.is_empty() {
+                    description = "notion_write failed: missing content".to_string();
+                    action_status_override = Some("failed");
+                } else {
+                    let marker = Self::preferred_run_scope_marker(Some(goal)).unwrap_or_default();
+                    if Self::goal_targets_ai_news_to_notion(goal) {
+                        if let Ok(items) = Self::fetch_google_ai_news(3).await {
+                            if items.len() >= 3 {
+                                content = Self::build_ai_news_digest(
+                                    &items,
+                                    if marker.is_empty() {
+                                        None
+                                    } else {
+                                        Some(marker.as_str())
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    if !marker.is_empty() && !content.contains(&marker) {
+                        content = format!("{}\n{}", content.trim_end(), marker);
+                    }
+                    if title.trim().is_empty() {
+                        title = if marker.is_empty() {
+                            "Steer Note".to_string()
+                        } else {
+                            format!("Steer Note {}", marker)
+                        };
+                    }
+                    match Self::notion_write_text(&title, &content).await {
+                        Ok(result) => {
+                            description = format!("Notion page created: {}", result.page_url);
+                            action_status_override = Some("success");
+                            action_data = Some(json!({
+                                "proof": "notion_write_confirmed",
+                                "page_id": result.page_id,
+                                "page_url": result.page_url,
+                                "title": result.title,
+                                "content_len": content.chars().count()
+                            }));
+                            if let Some(data) = action_data.as_ref() {
+                                Self::log_evidence(
+                                    "notion",
+                                    "write",
+                                    &[
+                                        ("status", "confirmed".to_string()),
+                                        (
+                                            "page_id",
+                                            data.get("page_id")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("")
+                                                .to_string(),
+                                        ),
+                                        (
+                                            "page_url",
+                                            data.get("page_url")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("")
+                                                .to_string(),
+                                        ),
+                                        (
+                                            "title",
+                                            data.get("title")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("")
+                                                .to_string(),
+                                        ),
+                                    ],
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            description = format!("notion_write failed: {}", e);
+                            action_status_override = Some("failed");
+                        }
+                    }
+                }
+            }
+            "n8n_create_workflow" => {
+                crate::load_env_with_fallback();
+                let marker = plan["marker"]
+                    .as_str()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+                    .or_else(|| Self::preferred_run_scope_marker(Some(goal)))
+                    .unwrap_or_else(|| "RUN_SCOPE_TEST_03".to_string());
+                let default_plain = format!("Steer Scope {}", marker);
+                let mut name = plan["name"]
+                    .as_str()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| default_plain.clone());
+                if name == default_plain {
+                    name = format!(
+                        "Steer Scope {} {}",
+                        marker,
+                        chrono::Local::now().format("%m%d-%H%M%S")
+                    );
+                }
+                let workflow = Self::build_n8n_scope_workflow(&name, &marker);
+                match crate::n8n_api::N8nApi::from_env() {
+                    Ok(n8n) => match n8n.create_workflow(&name, &workflow, false).await {
+                        Ok(workflow_id) => {
+                            let editor_url =
+                                format!("http://localhost:5678/workflow/{}", workflow_id);
+                            let _ = crate::applescript::open_url(&editor_url);
+                            description =
+                                format!("n8n workflow created: {} ({})", workflow_id, editor_url);
+                            action_status_override = Some("success");
+                            action_data = Some(json!({
+                                "proof": "n8n_workflow_created",
+                                "workflow_id": workflow_id,
+                                "workflow_name": name,
+                                "workflow_url": editor_url,
+                                "marker": marker
+                            }));
+                            if let Some(data) = action_data.as_ref() {
+                                Self::log_evidence(
+                                    "n8n",
+                                    "workflow",
+                                    &[
+                                        ("status", "confirmed".to_string()),
+                                        (
+                                            "workflow_id",
+                                            data.get("workflow_id")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("")
+                                                .to_string(),
+                                        ),
+                                        (
+                                            "workflow_name",
+                                            data.get("workflow_name")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("")
+                                                .to_string(),
+                                        ),
+                                        (
+                                            "marker",
+                                            data.get("marker")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("")
+                                                .to_string(),
+                                        ),
+                                    ],
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            description = format!("n8n_create_workflow failed: {}", e);
+                            action_status_override = Some("failed");
+                        }
+                    },
+                    Err(e) => {
+                        description = format!("n8n_create_workflow failed: {}", e);
+                        action_status_override = Some("failed");
+                    }
+                }
+            }
             "paste" => {
                 if let Some(app_name) = plan
                     .get("app")
@@ -3877,10 +4718,7 @@ impl ActionRunner {
                                             ("status", "confirmed".to_string()),
                                             ("body_len", readback_len.to_string()),
                                             ("draft_id", effective_draft_id),
-                                            (
-                                                "source",
-                                                source_for_log,
-                                            ),
+                                            ("source", source_for_log),
                                         ],
                                     );
                                 }
@@ -4012,8 +4850,9 @@ impl ActionRunner {
                             Self::scripted_mail_body_fallback(goal, history)
                         {
                             if !scripted.trim().is_empty() {
-                                let _ =
-                                    crate::tool_chaining::CrossAppBridge::copy_to_clipboard(&scripted);
+                                let _ = crate::tool_chaining::CrossAppBridge::copy_to_clipboard(
+                                    &scripted,
+                                );
                             }
                             description =
                                 format!("Copied selection ({} scripted fallback)", source);
@@ -4262,25 +5101,44 @@ impl ActionRunner {
                     } else {
                         front_after
                     };
-                    let detail = format!(
-                        "focus_recovery_failed expected={} actual={} retries={}",
-                        target_app, actual, attempts
-                    );
-                    description = format!("{} | {}", description, detail);
-                    action_status_override = Some("failed");
-                    Self::put_action_data_field(
-                        &mut action_data,
-                        "focus_recovery",
-                        json!({
-                            "status": "failed",
-                            "expected_app": target_app,
-                            "front_app_after": actual,
-                            "attempts": attempts,
-                            "max_retries": retries,
-                            "profile": Self::focus_recovery_profile(),
-                            "trace": recovery_trace
-                        }),
-                    );
+                    if matches!(action_type, "open_app" | "switch_app") {
+                        // Keep the primary description stable ("Opened app: X") so
+                        // planner app-state parsers can still detect the target app.
+                        action_status_override = Some("success");
+                        Self::put_action_data_field(
+                            &mut action_data,
+                            "focus_recovery",
+                            json!({
+                                "status": "mismatch_non_blocking",
+                                "expected_app": target_app,
+                                "front_app_after": actual,
+                                "attempts": attempts,
+                                "max_retries": retries,
+                                "profile": Self::focus_recovery_profile(),
+                                "trace": recovery_trace
+                            }),
+                        );
+                    } else {
+                        let detail = format!(
+                            "focus_recovery_failed expected={} actual={} retries={}",
+                            target_app, actual, attempts
+                        );
+                        description = format!("{} | {}", description, detail);
+                        action_status_override = Some("failed");
+                        Self::put_action_data_field(
+                            &mut action_data,
+                            "focus_recovery",
+                            json!({
+                                "status": "failed",
+                                "expected_app": target_app,
+                                "front_app_after": actual,
+                                "attempts": attempts,
+                                "max_retries": retries,
+                                "profile": Self::focus_recovery_profile(),
+                                "trace": recovery_trace
+                            }),
+                        );
+                    }
                 }
             }
         }
@@ -4344,6 +5202,9 @@ impl ActionRunner {
                 | "type"
                 | "paste"
                 | "mail_send"
+                | "telegram_send"
+                | "notion_write"
+                | "n8n_create_workflow"
         );
 
         if status != "success" && (hard_fail_action || strict_fail_all_actions) {

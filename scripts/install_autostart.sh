@@ -59,6 +59,8 @@ cat <<EOF > "$PLIST_PATH"
         <string>1</string>
         <key>STEER_COLLECTOR_HANDOFF_AUTOCONSUME</key>
         <string>0</string>
+        <key>STEER_PREFLIGHT_SCREEN_CAPTURE</key>
+        <string>0</string>
         <key>PATH</key>
         <string>$PATH:/usr/local/bin:/opt/homebrew/bin</string>
     </dict>

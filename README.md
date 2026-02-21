@@ -47,13 +47,24 @@ STEER_API_ALLOW_NO_KEY=1 STEER_DISABLE_EVENT_TAP=1 ./target/release/local_os_age
 To build a production-ready application (binary/bundle):
 
 ```bash
-./scripts/build_release.sh
+./scripts/rebuild_and_deploy.sh
 ```
 
 This script automates:
-1.  **Frontend Build**: Compiles React/Vite assets.
-2.  **Core Build**: Compiles Rust sidecar (steer-core).
-3.  **Bundle**: Generates `.app` (macOS) or `.exe` in `desktop/src-tauri/target/release/bundle`.
+1.  **Core Build**: Builds `core/target/release/local_os_agent`.
+2.  **Sidecar Sync**: Copies the latest server binary into `web/src-tauri/binaries/core-aarch64-apple-darwin`.
+3.  **Bundle Build**: Runs `npm run tauri build` from `web/`.
+4.  **Clean Deploy**: Replaces `/Applications/Steer OS.app` and verifies API health.
+
+Runbook: `docs/BUILD_DEPLOY_RUNBOOK.md`
+
+Fast dev loop (no packaging during iteration):
+
+```bash
+./scripts/validate_core_cli.sh --goal "메모장 열어서 박대엽이라고 써줘"
+# then only once at the end:
+./scripts/rebuild_and_deploy.sh
+```
 
 ## 🛡️ Self-Healing
 The agent includes a supervisor script to ensure high availability:
@@ -326,6 +337,50 @@ allowlist 템플릿: `.release-allowlist.example`
 - 시나리오 실행 스크립트는 `RUN_ATTEMPT`와 함께 `RUN_ATTEMPT_JSON|{...}` 구조 로그를 기록
 
 Windows 서비스 실행(`scripts/run_core.ps1`)은 기본값이 `-CollectorImpl rust`입니다.
+
+## 🎬 시연 빠른 실행
+
+```bash
+# 1) 원클릭 시연(사전점검 + 상태정리 + 녹화)
+./scripts/demo_run.sh --preset news_telegram
+
+# 2) 사용자 지정 자연어로 원클릭 시연
+./scripts/demo_run.sh --prompt "오늘 받은 메일 5개 요약해줘"
+
+# 3) 수동 단계로 실행하려면
+./scripts/demo_prep.sh
+./scripts/demo_state_reset.sh
+./scripts/record_demo_preset.sh news_telegram
+```
+
+- 기본값은 **UI 경로 우선**이며(`STEER_DEMO_USE_UI=1`), UI submit 실패 시 fallback 자동 실행은 기본 `OFF`(`STEER_UI_FALLBACK_RUN=0`)입니다.
+- `demo_run.sh`/`demo_ready_check.sh`는 시연 시작 전 `Steer OS` 앱 설치 여부를 먼저 확인합니다.
+- `demo_run.sh`는 기본적으로 core API가 내려가 있으면 자동 기동을 시도합니다(`STEER_DEMO_START_CORE_IF_DOWN=1`, 로그: `scenario_results/demo_videos/core_autostart.log`).
+- 자동 기동 대기 시간은 `STEER_DEMO_CORE_BOOT_TIMEOUT_SEC`(기본 45초)로 조정할 수 있습니다.
+- `demo_ready_check.sh`는 `goal-run` 미지원 코어에서도 legacy goal 경로를 함께 점검해 시연 가능 여부를 판단합니다.
+- `demo_state_reset.sh`는 기본적으로 Finder 포커스 복구 + Mail 초안창 정리 + Notes/TextEdit 중복 창 정리를 수행합니다.
+- `demo_state_reset.sh`의 Notes/TextEdit 정리는 앱을 전면 활성화하지 않고 백그라운드로 창만 정리해 시연 화면 점프를 줄입니다.
+- 필요 시 `STEER_DEMO_RESET_MAIL_OUTGOING=0`, `STEER_DEMO_RESET_NOTES_WINDOWS=0`, `STEER_DEMO_RESET_TEXTEDIT_WINDOWS=0`로 개별 비활성화할 수 있습니다.
+- `record_ui_nl_demo.sh`는 기본적으로 `both`(enter+버튼) 전송을 사용하고, 미감지 시 재시도는 `auto` 모드(enter/button 자동 전환)를 사용합니다.
+- `record_ui_nl_demo.sh`는 단일 실행 락(`/tmp/steer_ui_nl_demo.lock`)을 사용해 중복 녹화 실행을 차단합니다.
+- 기본 재시도 횟수는 3회이며, 재시도 간격은 `STEER_UI_RETRY_INTERVAL_SEC`(시연 기본 4초)로 조정할 수 있습니다.
+- `record_ui_nl_demo.sh`는 시연 기본값으로 `AX` 입력 주입(`STEER_UI_SET_VALUE_MODE=ax`)을 사용하고, 필요 시 입력 검증 재시도(`STEER_UI_INPUT_VERIFY_RETRIES`)를 수행합니다.
+- `type` 폴백은 기본 비활성(`STEER_UI_ENABLE_TYPE_FALLBACK=0`)이며, 한글/비ASCII 프롬프트는 기본적으로 `AX`만 사용합니다.
+- 기본값으로 `STEER_UI_REQUIRE_INPUT_MATCH=1`이 적용되어, UI 입력값이 요청문과 다르면 시연을 중단합니다.
+- 기본값으로 `STEER_UI_ALLOW_INPUT_UNAVAILABLE=0`이 적용되어, 입력 필드 검증이 불가능한 상태를 성공으로 간주하지 않습니다.
+- 기본값으로 `STEER_UI_REQUIRE_RUN_DETECTION=1`이 적용되어, UI에서 실제 run 감지가 안 되면 스크립트를 실패로 종료합니다.
+- 기본값으로 `STEER_UI_REQUIRE_SUCCESS_STATUS=1`이 적용되어, run 감지 후에도 최종 상태가 `completed/success/finished`가 아니면 시연을 실패로 종료합니다.
+- `record_ui_nl_demo.sh`는 시작 시 core status API를 먼저 확인하고, 준비되지 않으면 녹화를 시작하지 않고 즉시 실패합니다(정지 화면 영상 방지).
+- 동시에 다른 작업이 있는 환경에서는 `STEER_UI_MATCH_TASK_RUN_PROMPT=1`(기본)로 같은 프롬프트의 run만 감지합니다.
+- UI 실행 감지는 `task-runs` API를 우선 사용하고, 필요 시 기존 `nl_request_*.log` 감지로 내려갑니다.
+- 필요 시 `STEER_UI_SUBMIT_METHOD=button|enter|both`, `STEER_UI_RETRY_SUBMIT_METHOD=auto|button|enter|both`로 전송 방식을 바꿀 수 있습니다.
+- `STEER_UI_DETECT_WINDOW_SEC`로 UI 제출 후 run 감지 대기 시간을 조정할 수 있습니다(시연 기본 12초).
+- `STEER_UI_MAX_RUN_IDLE_SEC`(시연 기본 25초) 동안 run 상태 변화가 없으면 시연을 `stalled`로 종료해 빈 화면 녹화를 줄입니다.
+- 코어에 `/api/agent/goal/run`이 없어도 런처는 자동으로 legacy(`/api/agent/goal`) 경로로 폴백합니다.
+- 시연 기본값은 과도한 증거 노이즈를 줄이기 위해 `STEER_NODE_CAPTURE_ALL=0`으로 설정됩니다(필요 시 `1`로 재활성화).
+- 텔레그램 추가 이미지 첨부는 기본 0장(`STEER_TELEGRAM_EXTRA_IMAGE_MAX=0`)으로 제한됩니다.
+- 텔레그램 결과는 시연 기본값으로 초간단 요약 모드(`STEER_TELEGRAM_SUPER_COMPACT=1`)를 사용합니다.
+- 출력 파일은 `scenario_results/demo_videos`에 저장됩니다.
 
 ## 📜 라이선스
 
