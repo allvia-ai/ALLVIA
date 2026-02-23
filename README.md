@@ -14,6 +14,7 @@
 | Recommend | `recommend` | 자동화 스크립트 제안 |
 | Control | `control <app> <cmd>` | 앱 내부 제어 |
 | Workflow | `build_workflow <prompt>` | n8n 자동화 생성 |
+| News Digest | `ai_digest [msg]` | n8n 뉴스 Digest 프로그램 트리거 (자연어 토픽) |
 | Exec | `exec <cmd>` | 셸 명령 실행 |
 | Status | `status` | 시스템 리소스 확인 |
 

@@ -167,6 +167,25 @@ impl OpenAILLMClient {
         })
     }
 
+    fn llm_primary_mode() -> Option<String> {
+        env::var("STEER_LLM_PRIMARY")
+            .ok()
+            .map(|v| v.trim().to_lowercase())
+            .filter(|v| !v.is_empty())
+    }
+
+    fn cli_first_enabled() -> bool {
+        matches!(
+            Self::llm_primary_mode().as_deref(),
+            Some("cli")
+                | Some("codex")
+                | Some("gemini")
+                | Some("claude")
+                | Some("local")
+                | Some("llama")
+        )
+    }
+
     fn vision_model(&self) -> String {
         env::var("STEER_VISION_MODEL")
             .ok()
@@ -721,6 +740,14 @@ Output internal monologue in <think>...</think> followed by ONLY valid JSON.
     /// Generic Chat Completion (for Architect/Chat features)
     /// Falls back to CLI LLM chain (Gemini→Codex→llama-server) on 429.
     async fn chat_completion(&self, messages: Vec<Value>) -> Result<String> {
+        if Self::cli_first_enabled() {
+            eprintln!(
+                "ℹ️ [chat_completion] CLI-first mode enabled (STEER_LLM_PRIMARY={}).",
+                Self::llm_primary_mode().unwrap_or_else(|| "cli".to_string())
+            );
+            return crate::cli_llm::fallback_chat_completion(&messages).await;
+        }
+
         let body = json!({
             "model": self.model,
             "messages": messages
@@ -1307,23 +1334,14 @@ Respond with ONE JSON object only.
             sample.join("\n")
         );
 
-        let body = json!({
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": "You are a helpful assistant that analyzes user behavior patterns."},
-                {"role": "user", "content": prompt}
-            ]
-        });
-
-        let res_json = self
-            .post_with_retry("https://api.openai.com/v1/chat/completions", &body)
-            .await?;
-        let content = res_json["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("No analysis generated.")
-            .to_string();
-
-        Ok(content)
+        let messages = vec![
+            json!({
+                "role": "system",
+                "content": "You are a helpful assistant that analyzes user behavior patterns."
+            }),
+            json!({"role": "user", "content": prompt}),
+        ];
+        self.chat_completion(messages).await
     }
 
     async fn recommend_automation(&self, logs: &[String]) -> Result<String> {
@@ -1359,23 +1377,14 @@ Respond with ONE JSON object only.
             sample.join("\n")
         );
 
-        let body = json!({
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": "You are a pragmatic automation engineer. You write safe, effective scripts."},
-                {"role": "user", "content": prompt}
-            ]
-        });
-
-        let res_json = self
-            .post_with_retry("https://api.openai.com/v1/chat/completions", &body)
-            .await?;
-        let content = res_json["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("No recommendation generated.")
-            .to_string();
-
-        Ok(content)
+        let messages = vec![
+            json!({
+                "role": "system",
+                "content": "You are a pragmatic automation engineer. You write safe, effective scripts."
+            }),
+            json!({"role": "user", "content": prompt}),
+        ];
+        self.chat_completion(messages).await
     }
 
     /// Build n8n workflow JSON from user prompt
@@ -1758,39 +1767,11 @@ Output format: Just the intent description in 1-2 sentences.
 
         let log_text = logs.join("\n");
         let user_msg = format!("LOGS:\n{}", log_text);
-
-        let request_body = json!({
-            "model": self.model,
-            "messages": [
-                { "role": "system", "content": system_prompt },
-                { "role": "user", "content": user_msg }
-            ],
-            "temperature": 0.3
-        });
-
-        let body: Value = match self
-            .post_with_retry("https://api.openai.com/v1/chat/completions", &request_body)
-            .await
-        {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!(
-                    "⚠️ [analyze_tendency] OpenAI error: {}. Invoking fallback...",
-                    e
-                );
-                let messages = vec![
-                    json!({"role": "system", "content": system_prompt}),
-                    json!({"role": "user", "content": user_msg}),
-                ];
-                return crate::cli_llm::fallback_chat_completion(&messages).await;
-            }
-        };
-
-        let content = body["choices"][0]["message"]["content"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("No content"))?;
-
-        Ok(content.to_string())
+        let messages = vec![
+            json!({"role": "system", "content": system_prompt}),
+            json!({"role": "user", "content": user_msg}),
+        ];
+        self.chat_completion(messages).await
     }
 
     /// Parse natural language input into a structured command
@@ -1850,9 +1831,16 @@ Return JSON only:
         // Add current user message
         messages.push(json!({ "role": "user", "content": user_input }));
 
+        if Self::cli_first_enabled() {
+            let fallback_res = crate::cli_llm::fallback_chat_completion(&messages).await?;
+            let parsed = recover_json(&fallback_res)
+                .ok_or_else(|| anyhow::anyhow!("Failed to parse JSON from CLI-first fallback"))?;
+            return Ok(parsed);
+        }
+
         let request_body = json!({
             "model": self.model,
-            "messages": messages,
+            "messages": messages.clone(),
             "temperature": 0.1,
             "response_format": { "type": "json_object" }
         });
@@ -1943,12 +1931,40 @@ Guidelines:
             pattern_description, samples_str
         );
 
+        let messages = vec![
+            json!({ "role": "system", "content": system_prompt }),
+            json!({ "role": "user", "content": user_msg }),
+        ];
+
+        if Self::cli_first_enabled() {
+            let fallback_res = crate::cli_llm::fallback_chat_completion(&messages).await?;
+            let parsed: Value = recover_json(&fallback_res)
+                .ok_or_else(|| anyhow::anyhow!("Failed to recover JSON from CLI-first fallback"))?;
+            return Ok(AutomationProposal {
+                title: parsed["title"]
+                    .as_str()
+                    .unwrap_or("Unnamed Workflow")
+                    .to_string(),
+                summary: parsed["summary"].as_str().unwrap_or("").to_string(),
+                trigger: parsed["trigger"].as_str().unwrap_or("manual").to_string(),
+                actions: parsed["actions"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                n8n_prompt: parsed["n8n_prompt"].as_str().unwrap_or("").to_string(),
+                confidence: parsed["confidence"].as_f64().unwrap_or(0.5),
+                evidence: vec![],
+                pattern_id: None,
+            });
+        }
+
         let request_body = json!({
             "model": self.model,
-            "messages": [
-                { "role": "system", "content": system_prompt },
-                { "role": "user", "content": user_msg }
-            ],
+            "messages": messages.clone(),
             "temperature": 0.3,
             "response_format": { "type": "json_object" }
         });
@@ -1963,10 +1979,6 @@ Guidelines:
                     "⚠️ [generate_recommendation] OpenAI error: {}. Invoking fallback...",
                     e
                 );
-                let messages = vec![
-                    json!({"role": "system", "content": system_prompt}),
-                    json!({"role": "user", "content": user_msg}),
-                ];
                 let fallback_res = crate::cli_llm::fallback_chat_completion(&messages).await?;
                 let parsed: Value = recover_json(&fallback_res)
                     .ok_or_else(|| anyhow::anyhow!("Failed to recover JSON from fallback"))?;

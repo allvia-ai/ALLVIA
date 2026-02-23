@@ -12,6 +12,41 @@ fn is_local_port_open(port: u16) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(220)).is_ok()
 }
 
+fn listening_pid_on_port(port: u16) -> Option<u32> {
+    let output = std::process::Command::new("lsof")
+        .args([
+            "-nP",
+            "-iTCP",
+            &format!("127.0.0.1:{}", port),
+            "-sTCP:LISTEN",
+            "-t",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let first = text.lines().next()?.trim();
+    first.parse::<u32>().ok()
+}
+
+fn process_command_line(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let cmd = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if cmd.is_empty() {
+        None
+    } else {
+        Some(cmd)
+    }
+}
+
 fn bundled_core_path() -> Option<std::path::PathBuf> {
     // In the macOS bundle, both `app` and `core` live under Contents/MacOS/.
     // We resolve relative to the current executable to avoid relying on CWD.
@@ -26,12 +61,54 @@ fn bundled_core_path() -> Option<std::path::PathBuf> {
 }
 
 fn ensure_core_running() -> Result<(), String> {
-    // Avoid spawning duplicate servers if something is already bound to the port.
-    if is_local_port_open(5680) {
-        return Ok(());
-    }
-
     let core = bundled_core_path().ok_or_else(|| "bundled_core_not_found".to_string())?;
+
+    // Avoid spawning duplicate servers if something is already bound to the port.
+    // If port owner is not this bundle's core, replace it by default to avoid legacy-core drift.
+    if is_local_port_open(5680) {
+        if let Some(pid) = listening_pid_on_port(5680) {
+            if let Some(cmdline) = process_command_line(pid) {
+                let expected = core.to_string_lossy().to_string();
+                if !cmdline.contains(&expected) {
+                    let replace_foreign = std::env::var("STEER_REPLACE_FOREIGN_CORE")
+                        .ok()
+                        .map(|v| {
+                            matches!(
+                                v.trim().to_ascii_lowercase().as_str(),
+                                "1" | "true" | "yes" | "on"
+                            )
+                        })
+                        .unwrap_or(true);
+                    if replace_foreign {
+                        let _ = std::process::Command::new("kill")
+                            .args(["-TERM", &pid.to_string()])
+                            .status();
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        if is_local_port_open(5680) {
+                            let _ = std::process::Command::new("kill")
+                                .args(["-KILL", &pid.to_string()])
+                                .status();
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                        }
+                        if is_local_port_open(5680) {
+                            return Err(format!(
+                                "foreign_core_still_bound port=5680 pid={} cmd={}",
+                                pid, cmdline
+                            ));
+                        }
+                    } else {
+                        return Ok(());
+                    }
+                } else {
+                    return Ok(());
+                }
+            } else {
+                return Ok(());
+            }
+        } else {
+            return Ok(());
+        }
+    }
 
     // Resolve the .env location: prefer the project core/ directory if it exists,
     // otherwise fall back to the binary's own directory.
@@ -52,6 +129,7 @@ fn ensure_core_running() -> Result<(), String> {
         .env("STEER_LAUNCHED_BY_APP", "1")
         .env("STEER_API_ALLOW_NO_KEY", "1")
         .env("STEER_DISABLE_EVENT_TAP", "1")
+        .env("STEER_DISABLE_ANALYZER", "1")
         .env("STEER_PREFLIGHT_SCREEN_CAPTURE", "0")
         .env("STEER_PREFLIGHT_AX_SNAPSHOT", "0")
         .env("RUST_LOG", "info")
@@ -94,6 +172,24 @@ fn open_artifact_path(path: String) -> Result<String, String> {
     Ok(resolved.to_string_lossy().to_string())
 }
 
+#[tauri::command]
+fn open_external_target(target: String) -> Result<String, String> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return Err("empty_target".to_string());
+    }
+
+    let status = std::process::Command::new("open")
+        .arg(trimmed)
+        .status()
+        .map_err(|e| format!("open_error: {}", e))?;
+    if !status.success() {
+        return Err(format!("open_failed: {}", status));
+    }
+
+    Ok(trimmed.to_string())
+}
+
 fn position_window_bottom_center(window: &tauri::WebviewWindow) {
     if let (Ok(Some(monitor)), Ok(window_size)) = (window.current_monitor(), window.outer_size()) {
         let monitor_size = monitor.size();
@@ -122,7 +218,8 @@ pub fn run() {
             }
 
             // Best-effort: start the bundled core server when launching the app.
-            // If a different core is already running on :5680, we won't override it here.
+            // If a different process is bound on :5680, we replace it by default
+            // (set STEER_REPLACE_FOREIGN_CORE=0 to opt out).
             if let Err(err) = ensure_core_running() {
                 log::warn!("core auto-start skipped: {}", err);
             }
@@ -180,7 +277,10 @@ pub fn run() {
                 api.prevent_close();
             }
         })
-        .invoke_handler(tauri::generate_handler![open_artifact_path])
+        .invoke_handler(tauri::generate_handler![
+            open_artifact_path,
+            open_external_target
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

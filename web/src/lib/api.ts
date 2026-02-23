@@ -4,6 +4,7 @@ import {
     RoutineSchema,
     LogEntrySchema,
     RecommendationSchema,
+    ApproveRecommendationResponseSchema,
     RecommendationMetricsSchema,
     ExecApprovalSchema,
     ExecAllowlistSchema,
@@ -42,6 +43,7 @@ import {
     type Routine,
     type LogEntry,
     type Recommendation,
+    type ApproveRecommendationResponse,
     type RecommendationMetrics,
     type ExecApproval,
     type ExecAllowlistEntry,
@@ -129,8 +131,9 @@ export async function fetchRecommendations(): Promise<Recommendation[]> {
     return z.array(RecommendationSchema).parse(data);
 }
 
-export async function approveRecommendation(id: number): Promise<void> {
-    await api.post(`/recommendations/${id}/approve`, undefined, { timeout: 20000 });
+export async function approveRecommendation(id: number): Promise<ApproveRecommendationResponse> {
+    const { data } = await api.post(`/recommendations/${id}/approve`, undefined, { timeout: 20000 });
+    return ApproveRecommendationResponseSchema.parse(data);
 }
 
 export async function rejectRecommendation(id: number): Promise<void> {
@@ -364,7 +367,8 @@ export async function agentGoalRun(
     if (sessionKey?.trim()) {
         payload.session_key = sessionKey.trim();
     }
-    const { data } = await api.post("/agent/goal/run", payload, { timeout: 300000 });
+    // goal/run now defaults to fast async-ack (202 accepted), so long client waits are unnecessary.
+    const { data } = await api.post("/agent/goal/run", payload, { timeout: 15000 });
     return AgentGoalRunResponseSchema.parse(data);
 }
 

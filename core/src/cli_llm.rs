@@ -7,6 +7,7 @@ use anyhow::{anyhow, Result};
 use log::{debug, warn};
 use serde_json::Value;
 use std::process::Command; // Added missing imports
+use std::time::{Duration, Instant};
 
 // Removed unused imports: Write, Stdio, Duration, FromStr
 
@@ -56,10 +57,19 @@ impl CLILLMClient {
     }
 
     pub fn new(provider: LLMProvider) -> Self {
-        let timeout = std::env::var("STEER_CLI_TIMEOUT")
+        let default_timeout = std::env::var("STEER_CLI_TIMEOUT")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(120);
+        let provider_timeout_key = match provider {
+            LLMProvider::Codex => "STEER_CLI_TIMEOUT_CODEX",
+            LLMProvider::Gemini => "STEER_CLI_TIMEOUT_GEMINI",
+            LLMProvider::Claude => "STEER_CLI_TIMEOUT_CLAUDE",
+        };
+        let timeout = std::env::var(provider_timeout_key)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default_timeout);
 
         Self {
             provider,
@@ -190,8 +200,8 @@ impl CLILLMClient {
         }
 
         // Wait for output
-        debug!("Waiting for output...");
-        let output = child.wait_with_output()?;
+        debug!("Waiting for output (timeout={}s)...", self.timeout_sec);
+        let output = self.wait_with_output_timeout(child)?;
         debug!("Exit Status: {}", output.status);
 
         if !output.status.success() {
@@ -264,6 +274,29 @@ impl CLILLMClient {
         // If simple extraction fails, return raw and let caller try to parse (or fail)
         // But for this function, we return Option
         Some(text.to_string())
+    }
+
+    fn wait_with_output_timeout(&self, mut child: std::process::Child) -> Result<std::process::Output> {
+        let start = Instant::now();
+        let timeout = Duration::from_secs(self.timeout_sec.max(1));
+
+        loop {
+            if child.try_wait()?.is_some() {
+                break;
+            }
+            if start.elapsed() >= timeout {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!(
+                    "CLI timeout (provider={}, timeout={}s)",
+                    self.provider.name(),
+                    self.timeout_sec
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        Ok(child.wait_with_output()?)
     }
 
     /// Execute with base64 image for vision tasks
@@ -375,7 +408,7 @@ impl CLILLMClient {
             }
         }
 
-        let output = child.wait_with_output()?;
+        let output = self.wait_with_output_timeout(child)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

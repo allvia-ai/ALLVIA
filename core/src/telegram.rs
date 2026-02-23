@@ -135,22 +135,24 @@ impl TelegramBot {
                                     let bot_clone = self.clone();
                                     let chat_id = msg.chat.id;
                                     let text_clone = text.clone();
+                                    let route_to_n8n =
+                                        crate::ai_digest::extract_explicit_n8n_request(&text)
+                                            .is_some();
                                     let run_sem = Self::run_semaphore();
                                     let queued = run_sem.available_permits() == 0;
 
                                     // Ack reception
-                                    let ack = if queued {
+                                    let ack = if route_to_n8n {
+                                        "🤖 Command received. Routing to n8n digest..."
+                                    } else if queued {
                                         "🤖 Command received. Queued after current task..."
                                     } else {
                                         "🤖 Command received. Processing..."
                                     };
-                                    let _ = self
-                                        .send_message(chat_id, ack)
-                                        .await
-                                        .map_err(|e| {
-                                            error!("⚠️ Telegram ack send failed: {}", e);
-                                            e
-                                        });
+                                    let _ = self.send_message(chat_id, ack).await.map_err(|e| {
+                                        error!("⚠️ Telegram ack send failed: {}", e);
+                                        e
+                                    });
 
                                     // Spawn agent task
                                     tokio::spawn(async move {
@@ -167,6 +169,48 @@ impl TelegramBot {
                                                 return;
                                             }
                                         };
+
+                                        if let Some(request_text) =
+                                            crate::ai_digest::extract_explicit_n8n_request(
+                                                &text_clone,
+                                            )
+                                        {
+                                            let reply =
+                                                match crate::ai_digest::trigger_program_webhook(
+                                                    &request_text,
+                                                    None,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(result) => {
+                                                        crate::ai_digest::format_human_summary(
+                                                            &result,
+                                                        )
+                                                    }
+                                                    Err(e) => {
+                                                        format!(
+                                                            "❌ n8n digest trigger failed: {}",
+                                                            e
+                                                        )
+                                                    }
+                                                };
+                                            let _ = bot_clone
+                                                .send_message_chunked(chat_id, &reply)
+                                                .await;
+                                            return;
+                                        }
+
+                                        let goal_text = {
+                                            let cleaned =
+                                                crate::ai_digest::strip_local_execution_prefix(
+                                                    &text_clone,
+                                                );
+                                            if cleaned.is_empty() {
+                                                text_clone.clone()
+                                            } else {
+                                                cleaned
+                                            }
+                                        };
                                         let planner = crate::controller::planner::Planner::new(
                                             bot_clone.llm.clone(),
                                             bot_clone.tx_analyzer.clone(),
@@ -176,7 +220,8 @@ impl TelegramBot {
 
                                         match tokio::time::timeout(
                                             Duration::from_secs(timeout_sec),
-                                            planner.run_goal_tracked(&text_clone, Some(&session_key)),
+                                            planner
+                                                .run_goal_tracked(&goal_text, Some(&session_key)),
                                         )
                                         .await
                                         {

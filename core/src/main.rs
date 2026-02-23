@@ -1,7 +1,8 @@
 use local_os_agent::{
-    analyzer, api_server, applescript, bash_executor, db, dependency_check, feedback_collector,
-    integrations, llm_gateway, mcp_client, monitor, orchestrator, pattern_detector, policy,
-    recommendation, recommendation_executor, scheduler, security, workflow_intake,
+    ai_digest, analyzer, api_server, applescript, bash_executor, db, dependency_check,
+    feedback_collector, integrations, llm_gateway, mcp_client, monitor, orchestrator,
+    pattern_detector, policy, recommendation, recommendation_executor, scheduler, security,
+    workflow_intake,
 };
 
 use local_os_agent::env_flag;
@@ -740,7 +741,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 1. Start Native Event Tap (replaces IPC Adapter)
     // [Paranoid Audit] Increased capacity to 1000 to prevent dropping mouse bursts
-    let (log_tx, mut log_rx) = tokio::sync::mpsc::channel::<String>(1000);
+    let (log_tx, log_rx) = tokio::sync::mpsc::channel::<String>(1000);
 
     #[cfg(target_os = "macos")]
     {
@@ -752,18 +753,26 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 2. Start "Shadow Analyzer" (Decoupled Module)
-    // CRITICAL FIX: Always consume log_rx, even without LLM
-    if let Some(c) = llm_client.clone() {
-        analyzer::spawn(log_rx, c);
-    } else {
-        // Fallback: Just save events to DB without LLM analysis
+    // CRITICAL FIX: Always consume log_rx, even when analyzer is disabled.
+    let spawn_event_persist_only = |mut rx: tokio::sync::mpsc::Receiver<String>| {
         tokio::spawn(async move {
-            while let Some(log_json) = log_rx.recv().await {
+            while let Some(log_json) = rx.recv().await {
                 if let Err(e) = db::insert_event(&log_json) {
                     eprintln!("DB insert error: {}", e);
                 }
             }
         });
+    };
+
+    if let Some(c) = llm_client.clone() {
+        if env_flag("STEER_DISABLE_ANALYZER") {
+            spawn_event_persist_only(log_rx);
+            println!("⚠️  Shadow Analyzer disabled via STEER_DISABLE_ANALYZER=1 (events still saved)");
+        } else {
+            analyzer::spawn(log_rx, c);
+        }
+    } else {
+        spawn_event_persist_only(log_rx);
         println!("⚠️  Running in lite mode (no LLM, events still saved)");
     }
 
@@ -841,7 +850,13 @@ async fn main() -> anyhow::Result<()> {
         }
 
         if reader.read_line(&mut buffer).await? == 0 {
-            // EOF - keep server running (headless mode)
+            // Optional test/batch mode: exit on EOF instead of switching to headless API loop.
+            if env_flag("STEER_EXIT_ON_EOF") {
+                println!("👋 EOF received. Exiting by STEER_EXIT_ON_EOF=1.");
+                break;
+            }
+
+            // Default behavior: keep server running in headless mode.
             println!("📡 Running in headless mode (API only)...");
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
@@ -876,6 +891,8 @@ async fn main() -> anyhow::Result<()> {
                 );
                 println!("  analyze_patterns      - Detect behavior patterns and generate recommendations");
                 println!("  quality               - Show workflow quality metrics");
+                println!("  ai_digest [msg]       - Trigger n8n News Digest via program webhook");
+                println!("  news_digest [msg]     - Alias of ai_digest (natural-language topic)");
                 println!("  telegram <msg>        - Send Telegram message");
                 println!("  telegram_listen       - Start Telegram natural-language listener");
                 println!("  notion <title>|<body> - Create Notion page");
@@ -1374,6 +1391,18 @@ async fn main() -> anyhow::Result<()> {
                     Err(e) => println!("❌ Failed to queue workflow recommendation: {}", e),
                 }
             }
+            "ai_digest" | "ai-digest" | "news_digest" | "news-digest" | "digest" => {
+                let request = if parts.len() >= 2 {
+                    parts[1..].join(" ")
+                } else {
+                    ai_digest::default_request_text().to_string()
+                };
+                println!("📰 Triggering news digest workflow...");
+                match ai_digest::trigger_program_webhook(&request, None).await {
+                    Ok(result) => println!("{}", ai_digest::format_human_summary(&result)),
+                    Err(e) => println!("❌ News digest trigger failed: {}", e),
+                }
+            }
             "telegram" => {
                 if parts.len() < 2 {
                     println!("Usage: telegram <message>");
@@ -1612,7 +1641,10 @@ async fn main() -> anyhow::Result<()> {
                 if let Ok(orch) = orchestrator::Orchestrator::new().await {
                     info!("🤖 Super Agent: Processing '{}'...", input);
                     match orch.handle_request(input).await {
-                        Ok(resp) => info!("{}", resp),
+                        Ok(resp) => {
+                            println!("{}", resp);
+                            info!("{}", resp);
+                        }
                         Err(e) => error!("❌ Super Agent Error: {}", e),
                     }
                 } else {

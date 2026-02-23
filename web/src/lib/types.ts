@@ -32,6 +32,18 @@ export const RecommendationSchema = z.object({
     confidence: z.number(),
     evidence: z.array(z.string()).optional(), // [NEW] Explainability
     last_error: z.string().nullable().optional(),
+    workflow_id: z.string().nullable().optional(),
+    workflow_url: z.string().nullable().optional(),
+});
+
+export const ApproveRecommendationResponseSchema = z.object({
+    status: z.string(),
+    id: z.string().nullable().optional(),
+    workflow_id: z.string().nullable().optional(),
+    workflow_url: z.string().nullable().optional(),
+    approved_now: z.boolean().optional(),
+    reused_existing: z.boolean().optional(),
+    message: z.string().optional(),
 });
 
 export const RecommendationMetricsSchema = z.object({
@@ -437,6 +449,7 @@ export type SystemStatus = z.infer<typeof SystemStatusSchema>;
 export type LogEntry = z.infer<typeof LogEntrySchema>;
 export type Routine = z.infer<typeof RoutineSchema>;
 export type Recommendation = z.infer<typeof RecommendationSchema>;
+export type ApproveRecommendationResponse = z.infer<typeof ApproveRecommendationResponseSchema>;
 export type RecommendationMetrics = z.infer<typeof RecommendationMetricsSchema>;
 export type ExecApproval = z.infer<typeof ExecApprovalSchema>;
 export type ExecAllowlistEntry = z.infer<typeof ExecAllowlistSchema>;

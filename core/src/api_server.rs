@@ -6,21 +6,22 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::permission_manager::PermissionManager;
 use crate::{
-    approval_gate, chat_sanitize, collector_pipeline, consistency_check, context_pruning, db,
-    execution_controller, feedback_collector, integrations, intent_router, judgment, llm_gateway,
-    monitor, nl_store, pattern_detector, performance_verification, plan_builder, project_scanner,
-    quality_scorer, recommendation_executor, release_gate, runtime_verification,
-    semantic_verification, slot_filler, tool_result_guard, verification_engine,
-    visual_verification, workflow_intake,
+    ai_digest, approval_gate, chat_sanitize, collector_pipeline, consistency_check,
+    context_pruning, db, execution_controller, feedback_collector, integrations, intent_router,
+    judgment, llm_gateway, monitor, nl_store, pattern_detector, performance_verification,
+    plan_builder, project_scanner, quality_scorer, recommendation_executor, release_gate,
+    runtime_verification, semantic_verification, slot_filler, tool_result_guard,
+    verification_engine, visual_verification, workflow_intake,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use sysinfo::System;
 
@@ -31,9 +32,14 @@ pub struct AppState {
 }
 
 static INFLIGHT_AGENT_EXECUTIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static TELEGRAM_LISTENER_STARTED: OnceLock<AtomicBool> = OnceLock::new();
 
 fn inflight_agent_executions() -> &'static Mutex<HashSet<String>> {
     INFLIGHT_AGENT_EXECUTIONS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn telegram_listener_started_flag() -> &'static AtomicBool {
+    TELEGRAM_LISTENER_STARTED.get_or_init(|| AtomicBool::new(false))
 }
 
 struct AgentExecutionGuard {
@@ -529,6 +535,42 @@ pub struct ChatResponse {
     pub command: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct AiDigestRunRequest {
+    text: Option<String>,
+    scope_marker: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AiDigestRunResponse {
+    ok: bool,
+    scope_marker: String,
+    notion_url: Option<String>,
+    webhook_url: String,
+    status_code: u16,
+    response_text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct NewsSummaryRequest {
+    title: Option<String>,
+    link: Option<String>,
+    source: Option<String>,
+    #[serde(alias = "pubDate")]
+    pub_date: Option<String>,
+    description: Option<String>,
+    scope_marker: Option<String>,
+    telegram_chat_id: Option<String>,
+    article_count: Option<usize>,
+    topic: Option<String>,
+}
+
+#[derive(Serialize)]
+struct NewsSummaryResponse {
+    ok: bool,
+    summary: Value,
+}
+
 #[derive(Serialize)]
 pub struct SystemStatus {
     pub cpu_usage: f32,
@@ -552,6 +594,8 @@ pub struct RecommendationItem {
     pub confidence: f64,
     pub evidence: Vec<String>, // [NEW] Explainability field
     pub last_error: Option<String>,
+    pub workflow_id: Option<String>,
+    pub workflow_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -638,6 +682,23 @@ async fn auth_middleware(
 pub async fn start_api_server(
     llm_client: Option<std::sync::Arc<dyn llm_gateway::LLMClient>>,
 ) -> anyhow::Result<()> {
+    if crate::env_flag("STEER_TELEGRAM_POLLING") {
+        telegram_listener_started_flag().store(true, Ordering::SeqCst);
+    }
+
+    match db::mark_orphaned_inflight_task_runs_failed() {
+        Ok(recovered) if recovered > 0 => {
+            println!(
+                "♻️ Recovered {} orphaned in-flight task run(s) from previous core process.",
+                recovered
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            println!("⚠️ Failed to recover orphaned task runs: {}", e);
+        }
+    }
+
     let state = AppState {
         llm_client,
         current_goal: Arc::new(Mutex::new(None)),
@@ -680,6 +741,8 @@ pub async fn start_api_server(
         // Protected Endpoints (Chat, Execute, Plan, Verify)
         .route("/events", post(ingest_events))
         .route("/api/chat", post(handle_chat))
+        .route("/api/automation/ai-digest", post(run_ai_digest_handler))
+        .route("/api/llm/news-summary", post(run_news_summary_handler))
         .route("/api/recommendations", get(list_recommendations))
         .route(
             "/api/recommendations/:id/approve",
@@ -1996,6 +2059,226 @@ async fn ingest_events(Json(payload): Json<serde_json::Value>) -> Json<serde_jso
     }))
 }
 
+async fn run_ai_digest_handler(Json(req): Json<AiDigestRunRequest>) -> impl IntoResponse {
+    let text = ai_digest::normalize_request_text(req.text.as_deref());
+    match ai_digest::trigger_program_webhook(&text, req.scope_marker).await {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(AiDigestRunResponse {
+                ok: true,
+                scope_marker: result.scope_marker,
+                notion_url: result.notion_url,
+                webhook_url: result.webhook_url,
+                status_code: result.status_code,
+                response_text: result.response_text,
+            }),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "ok": false,
+                "error": err.to_string(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn run_news_summary_handler(
+    State(state): State<AppState>,
+    Json(req): Json<NewsSummaryRequest>,
+) -> impl IntoResponse {
+    let Some(llm) = state.llm_client.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ok": false,
+                "error": "llm_client_not_available",
+            })),
+        )
+            .into_response();
+    };
+
+    let clean = |v: Option<&str>, max_len: usize| -> String {
+        v.unwrap_or("")
+            .trim()
+            .chars()
+            .take(max_len)
+            .collect::<String>()
+    };
+
+    let title = clean(req.title.as_deref(), 220);
+    let link = clean(req.link.as_deref(), 500);
+    let source = clean(req.source.as_deref(), 120);
+    let pub_date = clean(req.pub_date.as_deref(), 120);
+    let description = clean(req.description.as_deref(), 700);
+    let scope_marker = clean(req.scope_marker.as_deref(), 120);
+    let telegram_chat_id = clean(req.telegram_chat_id.as_deref(), 80);
+    let topic = {
+        let t = clean(req.topic.as_deref(), 80);
+        if t.is_empty() {
+            "뉴스".to_string()
+        } else {
+            t
+        }
+    };
+    let article_count = req.article_count.unwrap_or(5).clamp(1, 10);
+    let transparency_note = "원문 접근 제한: RSS title/description 기반 요약";
+
+    let prompt = format!(
+        "당신은 뉴스 요약기입니다. 입력(title/link/source/pubDate/description)만 사용해 요약하세요.\n\
+JSON 객체 하나만 출력하고 코드블록/마크다운/설명문을 추가하지 마세요.\n\
+summary_bullets는 한국어 완결 문장 3~6개로 작성하세요.\n\
+transparency_note에는 반드시 \"{}\"를 포함하세요.\n\n\
+입력:\n\
+- title: {}\n\
+- link: {}\n\
+- source: {}\n\
+- pubDate: {}\n\
+- description: {}\n\n\
+출력 스키마:\n\
+{{\n\
+  \"title\": \"string\",\n\
+  \"link\": \"string\",\n\
+  \"source\": \"string\",\n\
+  \"pubDate\": \"string\",\n\
+  \"summary_bullets\": [\"string\", \"string\", \"string\"],\n\
+  \"why_it_matters\": \"string\",\n\
+  \"keywords\": [\"string\", \"string\", \"string\"],\n\
+  \"transparency_note\": \"string\",\n\
+  \"scope_marker\": \"string\",\n\
+  \"telegram_chat_id\": \"string\",\n\
+  \"article_count\": {}\n\
+}}",
+        transparency_note, title, link, source, pub_date, description, article_count
+    );
+
+    let messages = vec![
+        json!({
+            "role": "system",
+            "content": "Return only one valid JSON object. No markdown."
+        }),
+        json!({
+            "role": "user",
+            "content": prompt
+        }),
+    ];
+
+    let raw = match llm.chat_completion(messages).await {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("llm_chat_completion_failed: {}", err),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let parsed = match llm_gateway::recover_json(&raw) {
+        Some(v) => v,
+        None => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "ok": false,
+                    "error": "llm_output_not_json",
+                    "raw_preview": truncate_log_message(&raw, 300),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let get_str = |k: &str| -> Option<String> {
+        parsed
+            .get(k)
+            .and_then(|v| v.as_str())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+
+    let mut bullets: Vec<String> = parsed
+        .get("summary_bullets")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .take(6)
+                .map(|s| s.chars().take(190).collect::<String>())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if bullets.len() < 3 {
+        let fallback_title = if title.is_empty() {
+            "주요 뉴스".to_string()
+        } else {
+            title.clone()
+        };
+        let fallback_desc = if description.is_empty() {
+            "RSS 본문이 짧아 제목 중심으로 요약했습니다.".to_string()
+        } else {
+            description.chars().take(170).collect::<String>()
+        };
+        bullets = vec![
+            format!("핵심: {}", fallback_title),
+            format!("내용: {}", fallback_desc),
+            format!(
+                "영향: {} 맥락의 후속 의사결정에 참고할 가치가 있습니다.",
+                topic
+            ),
+        ];
+    }
+
+    let mut keywords: Vec<String> = parsed
+        .get("keywords")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .take(3)
+                .map(|s| s.chars().take(30).collect::<String>())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    while keywords.len() < 3 {
+        let filler = match keywords.len() {
+            0 => topic.clone(),
+            1 => "트렌드".to_string(),
+            _ => "요약".to_string(),
+        };
+        keywords.push(filler);
+    }
+
+    let summary = json!({
+        "title": get_str("title").unwrap_or_else(|| title.clone()),
+        "link": get_str("link").unwrap_or_else(|| link.clone()),
+        "source": get_str("source").unwrap_or_else(|| source.clone()),
+        "pubDate": get_str("pubDate").unwrap_or_else(|| pub_date.clone()),
+        "summary_bullets": bullets,
+        "why_it_matters": get_str("why_it_matters").unwrap_or_else(|| format!("이 이슈는 {} 맥락의 실행 우선순위와 전략에 영향을 줄 수 있습니다.", topic)),
+        "keywords": keywords,
+        "transparency_note": transparency_note,
+        "scope_marker": if scope_marker.is_empty() { get_str("scope_marker").unwrap_or_default() } else { scope_marker.clone() },
+        "telegram_chat_id": if telegram_chat_id.is_empty() { get_str("telegram_chat_id").unwrap_or_default() } else { telegram_chat_id.clone() },
+        "article_count": article_count,
+    });
+
+    (
+        StatusCode::OK,
+        Json(NewsSummaryResponse { ok: true, summary }),
+    )
+        .into_response()
+}
+
 async fn handle_chat(
     State(state): State<AppState>,
     Json(req): Json<ChatRequest>,
@@ -2018,7 +2301,7 @@ async fn handle_chat(
     if !sanitized.flags.is_empty() {
         eprintln!("⚠️ Chat sanitize flags: {:?}", sanitized.flags);
     }
-    let message = sanitized.text.trim().to_string();
+    let mut message = sanitized.text.trim().to_string();
     if message.is_empty() {
         return Json(ChatResponse {
             response: "❓ 메시지가 비어있어요. 다시 입력해주세요.".to_string(),
@@ -2030,9 +2313,10 @@ async fn handle_chat(
     if let Err(e) = db::insert_chat_message("user", &message) {
         eprintln!("Failed to save user chat: {}", e);
     }
+    let message_lc = message.to_lowercase();
 
     // 1. Intercept explicit system commands (Bypass LLM)
-    if message == "analyze_patterns" || message == "패턴 분석" {
+    if message_lc == "analyze_patterns" || message == "패턴 분석" {
         let results = run_analysis_internal();
         let response_text = if results.is_empty() {
             "🔍 분석 완료! 새로운 패턴을 찾지 못했습니다.\n(하지만 시연을 위해 데모 항목을 생성했습니다. 오른쪽을 확인하세요!)".to_string()
@@ -2050,8 +2334,79 @@ async fn handle_chat(
         });
     }
 
+    if message_lc == "telegram listener status"
+        || message_lc == "telegram_listen status"
+        || message_lc == "telegram-listen status"
+        || message_lc == "telegram status"
+        || message.contains("텔레그램 리스너 상태")
+    {
+        let active = telegram_listener_started_flag().load(Ordering::SeqCst);
+        return Json(ChatResponse {
+            response: if active {
+                "🤖 Telegram listener 상태: running".to_string()
+            } else {
+                "⚪️ Telegram listener 상태: stopped".to_string()
+            },
+            command: Some("telegram_listener_status".to_string()),
+        });
+    }
+
+    if message_lc == "telegram_listen"
+        || message_lc == "telegram-listen"
+        || message_lc == "telegram listener start"
+        || message_lc == "telegram listen"
+        || message.contains("텔레그램 리스너 시작")
+    {
+        let started_flag = telegram_listener_started_flag();
+        if started_flag.load(Ordering::SeqCst) {
+            return Json(ChatResponse {
+                response: "ℹ️ Telegram listener가 이미 실행 중입니다.".to_string(),
+                command: Some("telegram_listener_start".to_string()),
+            });
+        }
+
+        let llm = match state.llm_client.clone() {
+            Some(v) => v,
+            None => {
+                return Json(ChatResponse {
+                    response: "❌ LLM 클라이언트가 없어 Telegram listener를 시작할 수 없습니다.".to_string(),
+                    command: Some("telegram_listener_start".to_string()),
+                })
+            }
+        };
+        let bot = match crate::telegram::TelegramBot::from_env(llm, None) {
+            Some(v) => v,
+            None => {
+                return Json(ChatResponse {
+                    response: "❌ TELEGRAM_BOT_TOKEN이 없어 listener를 시작할 수 없습니다.".to_string(),
+                    command: Some("telegram_listener_start".to_string()),
+                })
+            }
+        };
+
+        if started_flag
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Json(ChatResponse {
+                response: "ℹ️ Telegram listener가 이미 실행 중입니다.".to_string(),
+                command: Some("telegram_listener_start".to_string()),
+            });
+        }
+
+        tokio::spawn(async move {
+            std::sync::Arc::new(bot).start_polling().await;
+            telegram_listener_started_flag().store(false, Ordering::SeqCst);
+        });
+
+        return Json(ChatResponse {
+            response: "🤖 Telegram listener 시작됨 (long polling)".to_string(),
+            command: Some("telegram_listener_start".to_string()),
+        });
+    }
+
     // Issue #4 Fix: n8n restart command
-    if message == "n8n restart" || message.contains("n8n 재시작") {
+    if message_lc == "n8n restart" || message.contains("n8n 재시작") {
         let api = match crate::n8n_api::N8nApi::from_env() {
             Ok(v) => v,
             Err(e) => {
@@ -2077,21 +2432,46 @@ async fn handle_chat(
         }
     }
 
+    if let Some(n8n_text) = ai_digest::extract_explicit_n8n_request(&message) {
+        match ai_digest::trigger_program_webhook(&n8n_text, None).await {
+            Ok(result) => {
+                let notion_line = result
+                    .notion_url
+                    .clone()
+                    .unwrap_or_else(|| "(웹훅 응답에 notion_url 없음)".to_string());
+                return Json(ChatResponse {
+                    response: format!(
+                        "📰 News Digest 프로그램 트리거 완료\n- scope_marker: {}\n- notion_url: {}\n- webhook: {}",
+                        result.scope_marker, notion_line, result.webhook_url
+                    ),
+                    command: Some("ai_digest_program".to_string()),
+                });
+            }
+            Err(e) => {
+                return Json(ChatResponse {
+                    response: format!("❌ News Digest 트리거 실패: {}", e),
+                    command: Some("ai_digest_program".to_string()),
+                });
+            }
+        }
+    }
+    message = ai_digest::strip_local_execution_prefix(&message);
+
     // 1.5 Local lightweight chat commands (LLM-free).
     // Keep these commands available even when OpenAI quota/network is unavailable.
-    if message == "help" || message == "도움말" || message == "명령어" {
+    if message_lc == "help" || message == "도움말" || message == "명령어" {
         return Json(ChatResponse {
-            response: "💡 바로 실행 가능한 명령:\n• analyze_patterns / 패턴 분석\n• n8n restart / n8n 재시작\n• /capture (화면 분석)\n• system_status / 시스템 상태".to_string(),
+            response: "💡 바로 실행 가능한 명령:\n• analyze_patterns / 패턴 분석\n• n8n restart / n8n 재시작\n• telegram listener start / 텔레그램 리스너 시작\n• telegram listener status / 텔레그램 리스너 상태\n• /n8n 스포츠 뉴스 5개 요약해서 노션에 정리해줘 (명시 n8n)\n• /local 메모장 열고 체크리스트 작성해줘 (로컬 실행 강제)\n• /capture (화면 분석)\n• system_status / 시스템 상태".to_string(),
             command: Some("help_local".to_string()),
         });
     }
-    if message == "안녕" || message == "hello" || message == "hi" {
+    if message == "안녕" || message_lc == "hello" || message_lc == "hi" {
         return Json(ChatResponse {
             response: "👋 안녕하세요! 간단 작업은 바로 실행할 수 있어요.\n원하면 `패턴 분석` 또는 `시스템 상태`라고 입력해보세요.".to_string(),
             command: Some("greeting_local".to_string()),
         });
     }
-    if message == "system_status" || message == "시스템 상태" || message == "코어 상태" {
+    if message_lc == "system_status" || message == "시스템 상태" || message == "코어 상태" {
         let mut rm = monitor::ResourceMonitor::new();
         return Json(ChatResponse {
             response: format!("📊 {}", rm.get_status()),
@@ -2442,6 +2822,40 @@ struct RecQueryParams {
     status: Option<String>,
 }
 
+fn n8n_editor_base_url() -> String {
+    if let Ok(editor) = std::env::var("N8N_EDITOR_URL") {
+        let trimmed = editor.trim().trim_end_matches('/');
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    let api = std::env::var("N8N_API_URL")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "http://localhost:5678/api/v1".to_string());
+
+    for suffix in ["/api/v1", "/api/v2", "/api"] {
+        if let Some(stripped) = api.strip_suffix(suffix) {
+            let candidate = stripped.trim_end_matches('/');
+            if !candidate.is_empty() {
+                return candidate.to_string();
+            }
+        }
+    }
+
+    api
+}
+
+fn workflow_editor_url(workflow_id: &str) -> Option<String> {
+    let trimmed = workflow_id.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(format!("{}/workflow/{}", n8n_editor_base_url(), trimmed))
+}
+
 async fn list_recommendations(
     Query(params): Query<RecQueryParams>,
 ) -> Json<Vec<RecommendationItem>> {
@@ -2463,6 +2877,8 @@ async fn list_recommendations(
                     confidence: r.confidence,
                     evidence: r.evidence, // [NEW] Pass evidence
                     last_error: r.last_error,
+                    workflow_id: r.workflow_id.clone(),
+                    workflow_url: r.workflow_id.as_deref().and_then(workflow_editor_url),
                 })
                 .collect(),
         ),
@@ -2479,10 +2895,14 @@ async fn approve_recommendation(
     match recommendation_executor::approve_and_execute_recommendation(id, state.llm_client.clone())
         .await
     {
-        Ok(outcome) => Ok(Json(serde_json::json!({
+        Ok(outcome) => {
+            let workflow_id = outcome.workflow_id;
+            let workflow_url = workflow_editor_url(&workflow_id);
+            Ok(Json(serde_json::json!({
             "status": "success",
-            "id": outcome.workflow_id,
-            "workflow_id": outcome.workflow_id,
+            "id": workflow_id.clone(),
+            "workflow_id": workflow_id,
+            "workflow_url": workflow_url,
             "approved_now": outcome.approved_now,
             "reused_existing": outcome.reused_existing,
             "message": if outcome.reused_existing {
@@ -2490,7 +2910,8 @@ async fn approve_recommendation(
             } else {
                 "Workflow created successfully"
             }
-        }))),
+        })))
+        }
         Err(e) => {
             let detail = e.to_string();
             let status = if detail.contains("not found") {
@@ -3055,12 +3476,83 @@ async fn run_goal_sync_handler(
             .into_response();
     };
 
+    let _ = db::mark_stale_running_task_runs_finished();
+    let allow_goal_queue = env_truthy_default("STEER_ALLOW_GOAL_QUEUE", false);
+    if !allow_goal_queue {
+        if let Ok(Some(active)) = db::get_latest_inflight_task_run() {
+            return (
+                StatusCode::ACCEPTED,
+                Json(RunGoalResponse {
+                    run_id: active.run_id,
+                    planner_complete: false,
+                    execution_complete: false,
+                    business_complete: false,
+                    status: "busy".to_string(),
+                    summary: Some(format!(
+                        "existing run in progress (status={}). join active run instead of queueing a new one.",
+                        active.status
+                    )),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    let run_id = format!(
+        "surf_{}_{}",
+        chrono::Utc::now().format("%Y%m%d_%H%M%S"),
+        uuid::Uuid::new_v4().simple()
+    );
+    // Pre-register run row so clients can immediately observe status by run_id
+    // even when execution waits on serialized GUI lock.
+    let _ = db::create_task_run(&run_id, "surf_goal", goal, "queued");
+    let spawned_run_id = run_id.clone();
+    let goal_owned = goal.to_string();
+    let session_owned = payload.session_key.clone();
     let planner = crate::controller::planner::Planner::new(llm, None);
-    match planner
-        .run_goal_tracked(goal, payload.session_key.as_deref())
-        .await
-    {
-        Ok(outcome) => (
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result = planner
+            .run_goal_tracked_with_run_id(
+                &spawned_run_id,
+                &goal_owned,
+                session_owned.as_deref(),
+            )
+            .await;
+        let _ = tx.send(result);
+    });
+
+    let wait_for_result = std::env::var("STEER_GOAL_SYNC_WAIT_FOR_RESULT")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    if !wait_for_result {
+        return (
+            StatusCode::ACCEPTED,
+            Json(RunGoalResponse {
+                run_id,
+                planner_complete: false,
+                execution_complete: false,
+                business_complete: false,
+                status: "accepted".to_string(),
+                summary: Some("goal accepted and running asynchronously".to_string()),
+            }),
+        )
+            .into_response();
+    }
+
+    let sync_timeout_sec = std::env::var("STEER_GOAL_SYNC_TIMEOUT_SEC")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30);
+
+    match tokio::time::timeout(std::time::Duration::from_secs(sync_timeout_sec), rx).await {
+        Ok(Ok(Ok(outcome))) => (
             StatusCode::OK,
             Json(RunGoalResponse {
                 run_id: outcome.run_id,
@@ -3072,9 +3564,29 @@ async fn run_goal_sync_handler(
             }),
         )
             .into_response(),
-        Err(e) => (
+        Ok(Ok(Err(e))) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "goal_run_failed", "detail": e.to_string() })),
+        )
+            .into_response(),
+        Ok(Err(_recv_err)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "goal_run_failed", "detail": "planner_channel_closed" })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::ACCEPTED,
+            Json(RunGoalResponse {
+                run_id,
+                planner_complete: false,
+                execution_complete: false,
+                business_complete: false,
+                status: "accepted".to_string(),
+                summary: Some(format!(
+                    "goal still running asynchronously (sync timeout {}s)",
+                    sync_timeout_sec
+                )),
+            }),
         )
             .into_response(),
     }

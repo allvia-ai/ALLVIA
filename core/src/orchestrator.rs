@@ -53,9 +53,13 @@ impl Orchestrator {
 
         // ... (Logic)
 
-        let r = request.to_lowercase();
-        if r.contains("n8n") || r.contains("workflow") || r.contains("daily") || r.contains("every")
-        {
+        let trimmed = request.trim();
+        let r = trimmed.to_lowercase();
+        let first_token = r.split_whitespace().next().unwrap_or("");
+
+        // Workflow routing is explicit-only: /workflow (or /workflow@bot)
+        // Natural-language mentions like "workflow", "n8n", "daily" should not force workflow mode.
+        if first_token == "/workflow" || first_token.starts_with("/workflow@") {
             return Ok(TaskType::Workflow);
         } else if r.contains("click")
             || r.contains("open")
@@ -97,6 +101,18 @@ impl Orchestrator {
 
     async fn handle_workflow_task(&self, request: &str) -> Result<String> {
         println!("   ⚙️  Starting n8n Automation Builder...");
+        let normalized_request = request
+            .trim()
+            .trim_start_matches("/workflow")
+            .trim_start()
+            .trim_start_matches("@")
+            .trim();
+        let workflow_request = if normalized_request.is_empty() {
+            request.trim()
+        } else {
+            normalized_request
+        };
+
         if let Some(mock) = Self::load_mock_workflow_proposal() {
             if !mock.n8n_prompt.trim().is_empty() {
                 return Ok(format!(
@@ -106,12 +122,18 @@ impl Orchestrator {
             }
         }
 
-        // Map Box<dyn Error> to anyhow::Error
-        let proposal = self
-            .llm
-            .propose_workflow(&[request.to_string()])
-            .await
-            .map_err(|e| anyhow::anyhow!("LLM Error: {}", e))?;
+        // If the LLM chain fails, return a deterministic fallback response instead of bubbling an error.
+        let proposal = match self.llm.propose_workflow(&[workflow_request.to_string()]).await {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(format!(
+                    "(n8n Agent Fallback) Workflow intent acknowledged, but LLM generation is temporarily unavailable ({}).\n\
+Request: {}\n\
+Use /workflow <trigger + action> again after CLI/LLM providers recover.",
+                    e, workflow_request
+                ));
+            }
+        };
 
         if !proposal.n8n_prompt.is_empty() {
             return Ok(format!(

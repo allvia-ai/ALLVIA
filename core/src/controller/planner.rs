@@ -6,7 +6,7 @@ use crate::controller::supervisor::Supervisor;
 use crate::db;
 use crate::llm_gateway::LLMClient;
 use crate::schema::EventEnvelope;
-use crate::session_store::{Session, SessionStatus};
+use crate::session_store::{Session, SessionStatus, SessionStep};
 use crate::visual_driver::{SmartStep, VisualDriver};
 use anyhow::Result;
 use chrono::Utc;
@@ -51,6 +51,7 @@ struct RunGoalExecutionSummary {
     step_count: usize,
     failed_steps: usize,
     blocking_failed_steps: usize,
+    blocking_failure_details: Vec<String>,
     mail_send_required: bool,
     mail_send_confirmed: bool,
     notes_write_required: bool,
@@ -172,6 +173,12 @@ impl Planner {
         needles.iter().any(|needle| goal_lower.contains(needle))
     }
 
+    fn normalize_text_for_matching(text: &str) -> String {
+        use unicode_normalization::UnicodeNormalization;
+
+        text.nfkc().collect::<String>().to_lowercase()
+    }
+
     fn goal_requires_mail_send(goal: &str) -> bool {
         let lower = goal.to_lowercase();
         let mentions_mail =
@@ -191,23 +198,133 @@ impl Planner {
         mentions_telegram && mentions_send
     }
 
+    fn infer_news_topic_from_goal(goal: &str) -> String {
+        let lower = goal.to_lowercase();
+        let topic_map: &[(&[&str], &str)] = &[
+            (
+                &[
+                    "스포츠",
+                    "sport",
+                    "nba",
+                    "nfl",
+                    "mlb",
+                    "epl",
+                    "축구",
+                    "야구",
+                    "농구",
+                ],
+                "스포츠",
+            ),
+            (
+                &[
+                    "경제", "금융", "finance", "market", "stock", "주식", "증시", "코인",
+                ],
+                "경제",
+            ),
+            (
+                &[
+                    "정치",
+                    "politic",
+                    "election",
+                    "정부",
+                    "대통령",
+                    "의회",
+                    "외교",
+                ],
+                "정치",
+            ),
+            (&["과학", "science", "연구", "우주"], "과학"),
+            (&["기술", "tech", "it", "startup", "반도체"], "기술"),
+            (&["ai", "인공지능", "머신러닝", "생성형"], "AI"),
+            (
+                &["연예", "엔터", "entertainment", "movie", "music"],
+                "엔터테인먼트",
+            ),
+            (&["건강", "의료", "health", "medicine"], "건강"),
+        ];
+        for (needles, topic) in topic_map.iter().copied() {
+            if needles.iter().any(|needle| lower.contains(needle)) {
+                return topic.to_string();
+            }
+        }
+
+        let compact_topic_re =
+            regex::Regex::new(r"([가-힣A-Za-z0-9+#.&/\-]{2,40})\s*(?:뉴스|기사|헤드라인)").ok();
+        if let Some(re) = compact_topic_re {
+            if let Some(captures) = re.captures(goal) {
+                if let Some(raw) = captures.get(1) {
+                    let candidate = raw
+                        .as_str()
+                        .trim()
+                        .trim_matches(|c: char| c == '"' || c == '\'')
+                        .to_string();
+                    if !candidate.is_empty()
+                        && !["요약", "정리", "선정", "최신", "오늘", "개"]
+                            .iter()
+                            .any(|w| candidate.eq_ignore_ascii_case(w))
+                    {
+                        return candidate;
+                    }
+                }
+            }
+        }
+
+        "latest".to_string()
+    }
+
     fn goal_targets_ai_news_to_notion(goal: &str) -> bool {
         let lower = goal.to_lowercase();
-        let asks_google =
-            lower.contains("google") || lower.contains("구글") || lower.contains("검색");
-        let asks_ai = lower.contains("ai") || lower.contains("인공지능");
         let asks_news = lower.contains("news")
+            || lower.contains("headline")
             || lower.contains("article")
             || lower.contains("기사")
             || lower.contains("트렌드")
+            || lower.contains("헤드라인")
+            || lower.contains("브리핑")
             || lower.contains("trend")
-            || lower.contains("trendy");
+            || lower.contains("digest")
+            || lower.contains("trendy")
+            || lower.contains("뉴스");
         let asks_summary = lower.contains("요약")
             || lower.contains("summar")
             || lower.contains("정리")
+            || lower.contains("선정")
+            || lower.contains("모아")
             || lower.contains("핵심");
         let asks_notion = lower.contains("notion") || lower.contains("노션");
-        asks_google && asks_ai && asks_news && asks_summary && asks_notion
+        asks_news && asks_summary && asks_notion
+    }
+
+    fn goal_targets_todo_summary(goal: &str) -> bool {
+        let lower = Self::normalize_text_for_matching(goal);
+        let asks_todo = Self::goal_contains_any(
+            &lower,
+            &[
+                "todo",
+                "to-do",
+                "task",
+                "tasks",
+                "할 일",
+                "할일",
+                "체크리스트",
+                "업무",
+            ],
+        );
+        let asks_summary_or_list = Self::goal_contains_any(
+            &lower,
+            &[
+                "요약",
+                "정리",
+                "목록",
+                "리스트",
+                "만들",
+                "작성",
+                "summar",
+                "list",
+                "organize",
+            ],
+        );
+        asks_todo && asks_summary_or_list && !Self::goal_targets_ai_news_to_notion(goal)
     }
 
     fn text_staging_app() -> &'static str {
@@ -225,8 +342,11 @@ impl Planner {
     }
 
     fn should_use_deterministic_goal_autoplan(goal: &str) -> bool {
-        let lower = goal.to_lowercase();
+        let lower = Self::normalize_text_for_matching(goal);
         if Self::goal_targets_ai_news_to_notion(goal) {
+            return true;
+        }
+        if Self::goal_targets_todo_summary(goal) {
             return true;
         }
         if lower.contains("n8n") && lower.contains("추천 기능") {
@@ -243,9 +363,9 @@ impl Planner {
             return true;
         }
 
-        let lower = goal.to_lowercase();
         let apps = Self::ordered_apps_in_goal(goal);
         let text_fragments = Self::extract_goal_text_fragments(goal);
+        let inferred_open_app = Self::extract_known_app_from_text(goal);
         let explicit_ops = Self::goal_contains_any(
             &lower,
             &[
@@ -280,6 +400,14 @@ impl Planner {
             return true;
         }
 
+        let simple_open_goal = (apps.len() == 1 || (apps.is_empty() && inferred_open_app.is_some()))
+            && Self::goal_has_open_signal(&lower)
+            && !Self::goal_has_write_signal(&lower)
+            && !Self::goal_has_payload_tokens(goal);
+        if simple_open_goal {
+            return true;
+        }
+
         apps.len() >= 2 && text_fragments.len() >= 2 && explicit_ops
     }
 
@@ -301,6 +429,41 @@ impl Planner {
                 "type",
                 "append",
                 "기록",
+                "escribe",
+                "escribir",
+                "écris",
+                "ecris",
+                "rédige",
+                "redige",
+                "schreib",
+                "書",
+                "入力して",
+                "写",
+                "输入",
+            ],
+        )
+    }
+
+    fn goal_has_open_signal(lower: &str) -> bool {
+        Self::goal_contains_any(
+            lower,
+            &[
+                "open",
+                "launch",
+                "열어",
+                "열고",
+                "실행",
+                "켜",
+                "띄워",
+                "abre",
+                "abrir",
+                "ouvre",
+                "ouvrir",
+                "öffne",
+                "oeffne",
+                "開",
+                "打开",
+                "開啟",
             ],
         )
     }
@@ -551,14 +714,29 @@ impl Planner {
         desc.contains("mail send completed") || desc.contains("(mail sent)")
     }
 
-    fn is_benign_failed_step(step: &crate::session_store::SessionStep) -> bool {
+    fn is_shortcut_permission_failure(step: &SessionStep) -> bool {
+        if step.status == "success" {
+            return false;
+        }
+        if !step.action_type.eq_ignore_ascii_case("shortcut") {
+            return false;
+        }
+        let desc = step.description.to_lowercase();
+        desc.contains("not allowed to send keystrokes")
+            || desc.contains("허용되지 않습니다")
+            || desc.contains("osascript")
+            || desc.contains("system events")
+            || desc.contains("shortcut failed")
+    }
+
+    fn is_benign_failed_step(step: &SessionStep) -> bool {
         if step.status == "success" {
             return false;
         }
         matches!(
             Self::step_mail_send_status(step).as_deref(),
             Some("sent_pending") | Some("no_draft")
-        )
+        ) || Self::is_shortcut_permission_failure(step)
     }
 
     fn summarize_execution(
@@ -596,6 +774,13 @@ impl Planner {
             .iter()
             .filter(|s| s.status != "success" && !Self::is_benign_failed_step(s))
             .count();
+        let blocking_failure_details: Vec<String> = session
+            .steps
+            .iter()
+            .filter(|s| s.status != "success" && !Self::is_benign_failed_step(s))
+            .take(3)
+            .map(|s| format!("{}: {}", s.action_type, s.description))
+            .collect();
         let execution_complete = planner_complete && blocking_failed_steps == 0;
         let mail_send_required = Self::goal_requires_mail_send(goal);
         let notes_write_required = Self::goal_requires_notes_write(goal);
@@ -657,6 +842,7 @@ impl Planner {
             step_count,
             failed_steps,
             blocking_failed_steps,
+            blocking_failure_details,
             mail_send_required,
             mail_send_confirmed,
             notes_write_required,
@@ -713,19 +899,28 @@ impl Planner {
         }
 
         if Self::goal_targets_ai_news_to_notion(goal) {
-            if !Self::history_contains_case_insensitive(history, "trending")
-                || !Self::history_contains_case_insensitive(history, "ai")
-            {
+            let topic = Self::infer_news_topic_from_goal(goal);
+            let search_query = format!("trending {} news", topic);
+            let encoded_query = urlencoding::encode(&search_query).replace("%20", "+");
+            let search_url = format!("https://www.google.com/search?q={}", encoded_query);
+            let topic_lower = topic.to_lowercase();
+            let has_topic_search = history.iter().any(|entry| {
+                let e = entry.to_lowercase();
+                e.contains("google.com/search?q=")
+                    && (topic_lower == "latest" || e.contains(&topic_lower))
+            });
+            if !has_topic_search {
                 return Some(serde_json::json!({
                     "action": "open_url",
-                    "url": "https://www.google.com/search?q=trending+AI+news"
+                    "url": search_url
                 }));
             }
 
-            let summary_header = "AI 트렌드 기사 요약 (자동 생성)";
+            let summary_header = format!("{} 뉴스 기사 요약 (자동 생성)", topic);
             let mut summary_text = format!(
-                "{}\n1) 기사 1: 최신 AI 생태계 동향을 간단히 정리\n2) 기사 2: 생성형 AI 제품/서비스 업데이트 요약\n3) 기사 3: 산업/정책 이슈 핵심 포인트\n작성시각(UTC): {}",
+                "{}\n1) 기사 1: 최신 {} 핵심 이슈 요약\n2) 기사 2: 영향/배경/맥락 정리\n3) 기사 3: 후속 확인 포인트\n작성시각(UTC): {}",
                 summary_header,
+                topic,
                 Utc::now().format("%Y-%m-%d %H:%M")
             );
             if let Some(marker) = Self::goal_run_scope_marker(goal) {
@@ -763,10 +958,57 @@ impl Planner {
                 }));
             }
 
-            if !Self::history_contains_case_insensitive(history, summary_header) {
+            if !Self::history_contains_case_insensitive(history, &summary_header) {
                 return Some(serde_json::json!({
                     "action": "type",
                     "text": summary_text
+                }));
+            }
+
+            return Some(serde_json::json!({ "action": "done" }));
+        }
+
+        if Self::goal_targets_todo_summary(goal) {
+            let target_app =
+                if goal_lower.contains("notes")
+                    || goal_lower.contains("메모")
+                    || goal_lower.contains("노트")
+                {
+                "Notes"
+            } else {
+                Self::text_staging_app()
+            };
+
+            let todo_header = format!("오늘 할 일 체크리스트 ({})", Utc::now().format("%Y-%m-%d"));
+            let todo_text = format!(
+                "{}\n1) 오늘 최우선 작업 1개를 명확한 완료 조건과 함께 적기\n2) 30분 이내 착수 가능한 작업 2개 선정\n3) 지연 위험이 있는 항목 1개와 대응책 작성\n4) 커뮤니케이션 필요한 항목 1개와 담당자 지정\n5) 오늘 마감 전 점검 체크 1회 예약",
+                todo_header
+            );
+
+            let opened_marker = format!("Opened app: {}", target_app);
+            if !Self::history_contains_case_insensitive(history, &opened_marker) {
+                return Some(serde_json::json!({
+                    "action": "open_app",
+                    "name": target_app
+                }));
+            }
+
+            if target_app.eq_ignore_ascii_case("Notes")
+                && !Self::history_contains_case_insensitive(history, "Created new item")
+                && !Self::history_contains_case_insensitive(history, "shortcut 'n'")
+            {
+                return Some(serde_json::json!({
+                    "action": "shortcut",
+                    "key": "n",
+                    "modifiers": ["command"],
+                    "app": "Notes"
+                }));
+            }
+
+            if !Self::history_contains_case_insensitive(history, &todo_header) {
+                return Some(serde_json::json!({
+                    "action": "type",
+                    "text": todo_text
                 }));
             }
 
@@ -1187,24 +1429,50 @@ impl Planner {
     }
 
     fn ordered_apps_in_goal(goal: &str) -> Vec<&'static str> {
-        let goal_lower = goal.to_lowercase();
+        let goal_lower = Self::normalize_text_for_matching(goal);
         let app_aliases = [
             ("calendar", "Calendar"),
             ("캘린더", "Calendar"),
+            ("calendario", "Calendar"),
+            ("カレンダー", "Calendar"),
+            ("日历", "Calendar"),
+            ("google chrome", "Google Chrome"),
+            ("chrome", "Google Chrome"),
+            ("크롬", "Google Chrome"),
+            ("cromo", "Google Chrome"),
+            ("クローム", "Google Chrome"),
+            ("谷歌浏览器", "Google Chrome"),
             ("safari", "Safari"),
+            ("サファリ", "Safari"),
             ("파인더", "Finder"),
             ("finder", "Finder"),
+            ("explorador", "Finder"),
             ("textedit", "TextEdit"),
             ("텍스트에디트", "TextEdit"),
             ("notes", "Notes"),
             ("note", "Notes"),
+            ("노트", "Notes"),
             ("메모장", "Notes"),
             ("메모", "Notes"),
+            ("notas", "Notes"),
+            ("nota", "Notes"),
+            ("notes app", "Notes"),
+            ("メモ", "Notes"),
+            ("ノート", "Notes"),
+            ("笔记", "Notes"),
+            ("記事", "Notes"),
             ("calculator", "Calculator"),
             ("계산기", "Calculator"),
+            ("calculadora", "Calculator"),
+            ("計算機", "Calculator"),
+            ("计算器", "Calculator"),
             ("mail", "Mail"),
             ("이메일", "Mail"),
             ("메일", "Mail"),
+            ("correo", "Mail"),
+            ("email", "Mail"),
+            ("メール", "Mail"),
+            ("邮箱", "Mail"),
         ];
         let mut found: Vec<(usize, &'static str)> = app_aliases
             .iter()
@@ -1705,19 +1973,41 @@ impl Planner {
     }
 
     fn extract_known_app_from_text(text: &str) -> Option<&'static str> {
-        let lower = text.to_lowercase();
-        let aliases: [(&str, &'static str); 13] = [
+        let lower = Self::normalize_text_for_matching(text);
+        let aliases = [
             ("calendar", "Calendar"),
             ("캘린더", "Calendar"),
+            ("calendario", "Calendar"),
+            ("カレンダー", "Calendar"),
+            ("日历", "Calendar"),
+            ("google chrome", "Google Chrome"),
+            ("chrome", "Google Chrome"),
+            ("크롬", "Google Chrome"),
+            ("cromo", "Google Chrome"),
+            ("クローム", "Google Chrome"),
+            ("谷歌浏览器", "Google Chrome"),
             ("notes", "Notes"),
             ("메모", "Notes"),
+            ("노트", "Notes"),
+            ("notas", "Notes"),
+            ("nota", "Notes"),
+            ("メモ", "Notes"),
+            ("ノート", "Notes"),
+            ("笔记", "Notes"),
             ("textedit", "TextEdit"),
             ("mail", "Mail"),
             ("메일", "Mail"),
+            ("correo", "Mail"),
+            ("email", "Mail"),
+            ("メール", "Mail"),
+            ("邮箱", "Mail"),
             ("finder", "Finder"),
             ("safari", "Safari"),
             ("calculator", "Calculator"),
             ("계산기", "Calculator"),
+            ("calculadora", "Calculator"),
+            ("計算機", "Calculator"),
+            ("计算器", "Calculator"),
             ("notion", "Notion"),
             ("노션", "Notion"),
         ];
@@ -2160,6 +2450,120 @@ impl Planner {
             .unwrap_or(default_value)
     }
 
+    fn is_soft_planner_failure(message: &str) -> bool {
+        let lower = message.to_lowercase();
+        lower.contains("timeout")
+            || lower.contains("timed out")
+            || lower.contains("rate limit")
+            || lower.contains("429")
+            || lower.contains("temporar")
+            || lower.contains("network")
+            || lower.contains("connection")
+            || lower.contains("http 5")
+            || lower.contains("service unavailable")
+    }
+
+    fn has_quota_exhaustion_marker(history: &[String]) -> bool {
+        history.iter().any(|line| {
+            let lower = line.to_lowercase();
+            lower.contains("insufficient_quota")
+                || lower.contains("quota")
+                || lower.contains("exhausted your capacity")
+                || lower.contains("rate limit")
+                || lower.contains("429")
+        })
+    }
+
+    async fn recover_plan_after_primary_failure(
+        &self,
+        goal: &str,
+        history: &[String],
+        failure_reason: &str,
+    ) -> Option<serde_json::Value> {
+        let recovery_enabled = Self::env_truthy_default("STEER_PLANNER_TIMEOUT_RECOVERY", true);
+        if !recovery_enabled {
+            return None;
+        }
+
+        let allow_hard_error_recovery = Self::env_truthy("STEER_PLANNER_RECOVER_HARD_ERRORS");
+        if !allow_hard_error_recovery && !Self::is_soft_planner_failure(failure_reason) {
+            return None;
+        }
+
+        let compact_history = history
+            .iter()
+            .rev()
+            .take(16)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n- ");
+
+        let system_prompt = "You are a resilient desktop automation planner.
+Return exactly one JSON object for the next single action.
+Allowed actions: click_visual, click_ref, type, shortcut, read, scroll, open_app, open_url, select_all, copy, paste, read_clipboard, done, wait.
+Rules:
+- Never output markdown or explanation text.
+- If using open_app, include a non-empty name.
+- Prefer the safest action that still moves toward the goal.";
+        let user_prompt = format!(
+            "GOAL: {}\nFAILURE_REASON: {}\nRECENT_HISTORY:\n- {}",
+            goal,
+            failure_reason,
+            if compact_history.is_empty() {
+                "None"
+            } else {
+                &compact_history
+            }
+        );
+
+        let recovery_timeout = Duration::from_secs(Self::env_u64(
+            "STEER_PLANNER_RECOVERY_TIMEOUT_SEC",
+            14,
+        ));
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": system_prompt}),
+            serde_json::json!({"role": "user", "content": user_prompt}),
+        ];
+
+        match tokio::time::timeout(recovery_timeout, self.llm.chat_completion(messages)).await {
+            Ok(Ok(raw)) => {
+                if let Some(parsed) = crate::llm_gateway::recover_json(&raw) {
+                    println!("   🧯 Planner recovery: text-only LLM plan accepted.");
+                    return Some(parsed);
+                }
+                println!("   ⚠️ Planner recovery: text-only output was not valid JSON.");
+            }
+            Ok(Err(e)) => {
+                println!("   ⚠️ Planner recovery: text-only LLM failed: {}", e);
+            }
+            Err(_) => {
+                println!(
+                    "   ⚠️ Planner recovery: text-only LLM timeout after {}s.",
+                    recovery_timeout.as_secs()
+                );
+            }
+        }
+
+        if let Some(fallback_plan) = Self::fallback_plan_from_goal(goal, history) {
+            println!("   🧯 Planner recovery: deterministic fallback plan selected.");
+            return Some(fallback_plan);
+        }
+
+        if let Some(app) = Self::extract_known_app_from_text(goal) {
+            println!(
+                "   🧯 Planner recovery: inferred open_app fallback selected ({}).",
+                app
+            );
+            return Some(serde_json::json!({"action":"open_app","name":app}));
+        }
+
+        println!("   🧯 Planner recovery: default wait action selected.");
+        Some(serde_json::json!({"action":"wait","seconds":1}))
+    }
+
     fn notion_api_ready() -> bool {
         crate::load_env_with_fallback();
         let has_key = std::env::var("NOTION_API_KEY")
@@ -2277,16 +2681,30 @@ impl Planner {
         goal: &str,
         session_key: Option<&str>,
     ) -> Result<RunGoalOutcome> {
-        let _serial_guard = if Self::env_truthy_default("STEER_SERIALIZE_GUI_RUNS", true) {
-            Some(GUI_RUN_SERIAL_LOCK.lock().await)
-        } else {
-            None
-        };
         let run_id = format!(
             "surf_{}_{}",
             Utc::now().format("%Y%m%d_%H%M%S"),
             Uuid::new_v4().simple()
         );
+        self.run_goal_tracked_with_run_id(&run_id, goal, session_key)
+            .await
+    }
+
+    pub async fn run_goal_tracked_with_run_id(
+        &self,
+        run_id: &str,
+        goal: &str,
+        session_key: Option<&str>,
+    ) -> Result<RunGoalOutcome> {
+        let _serial_guard = if Self::env_truthy_default("STEER_SERIALIZE_GUI_RUNS", true) {
+            Some(GUI_RUN_SERIAL_LOCK.lock().await)
+        } else {
+            None
+        };
+        let run_id = run_id.trim().to_string();
+        if run_id.is_empty() {
+            return Err(anyhow::anyhow!("run_id_empty"));
+        }
         if let Ok(cleaned) = db::mark_stale_running_task_runs_finished() {
             if cleaned > 0 {
                 println!(
@@ -2351,6 +2769,7 @@ impl Planner {
                     "step_count": exec_summary.step_count,
                     "failed_steps": exec_summary.failed_steps,
                     "blocking_failed_steps": exec_summary.blocking_failed_steps,
+                    "blocking_failure_details": exec_summary.blocking_failure_details.clone(),
                     "mail_send_required": exec_summary.mail_send_required,
                     "mail_send_confirmed": exec_summary.mail_send_confirmed,
                     "notes_write_required": exec_summary.notes_write_required,
@@ -2468,7 +2887,16 @@ impl Planner {
                     "true",
                     if execution_complete { "true" } else { "false" },
                     execution_complete,
-                    Some("All blocking action steps must be successful (mail send pending/no_draft retries are non-blocking)"),
+                    Some(&{
+                        let mut evidence = String::from(
+                            "All blocking action steps must be successful (mail send pending/no_draft retries + shortcut permission denials are non-blocking)"
+                        );
+                        if !exec_summary.blocking_failure_details.is_empty() {
+                            evidence.push_str(" | failures=");
+                            evidence.push_str(&exec_summary.blocking_failure_details.join(" || "));
+                        }
+                        evidence
+                    }),
                 );
                 let _ = db::record_task_stage_assertion(
                     &run_id,
@@ -2715,12 +3143,26 @@ impl Planner {
         let mut last_read_number: Option<String> = None;
         let mut session_steps: Vec<SmartStep> = Vec::new();
         let mut last_action_by_plan: HashMap<String, String> = HashMap::new();
+        let mut repeated_loop_hits: usize = 0;
         let mut goal_completed = false;
         let mut timing = PlannerTimingStats::default();
+        let run_started = Instant::now();
+        let max_wall_seconds = Self::env_u64("STEER_GOAL_MAX_WALL_SEC", 240);
+        let max_wall_duration = Duration::from_secs(max_wall_seconds.max(30));
+        let max_repeat_loop_hits = Self::env_usize("STEER_MAX_REPEAT_LOOP_HITS", 6).max(2);
+        let max_attempts_per_plan_key = Self::env_usize("STEER_MAX_ATTEMPTS_PER_PLAN_KEY", 12).max(3);
 
         Self::run_standard_cleanup_preset(goal, &mut history).await;
 
         for i in 1..=self.max_steps {
+            if run_started.elapsed() > max_wall_duration {
+                let msg = format!(
+                    "Planner wall timeout after {}s (goal stalled without completion).",
+                    max_wall_duration.as_secs()
+                );
+                history.push(format!("PLANNER_WALL_TIMEOUT: {}", msg));
+                return Err(anyhow::anyhow!(msg));
+            }
             println!("\n🔄 [Step {}/{}] Observing...", i, self.max_steps);
 
             // 1. Capture Screen
@@ -2738,6 +3180,14 @@ impl Planner {
                 .entry(plan_key.clone())
                 .and_modify(|v| *v += 1)
                 .or_insert(1);
+            if *attempt > max_attempts_per_plan_key {
+                let msg = format!(
+                    "Planner exceeded max attempts for same screen state: attempts={} limit={} plan_key={}",
+                    *attempt, max_attempts_per_plan_key, plan_key
+                );
+                history.push(format!("PLAN_ATTEMPT_LIMIT: {}", msg));
+                return Err(anyhow::anyhow!(msg));
+            }
 
             // Preflight: close blocking dialogs
             if heuristics::try_close_front_dialog() {
@@ -2774,7 +3224,8 @@ impl Planner {
                 // Call LLM for Vision Planning
                 let plan_timeout =
                     Duration::from_secs(Self::env_u64("STEER_PLANNER_PLAN_TIMEOUT_SEC", 10));
-                crate::retry_logic::with_retry(&retry_config, "LLM Vision", || async {
+                let primary_result =
+                    crate::retry_logic::with_retry(&retry_config, "LLM Vision", || async {
                     tokio::time::timeout(
                         plan_timeout,
                         self.llm
@@ -2788,7 +3239,32 @@ impl Planner {
                         )
                     })?
                 })
-                .await?
+                .await;
+
+                match primary_result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let err_text = e.to_string();
+                        history.push(format!("PLAN_PRIMARY_FAILED: {}", err_text));
+                        if let Some(recovered) = self
+                            .recover_plan_after_primary_failure(
+                                goal,
+                                &history_with_context,
+                                &err_text,
+                            )
+                            .await
+                        {
+                            if let Some(action) = recovered["action"].as_str() {
+                                history.push(format!("PLAN_RECOVERY_ACTION: {}", action));
+                            } else {
+                                history.push("PLAN_RECOVERY_ACTION: unknown".to_string());
+                            }
+                            recovered
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                }
             };
             let plan_elapsed = plan_started.elapsed();
             timing.record_plan(plan_elapsed);
@@ -2853,8 +3329,10 @@ impl Planner {
                             "STEER_PLANNER_SUPERVISOR_TIMEOUT_SEC",
                             6,
                         ));
-                        let supervisor_decision =
-                            crate::retry_logic::with_retry(&retry_config, "Supervisor", || async {
+                        let supervisor_result = crate::retry_logic::with_retry(
+                            &retry_config,
+                            "Supervisor",
+                            || async {
                                 tokio::time::timeout(
                                     supervisor_timeout,
                                     Supervisor::consult(&*self.llm, goal, &plan, &history),
@@ -2866,19 +3344,42 @@ impl Planner {
                                         supervisor_timeout.as_secs()
                                     )
                                 })?
-                            })
-                            .await?;
-
-                        println!(
-                            "   🕵️ Supervisor: {} ({})",
-                            supervisor_decision.action, supervisor_decision.reason
-                        );
-
-                        (
-                            supervisor_decision.action,
-                            supervisor_decision.reason,
-                            supervisor_decision.notes,
+                            },
                         )
+                        .await;
+
+                        match supervisor_result {
+                            Ok(supervisor_decision) => {
+                                println!(
+                                    "   🕵️ Supervisor: {} ({})",
+                                    supervisor_decision.action, supervisor_decision.reason
+                                );
+                                (
+                                    supervisor_decision.action,
+                                    supervisor_decision.reason,
+                                    supervisor_decision.notes,
+                                )
+                            }
+                            Err(e) => {
+                                let err_text = e.to_string();
+                                let fail_open =
+                                    Self::env_truthy_default("STEER_SUPERVISOR_FAIL_OPEN", true);
+                                if fail_open && Self::is_soft_planner_failure(&err_text) {
+                                    println!(
+                                        "   🧯 Supervisor fail-open: {}",
+                                        err_text
+                                    );
+                                    history.push(format!("SUPERVISOR_FAIL_OPEN: {}", err_text));
+                                    (
+                                        "accept".to_string(),
+                                        "supervisor_fail_open".to_string(),
+                                        err_text,
+                                    )
+                                } else {
+                                    return Err(e);
+                                }
+                            }
+                        }
                     };
                 let supervisor_elapsed = supervisor_started.elapsed();
                 timing.record_supervisor(supervisor_elapsed);
@@ -3092,12 +3593,31 @@ impl Planner {
                     "   🔄 LOOP DETECTED. Recording context and retrying with same action family."
                 );
                 history.push(format!("LOOP_DETECTED: repeated_plan={}", action_str));
+                repeated_loop_hits += 1;
+                if repeated_loop_hits >= max_repeat_loop_hits {
+                    let msg = format!(
+                        "Planner aborted due to repeated loop detections (hits={} limit={}).",
+                        repeated_loop_hits, max_repeat_loop_hits
+                    );
+                    history.push(format!("LOOP_ABORTED: {}", msg));
+                    return Err(anyhow::anyhow!(msg));
+                }
+            } else {
+                repeated_loop_hits = 0;
             }
             action_history.push(action_str.clone());
             last_action_by_plan.insert(
                 plan_key.clone(),
                 plan["action"].as_str().unwrap_or("unknown").to_string(),
             );
+
+            if plan["action"].as_str() == Some("wait")
+                && Self::has_quota_exhaustion_marker(&history)
+            {
+                let msg = "Planner aborted: provider quota/rate-limit detected and wait-loop suppressed.";
+                history.push(format!("QUOTA_ABORTED: {}", msg));
+                return Err(anyhow::anyhow!(msg));
+            }
 
             if plan["action"].as_str() == Some("done") {
                 if node_capture_enabled {
@@ -3256,6 +3776,8 @@ impl Planner {
 mod tests {
     use super::Planner;
     use crate::session_store::Session;
+    use chrono::Utc;
+    use unicode_normalization::UnicodeNormalization;
 
     fn base_session(goal: &str) -> Session {
         Session::new(goal, Some("planner_test"))
@@ -3302,6 +3824,35 @@ mod tests {
         assert!(summary.planner_complete);
         assert!(!summary.execution_complete);
         assert!(!summary.business_complete);
+    }
+
+    #[test]
+    fn summarize_execution_treats_shortcut_permission_failure_as_non_blocking() {
+        let goal = "노트에서 최근 TODO 정리해줘";
+        let mut session = base_session(goal);
+        session.add_step("open_app", "Opened app: Notes", "success", None);
+        session.add_step(
+            "shortcut",
+            "Shortcut 'n' + [\"command\"] | driver execution failed: Shortcut Failed: AppleScript Error: not allowed to send keystrokes (1002)",
+            "failed",
+            None,
+        );
+        session.add_step("type", "Typed '오늘 할 일 5개 정리'", "success", None);
+        let history = vec![
+            "Opened app: Notes".to_string(),
+            "Typed '오늘 할 일 5개 정리'".to_string(),
+        ];
+
+        let summary = Planner::summarize_execution(
+            goal,
+            &session,
+            &history,
+            true,
+            &super::PlannerTimingStats::default(),
+        );
+        assert!(summary.execution_complete);
+        assert!(summary.business_complete);
+        assert_eq!(summary.blocking_failed_steps, 0);
     }
 
     #[test]
@@ -3585,9 +4136,88 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_autoplan_enabled_for_simple_korean_notes_open() {
+        let goal = "노트 열어줘봐";
+        assert!(Planner::should_use_deterministic_goal_autoplan(goal));
+    }
+
+    #[test]
+    fn deterministic_autoplan_enabled_for_nfd_korean_notes_open() {
+        let goal_nfd: String = "노트 열어줘봐".nfd().collect();
+        assert!(Planner::should_use_deterministic_goal_autoplan(&goal_nfd));
+    }
+
+    #[test]
+    fn soft_planner_failure_detects_timeout_and_rate_limit() {
+        assert!(Planner::is_soft_planner_failure(
+            "planner plan_vision_step timeout after 20s"
+        ));
+        assert!(Planner::is_soft_planner_failure(
+            "HTTP 429 rate limit exceeded"
+        ));
+    }
+
+    #[test]
+    fn soft_planner_failure_ignores_schema_error() {
+        assert!(!Planner::is_soft_planner_failure(
+            "SCHEMA_ERROR: missing required key"
+        ));
+    }
+
+    #[test]
+    fn goal_has_open_signal_supports_multilingual_variants() {
+        assert!(Planner::goal_has_open_signal("abre notes por favor"));
+        assert!(Planner::goal_has_open_signal("ouvre notes"));
+        assert!(Planner::goal_has_open_signal("メモを開いて"));
+        assert!(Planner::goal_has_open_signal("打开 notes"));
+    }
+
+    #[test]
     fn deterministic_autoplan_enabled_for_ai_news_to_notion_goal() {
         let goal = "구글에서 현재가장 트렌디한 ai 관련 기사 찾아서 llm 으로 요약한후 노션에 정리";
         assert!(Planner::should_use_deterministic_goal_autoplan(goal));
+    }
+
+    #[test]
+    fn deterministic_autoplan_enabled_for_sports_news_to_notion_goal() {
+        let goal = "스포츠 뉴스 5개 선정해서 노션에 정리해줘";
+        assert!(Planner::should_use_deterministic_goal_autoplan(goal));
+    }
+
+    #[test]
+    fn deterministic_autoplan_enabled_for_todo_summary_goal() {
+        let goal = "노트에 오늘 할 일 5개 정리해줘";
+        assert!(Planner::should_use_deterministic_goal_autoplan(goal));
+    }
+
+    #[test]
+    fn fallback_plan_todo_summary_notes_flow_order() {
+        let goal = "노트에 오늘 할 일 5개 정리해줘";
+
+        let step1 = Planner::fallback_plan_from_goal(goal, &[]).unwrap();
+        assert_eq!(step1["action"].as_str(), Some("open_app"));
+        assert_eq!(step1["name"].as_str(), Some("Notes"));
+
+        let history_after_open = vec!["Opened app: Notes".to_string()];
+        let step2 = Planner::fallback_plan_from_goal(goal, &history_after_open).unwrap();
+        assert_eq!(step2["action"].as_str(), Some("shortcut"));
+        assert_eq!(step2["key"].as_str(), Some("n"));
+
+        let history_after_shortcut = vec![
+            "Opened app: Notes".to_string(),
+            "Shortcut 'n' + [\"command\"] (Created new item)".to_string(),
+        ];
+        let step3 = Planner::fallback_plan_from_goal(goal, &history_after_shortcut).unwrap();
+        assert_eq!(step3["action"].as_str(), Some("type"));
+
+        let todo_header = format!("오늘 할 일 체크리스트 ({})", Utc::now().format("%Y-%m-%d"));
+        let history_after_type = vec![
+            "Opened app: Notes".to_string(),
+            "Shortcut 'n' + [\"command\"] (Created new item)".to_string(),
+            format!("Typed '{}'", todo_header),
+        ];
+        let step4 = Planner::fallback_plan_from_goal(goal, &history_after_type).unwrap();
+        assert_eq!(step4["action"].as_str(), Some("done"));
     }
 
     #[test]
@@ -3609,7 +4239,7 @@ mod tests {
             assert!(step2["content"]
                 .as_str()
                 .unwrap_or("")
-                .contains("AI 트렌드 기사 요약"));
+                .contains("AI 뉴스 기사 요약"));
             let history_after_notion_write = vec![
                 "Opened URL 'https://www.google.com/search?q=trending+AI+news'".to_string(),
                 "Notion page created: https://www.notion.so/abcd1234".to_string(),
@@ -3639,8 +4269,18 @@ mod tests {
             assert!(step4["text"]
                 .as_str()
                 .unwrap_or("")
-                .contains("AI 트렌드 기사 요약"));
+                .contains("AI 뉴스 기사 요약"));
         }
+    }
+
+    #[test]
+    fn fallback_plan_sports_news_to_notion_uses_topic_search() {
+        let goal = "스포츠 뉴스 5개 선정해서 노션에 정리해줘";
+        let step1 = Planner::fallback_plan_from_goal(goal, &[]).unwrap();
+        assert_eq!(step1["action"].as_str(), Some("open_url"));
+        let url = step1["url"].as_str().unwrap_or("");
+        assert!(url.contains("google.com/search?q="));
+        assert!(url.contains("%EC%8A%A4%ED%8F%AC%EC%B8%A0") || url.contains("sports"));
     }
 
     #[test]

@@ -1,0 +1,518 @@
+{
+  "id": "tkp0wG55OEfNqzSb",
+  "name": "AI Digest — Telegram → Notion (5 news) — Steer",
+  "active": true,
+  "nodes": [
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "scope_marker",
+              "type": "string",
+              "value": "={{$json.scope_marker || $json.body?.scope_marker || (\"RUN_SCOPE_TELEGRAM_AI_DIGEST_\" + $now.toFormat(\"yyyyLLdd_HHmmss\"))}}"
+            },
+            {
+              "id": "a2",
+              "name": "request_text",
+              "type": "string",
+              "value": "={{$json.request_text || $json.body?.request_text || $json.body?.text || $json.query?.text || $json.message?.text || \"\"}}"
+            },
+            {
+              "id": "a3",
+              "name": "telegram_chat_id",
+              "type": "string",
+              "value": "={{$json.telegram_chat_id || $json.body?.telegram_chat_id || $json.body?.chat_id || $json.query?.telegram_chat_id || $json.message?.chat?.id || \"\"}}"
+            },
+            {
+              "id": "a4",
+              "name": "telegram_update_id",
+              "type": "string",
+              "value": "={{$json.telegram_update_id || $json.update_id || $json.body?.telegram_update_id || \"\"}}"
+            },
+            {
+              "id": "a5",
+              "name": "request_source",
+              "type": "string",
+              "value": "={{$json.request_source || ($json.message ? \"telegram\" : \"program\")}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "n2",
+      "name": "Set Scope Marker",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        450,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const inItem = $input.first().json;\nconst rawText = String(inItem.request_text || '').trim();\nconst text = rawText || '뉴스 요약';\nconst defaults = { article_count: 5, topic: '최신 이슈', include_youtube: true };\n\nlet articleCount = defaults.article_count;\nconst countMatch = text.match(/(\\d{1,2})\\s*개/) || text.match(/\\b(?:top|latest)\\s*(\\d{1,2})\\b/i);\nif (countMatch) {\n  const raw = Number(countMatch[countMatch.length - 1]);\n  if (Number.isFinite(raw)) articleCount = Math.max(1, Math.min(10, raw));\n}\n\nconst normalizeTopic = (value) => String(value || '')\n  .replace(/^[\"'`]+|[\"'`]+$/g, '')\n  .replace(/\\s+/g, ' ')\n  .replace(/^(관련|주제)\\s*/i, '')\n  .replace(/\\s*(뉴스|기사|소식|헤드라인|digest|summary|briefing?)\\s*$/i, '')\n  .trim()\n  .slice(0, 80);\n\nconst inferTopic = (input) => {\n  const s = String(input || '').trim();\n  if (!s) return defaults.topic;\n\n  const explicit = s.match(/(?:주제|topic)\\s*[:=]?\\s*([^\\n,.]+)/i);\n  if (explicit && explicit[1]) {\n    const value = normalizeTopic(explicit[1]);\n    if (value) return value;\n  }\n\n  const compactKr = s.match(/([가-힣A-Za-z0-9+#.&/\\-]{2,40})\\s*(?:뉴스|기사|헤드라인)/i);\n  if (compactKr && compactKr[1]) {\n    const candidate = normalizeTopic(compactKr[1]);\n    if (candidate && !/(요약|정리|선정|최신|오늘|개)$/i.test(candidate)) return candidate;\n  }\n\n  const englishNews = s.match(/(?:news|headlines?)\\s*(?:about|on|for)?\\s*([a-z0-9+#.&/\\- ]{2,50})/i);\n  if (englishNews && englishNews[1]) {\n    const candidate = normalizeTopic(englishNews[1]);\n    if (candidate) return candidate;\n  }\n\n  const categories = [\n    { re: /(스포츠|sport|nba|nfl|mlb|epl|축구|야구|농구|테니스|골프|올림픽)/i, topic: '스포츠' },\n    { re: /(경제|금융|finance|market|stock|증시|주식|코인|crypto|환율)/i, topic: '경제' },\n    { re: /(정치|politic|election|정부|대통령|의회|외교)/i, topic: '정치' },\n    { re: /(과학|science|우주|연구|논문)/i, topic: '과학' },\n    { re: /(기술|tech|it|startup|반도체|플랫폼)/i, topic: '기술' },\n    { re: /(ai|인공지능|머신러닝|생성형)/i, topic: 'AI' },\n    { re: /(엔터|연예|entertainment|movie|music|드라마)/i, topic: '엔터테인먼트' },\n    { re: /(건강|의료|health|medicine|바이오)/i, topic: '건강' },\n  ];\n\n  for (const c of categories) {\n    if (c.re.test(s)) return c.topic;\n  }\n\n  const stopWords = new Set([\n    '뉴스', '기사', '요약', '정리', '선정', '노션', '유튜브', '링크', '포함', '제외',\n    '해줘', '해주세요', '보내줘', '줘', '하고', '그리고', 'please', 'summarize', 'summary',\n    'digest', 'top', 'latest', 'to', 'in', 'on', 'for', 'the', 'a', 'an', 'news', 'headlines',\n  ]);\n\n  const tokens = s\n    .replace(/[^\\p{L}\\p{N}\\s+#.&/\\-]/gu, ' ')\n    .split(/\\s+/)\n    .map((t) => t.trim())\n    .filter((t) => t.length >= 2 && !stopWords.has(t.toLowerCase()));\n\n  if (tokens.length) {\n    return normalizeTopic(tokens.slice(0, 3).join(' ')) || defaults.topic;\n  }\n\n  return defaults.topic;\n};\n\nconst topic = inferTopic(text) || defaults.topic;\nconst includeYoutube = !/(유튜브\\s*(제외|빼|없)|without\\s+youtube|youtube\\s*off)/i.test(text);\nconst hasKorean = /[가-힣]/.test(`${topic} ${text}`);\n\nreturn [{\n  json: {\n    ...inItem,\n    request_text: text,\n    article_count: articleCount,\n    topic,\n    topic_label: topic,\n    topic_query: `${topic}${hasKorean ? ' 뉴스' : ' news'}`.trim(),\n    include_youtube: includeYoutube,\n    hl: hasKorean ? 'ko' : 'en-US',\n    gl: hasKorean ? 'KR' : 'US',\n    ceid: hasKorean ? 'KR:ko' : 'US:en',\n  },\n}];\n"
+      },
+      "id": "n3",
+      "name": "Parse Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        670,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://news.google.com/rss/search?q={{encodeURIComponent($json.topic_query || (($json.topic || \"AI\") + \" news\"))}}&hl={{$json.hl || \"en-US\"}}&gl={{$json.gl || \"US\"}}&ceid={{$json.ceid || \"US:en\"}}",
+        "responseFormat": "string",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "n4",
+      "name": "Fetch AI News RSS",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        900,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const inItem = $input.first().json;\nconst req = ($items('Parse Request', 0, 0)?.[0]?.json) || {};\nconst rss = String(inItem.body ?? inItem.data ?? inItem.response ?? '');\nconst decode = (s = '') => s\n  .replace(/<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>/g, '$1')\n  .replace(/&amp;/g, '&')\n  .replace(/&lt;/g, '<')\n  .replace(/&gt;/g, '>')\n  .replace(/&quot;/g, '\"')\n  .replace(/&#39;/g, \"'\")\n  .replace(/\\s+/g, ' ')\n  .trim();\nconst tag = (chunk, name) => {\n  const re = new RegExp('<' + name + '(?:\\\\s[^>]*)?>([\\\\s\\\\S]*?)<\\\\/' + name + '>', 'i');\n  const m = chunk.match(re);\n  return m ? decode(m[1]) : '';\n};\nconst itemRegex = /<item>([\\s\\S]*?)<\\/item>/gi;\nconst seen = new Set();\nconst all = [];\nlet match;\nwhile ((match = itemRegex.exec(rss)) !== null) {\n  const chunk = match[1];\n  const title = tag(chunk, 'title');\n  const rawLink = tag(chunk, 'link');\n  const description = tag(chunk, 'description').replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim();\n  const pubDate = tag(chunk, 'pubDate');\n  const source = tag(chunk, 'source') || 'Unknown';\n  if (!rawLink || !title) continue;\n\n  let cleanedLink = rawLink;\n  try {\n    const u = new URL(rawLink);\n    if (u.hostname.includes('news.google.com')) {\n      u.searchParams.delete('oc');\n      cleanedLink = u.toString();\n    }\n  } catch {}\n\n  const dedupeKey = cleanedLink || rawLink;\n  if (seen.has(dedupeKey)) continue;\n  seen.add(dedupeKey);\n\n  all.push({ title, link: cleanedLink, description, pubDate, source });\n}\n\nconst N = Math.max(1, Math.min(10, Number(req.article_count || inItem.article_count || 5)));\nconst selected = all.slice(0, N);\nif (selected.length === 0) {\n  throw new Error('No RSS items extracted from source feed');\n}\n\nconst topic = req.topic || inItem.topic || 'AI';\nconst includeYoutube = Boolean(req.include_youtube ?? inItem.include_youtube ?? true);\nconst scopeMarker = String(req.scope_marker || inItem.scope_marker || '');\nconst telegramChatId = String(req.telegram_chat_id || inItem.telegram_chat_id || '');\nconst telegramUpdateId = String(req.telegram_update_id || inItem.telegram_update_id || '');\nconst requestSource = String(req.request_source || inItem.request_source || 'program');\n\nreturn selected.map((a, idx) => ({\n  json: {\n    index: idx + 1,\n    title: a.title,\n    link: a.link,\n    source: a.source,\n    pubDate: a.pubDate,\n    description: a.description,\n    topic,\n    article_count: N,\n    include_youtube: includeYoutube,\n    scope_marker: scopeMarker,\n    telegram_chat_id: telegramChatId,\n    telegram_update_id: telegramUpdateId,\n    request_source: requestSource,\n  },\n}));\n"
+      },
+      "id": "n5",
+      "name": "Extract Top N Items",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1130,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const rows = $input.all();\n\nconst clamp = (s, n) => String(s || '').replace(/\\s+/g, ' ').trim().slice(0, n);\nconst NOTE = '원문 접근 제한: RSS title/description 기반 요약';\n\nconst parseJsonSafely = (text) => {\n  if (typeof text !== 'string') return null;\n  let t = text.trim();\n  t = t.replace(/^```(?:json)?\\s*/i, '').replace(/\\s*```$/, '');\n  try { return JSON.parse(t); } catch {}\n  const m = t.match(/\\{[\\s\\S]*\\}/);\n  if (m) {\n    try { return JSON.parse(m[0]); } catch {}\n  }\n  return null;\n};\n\nconst ENV = typeof $env === 'object' && $env ? $env : {};\nconst getEnv = (key, fallback = '') => {\n  const value = ENV[key];\n  if (value === undefined || value === null || value === '') return String(fallback || '');\n  return String(value);\n};\n\nconst OPENAI_API_KEY = getEnv('OPENAI_API_KEY', '').trim();\nconst GEMINI_API_KEY = getEnv('GEMINI_API_KEY', getEnv('GOOGLE_API_KEY', '')).trim();\nconst CODEX_API_KEY = getEnv('CODEX_API_KEY', OPENAI_API_KEY).trim();\nconst LLAMACPP_BASE_URL = getEnv('LLAMACPP_BASE_URL', 'http://127.0.0.1:8080').replace(/\\/$/, '');\n\nconst OPENAI_MODEL = getEnv('OPENAI_SUMMARY_MODEL', 'gpt-4o-mini').trim();\nconst GEMINI_MODEL = getEnv('GEMINI_SUMMARY_MODEL', 'gemini-2.0-flash').trim();\nconst CODEX_MODEL = getEnv('CODEX_SUMMARY_MODEL', 'gpt-5-codex').trim();\nconst LLAMACPP_MODEL = getEnv('LLAMACPP_MODEL', 'qwen2.5-0.5b-instruct-q4_k_m.gguf').trim();\nconst ENABLE_LOCAL_LLAMACPP_FALLBACK = /^(1|true|yes|on)$/i.test(getEnv('ENABLE_LOCAL_LLAMACPP_FALLBACK', '0').trim());\nconst STEER_SUMMARY_BRIDGE_ENABLED = /^(1|true|yes|on)$/i.test(getEnv('STEER_SUMMARY_BRIDGE_ENABLED', '1').trim());\nconst STEER_API_BASE_URL = getEnv('STEER_API_BASE_URL', 'http://127.0.0.1:5680').replace(/\\/$/, '');\nconst STEER_API_KEY = getEnv('STEER_API_KEY', '').trim();\n\nconst isGarbageLine = (s) => {\n  const t = String(s || '').trim();\n  if (!t) return true;\n  if (/^\\{|^\\}|^\\[|^\\]/.test(t)) return true;\n  if (/^\"[a-zA-Z_]+\"\\s*:/.test(t)) return true;\n  if (/^\\-?\\s*\"?(title|link|source|pubDate|summary_bullets|why_it_matters|keywords|transparency_note)\"?/i.test(t)) return true;\n  return false;\n};\n\nconst titleCore = (title, source) => {\n  let t = String(title || '').trim();\n  if (!t) return '';\n  if (source) {\n    const esc = String(source).replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');\n    t = t.replace(new RegExp(`\\\\s[-|]\\\\s${esc}$`, 'i'), '').trim();\n  }\n  t = t.replace(/\\s[-|]\\s[^-|]{2,40}$/, '').trim();\n  return t;\n};\n\nconst detectTheme = (title) => {\n  const t = String(title || '').toLowerCase();\n  if (/summit|policy|regulat|pledge|government|country|india|china|u\\.s/.test(t)) return '정책/지정학';\n  if (/invest|billion|fund|market|boom|chip|industry|company|startup/.test(t)) return '산업/투자';\n  if (/model|safety|research|openai|google|anthropic|agent|benchmark/.test(t)) return '기술/연구';\n  return '시장 동향';\n};\n\nconst keywordFromText = (title) => {\n  const stop = new Set(['the','and','for','with','from','that','this','into','over','after','before','about','what','your','you','are','was','were','will','has','have','had','news','today','more','than','between','their','they','its','not','so','much','at','in','on','to','of','a','an','is','as','by','it','ai']);\n  const raw = String(title || '')\n    .replace(/[^\\p{L}\\p{N}\\s]/gu, ' ')\n    .split(/\\s+/)\n    .map((x) => x.trim())\n    .filter((x) => x.length >= 2 && !stop.has(x.toLowerCase()));\n  const uniq = [];\n  for (const t of raw) {\n    if (!uniq.find((u) => u.toLowerCase() === t.toLowerCase())) uniq.push(t);\n  }\n  return uniq.slice(0, 3);\n};\n\nconst heuristicSummary = (j) => {\n  const core = titleCore(j.title || '', j.source || '') || String(j.title || '').trim();\n  const theme = detectTheme(core);\n  const datePart = String(j.pubDate || '').slice(0, 16) || '발행시각 미상';\n\n  const bullets = [\n    clamp(`핵심 이슈: \"${core}\" 관련 움직임이 관측되었습니다.`, 180),\n    clamp(`맥락: ${j.source || 'Unknown'} 보도(${datePart}) 기준으로 ${theme} 관점의 중요 신호입니다.`, 180),\n    clamp('체크포인트: 세부 수치·발표 주체·시점을 원문에서 추가 확인하세요.', 180),\n  ];\n\n  const kw = keywordFromText(core);\n  while (kw.length < 3) kw.push(['AI', '시장', '동향'][kw.length]);\n\n  return {\n    title: clamp(j.title || core || '', 220),\n    link: clamp(j.link || '', 500),\n    source: clamp(j.source || 'Unknown', 120),\n    pubDate: clamp(j.pubDate || '', 120),\n    summary_bullets: bullets,\n    why_it_matters: clamp(`${theme} 측면에서 후속 정책·투자·제품 전략에 영향을 줄 수 있어 추적 가치가 큽니다.`, 220),\n    keywords: kw.slice(0, 3),\n    transparency_note: NOTE,\n    scope_marker: clamp(j.scope_marker || '', 120),\n    telegram_chat_id: String(j.telegram_chat_id || ''),\n    article_count: Number(j.article_count || 5),\n  };\n};\n\nconst overlapRatio = (text, titleWords) => {\n  const words = String(text || '')\n    .toLowerCase()\n    .replace(/[^\\p{L}\\p{N}\\s]/gu, ' ')\n    .split(/\\s+/)\n    .filter(Boolean);\n  if (!words.length || !titleWords.length) return 0;\n  const hit = words.filter((w) => titleWords.includes(w)).length;\n  return hit / words.length;\n};\n\nconst weakBullets = (bullets, title) => {\n  if (!Array.isArray(bullets) || bullets.length < 3) return true;\n  const cleaned = bullets.map((b) => String(b || '').trim()).filter(Boolean);\n  if (cleaned.length < 3) return true;\n  const koreanCount = cleaned.filter((b) => /[가-힣]/.test(b)).length;\n  if (koreanCount < 2) return true;\n  const titleWords = String(title || '')\n    .toLowerCase()\n    .replace(/[^\\p{L}\\p{N}\\s]/gu, ' ')\n    .split(/\\s+/)\n    .filter((x) => x.length > 1);\n  const copied = cleaned.filter((b) => overlapRatio(b, titleWords) > 0.75).length;\n  if (copied >= 2) return true;\n  return false;\n};\n\nconst makePrompt = (j) => [\n  '당신은 AI 뉴스 요약기입니다. 입력(title/link/source/pubDate/description)만 사용해 요약하세요.',\n  'JSON 객체 하나만 출력하고, 코드블록/마크다운/설명문을 절대 추가하지 마세요.',\n  'summary_bullets는 한국어 완결 문장 3~6개로 작성하세요(단어 나열 금지).',\n  `transparency_note는 반드시 다음 문구 포함: \"${NOTE}\"`,\n  '',\n  '입력:',\n  `- title: ${String(j.title || '')}`,\n  `- link: ${String(j.link || '')}`,\n  `- source: ${String(j.source || '')}`,\n  `- pubDate: ${String(j.pubDate || '')}`,\n  `- description: ${String(j.description || '')}`,\n  '',\n  '{',\n  '  \"title\": \"string\",',\n  '  \"link\": \"string\",',\n  '  \"source\": \"string\",',\n  '  \"pubDate\": \"string\",',\n  '  \"summary_bullets\": [\"string\", \"string\", \"string\"],',\n  '  \"why_it_matters\": \"string\",',\n  '  \"keywords\": [\"string\", \"string\", \"string\"],',\n  '  \"transparency_note\": \"string\",',\n  '  \"scope_marker\": \"string\",',\n  '  \"telegram_chat_id\": \"string\",',\n  '  \"article_count\": 5',\n  '}',\n].join('\\n');\n\nconst toErrorText = (data) => {\n  if (!data) return '';\n  if (typeof data === 'string') return data.slice(0, 220);\n  const c = data.error?.message || data.message || data.error || '';\n  return String(c).slice(0, 220);\n};\n\nconst httpPostJson = async (url, headers, body) => {\n  const options = {\n    method: 'POST',\n    url,\n    headers: { 'content-type': 'application/json', ...headers },\n    body,\n    json: true,\n    timeout: 60000,\n  };\n  try {\n    if (typeof this !== 'undefined' && this?.helpers?.httpRequest) return await this.helpers.httpRequest(options);\n    if (typeof $httpRequest === 'function') return await $httpRequest(options);\n    throw new Error('HTTP_HELPER_NOT_AVAILABLE');\n  } catch (err) {\n    const status = err?.statusCode || err?.httpCode || '';\n    const msg = err?.message || err?.description || toErrorText(err?.response?.body) || String(err);\n    throw new Error(`HTTP_${status || 'ERR'}:${clamp(msg, 220)}`);\n  }\n};\n\nconst callOpenAI = async ({ apiKey, model, prompt }) => {\n  const data = await httpPostJson('https://api.openai.com/v1/chat/completions', { authorization: `Bearer ${apiKey}` }, {\n    model,\n    temperature: 0.2,\n    messages: [\n      { role: 'system', content: 'Return only one valid JSON object. No markdown.' },\n      { role: 'user', content: prompt },\n    ],\n  });\n  const text = data?.choices?.[0]?.message?.content;\n  if (!text) throw new Error('EMPTY_RESPONSE');\n  return String(text);\n};\n\nconst callGemini = async ({ apiKey, model, prompt }) => {\n  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;\n  const data = await httpPostJson(url, {}, {\n    contents: [{ parts: [{ text: prompt }] }],\n    generationConfig: { temperature: 0.2, responseMimeType: 'application/json' },\n  });\n  const text = (data?.candidates || []).flatMap((c) => c?.content?.parts || []).map((p) => p?.text || '').join('\\n').trim();\n  if (!text) throw new Error('EMPTY_RESPONSE');\n  return text;\n};\n\nconst callLlamaCpp = async ({ baseUrl, model, prompt }) => {\n  const data = await httpPostJson(`${baseUrl}/v1/chat/completions`, {}, {\n    model,\n    temperature: 0.2,\n    messages: [\n      { role: 'system', content: 'Return only one valid JSON object. No markdown.' },\n      { role: 'user', content: prompt },\n    ],\n  });\n  const text = data?.choices?.[0]?.message?.content;\n  if (!text) throw new Error('EMPTY_RESPONSE');\n  return String(text);\n};\n\nconst callSteerSummaryBridge = async ({ baseUrl, apiKey, article }) => {\n  const headers = {};\n  if (apiKey) headers['X-API-Key'] = apiKey;\n  const payload = {\n    title: article.title || '',\n    link: article.link || '',\n    source: article.source || '',\n    pubDate: article.pubDate || '',\n    description: article.description || '',\n    scope_marker: article.scope_marker || '',\n    telegram_chat_id: article.telegram_chat_id || '',\n    article_count: Number(article.article_count || 5),\n    topic: article.topic || '뉴스',\n  };\n  const data = await httpPostJson(`${baseUrl}/api/llm/news-summary`, headers, payload);\n  const summary = data?.summary || data?.result || data;\n  if (!summary || typeof summary !== 'object') throw new Error('INVALID_STEER_SUMMARY_RESPONSE');\n  return JSON.stringify(summary);\n};\n\nconst normalize = (obj, j, total) => {\n  const h = heuristicSummary(j);\n  let bullets = (Array.isArray(obj.summary_bullets) ? obj.summary_bullets : [])\n    .map((b) => clamp(b, 180))\n    .filter((b) => b && !isGarbageLine(b))\n    .slice(0, 6);\n\n  if (weakBullets(bullets, j.title || '')) bullets = h.summary_bullets;\n  while (bullets.length < 3) bullets.push(h.summary_bullets[bullets.length] || '핵심 요점 보완 필요');\n\n  let why = clamp(obj.why_it_matters || '', 220);\n  if (!why || why.length < 28 || !/[가-힣]/.test(why)) why = h.why_it_matters;\n\n  let keywords = (Array.isArray(obj.keywords) ? obj.keywords : [])\n    .map((k) => clamp(k, 30))\n    .filter((k) => k && !isGarbageLine(k))\n    .slice(0, 3);\n  if (keywords.length < 3) keywords = keywordFromText(j.title || '').slice(0, 3);\n  while (keywords.length < 3) keywords.push(['AI', '시장', '동향'][keywords.length]);\n\n  return {\n    title: clamp(obj.title || j.title || h.title, 220),\n    link: clamp(obj.link || j.link || h.link, 500),\n    source: clamp(obj.source || j.source || h.source, 120),\n    pubDate: clamp(obj.pubDate || j.pubDate || h.pubDate, 120),\n    summary_bullets: bullets.slice(0, 6),\n    why_it_matters: why,\n    keywords: keywords.slice(0, 3),\n    transparency_note: NOTE,\n    scope_marker: clamp(j.scope_marker || obj.scope_marker || '', 120),\n    telegram_chat_id: String(j.telegram_chat_id || obj.telegram_chat_id || ''),\n    article_count: Number(j.article_count || obj.article_count || total || 5),\n  };\n};\n\nconst out = [];\nfor (const item of rows) {\n  const j = item.json || {};\n  const prompt = makePrompt(j);\n  const attempts = [];\n  let parsed = null;\n  let providerUsed = '';\n\n  const providers = [\n    {\n      name: 'steer-cli-bridge',\n      enabled: STEER_SUMMARY_BRIDGE_ENABLED,\n      run: async () => callSteerSummaryBridge({\n        baseUrl: STEER_API_BASE_URL,\n        apiKey: STEER_API_KEY,\n        article: j,\n      }),\n    },\n    { name: 'openai', enabled: Boolean(OPENAI_API_KEY), run: async () => callOpenAI({ apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, prompt }) },\n    { name: 'gemini', enabled: Boolean(GEMINI_API_KEY), run: async () => callGemini({ apiKey: GEMINI_API_KEY, model: GEMINI_MODEL, prompt }) },\n    { name: 'codex', enabled: Boolean(CODEX_API_KEY), run: async () => callOpenAI({ apiKey: CODEX_API_KEY, model: CODEX_MODEL, prompt }) },\n    { name: 'llama.cpp', enabled: ENABLE_LOCAL_LLAMACPP_FALLBACK, run: async () => callLlamaCpp({ baseUrl: LLAMACPP_BASE_URL, model: LLAMACPP_MODEL, prompt }) },\n  ];\n\n  for (const p of providers) {\n    if (!p.enabled) {\n      attempts.push(`${p.name}:SKIP_NO_CONFIG`);\n      continue;\n    }\n    try {\n      const content = await p.run();\n      const candidate = parseJsonSafely(content);\n      if (!candidate || typeof candidate !== 'object') {\n        attempts.push(`${p.name}:NON_JSON_FALLBACK`);\n        parsed = heuristicSummary(j);\n      } else {\n        attempts.push(`${p.name}:OK`);\n        parsed = normalize(candidate, j, rows.length);\n      }\n      providerUsed = p.name;\n      break;\n    } catch (err) {\n      attempts.push(`${p.name}:FAIL:${clamp(err?.message || String(err), 220)}`);\n    }\n  }\n\n  if (!parsed) {\n    parsed = heuristicSummary(j);\n    providerUsed = 'heuristic';\n    attempts.push('heuristic:OK');\n  }\n\n  out.push({\n    json: {\n      ...j,\n      llm_provider: providerUsed,\n      llm_attempts: attempts,\n      summary_struct: parsed,\n      content: JSON.stringify(parsed),\n    },\n  });\n}\n\nreturn out;\n"
+      },
+      "id": "n6",
+      "name": "Summarize Each Article",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const parseJsonSafely = (text) => {\n  try { return JSON.parse(text); } catch {}\n  const m = text.match(/\\{[\\s\\S]*\\}/);\n  if (m) {\n    try { return JSON.parse(m[0]); } catch {}\n  }\n  return null;\n};\n\nconst clean = (s, n = 220) => String(s || '').replace(/\\s+/g, ' ').trim().slice(0, n);\nconst containsJsonArtifact = (s) => /(^[\\s]*[\\{\\[\\\"]|\"(title|link|source|pubDate|summary_bullets|why_it_matters|keywords)\"\\s*:)/i.test(String(s || ''));\n\nconst toKeywords = (title, description, topic = '') => {\n  const source = `${title || ''} ${description || ''}`\n    .replace(/[^\\p{L}\\p{N}\\s]/gu, ' ')\n    .split(/\\s+/)\n    .map((w) => w.trim())\n    .filter((w) => w.length >= 2)\n    .slice(0, 12);\n  const uniq = [];\n  for (const w of source) {\n    if (!uniq.includes(w)) uniq.push(w);\n    if (uniq.length >= 3) break;\n  }\n  const fallbackTopic = clean(topic || '뉴스', 30);\n  while (uniq.length < 3) uniq.push([fallbackTopic, '트렌드', '요약'][uniq.length]);\n  return uniq.slice(0, 3).map((w) => clean(w, 30));\n};\n\nconst fallbackSummary = (item, idx) => {\n  const title = clean(item.title || `기사 ${idx + 1}`, 220);\n  const description = clean(item.description || '', 400);\n  const source = clean(item.source || 'Unknown', 120);\n  const pubDate = clean(item.pubDate || '', 120);\n  const descShort = description || 'RSS 본문이 짧아 제목 중심으로 요약했습니다.';\n  const topic = clean(item.topic || item.topic_label || '뉴스', 80);\n\n  const bullets = [\n    `핵심: ${title}`,\n    `내용: ${descShort.slice(0, 170)}`,\n    `출처/시점: ${source}${pubDate ? `, ${pubDate}` : ''}`,\n    `영향: ${topic} 의사결정에 참고 가능한 신호를 제공합니다.`,\n  ].map((b) => clean(b, 190));\n\n  return {\n    title,\n    link: clean(item.link || '', 500),\n    source,\n    pubDate,\n    summary_bullets: bullets,\n    why_it_matters: clean(`${title} 이슈는 ${topic} 맥락의 우선순위와 실행 전략에 영향을 줄 수 있습니다.`, 220),\n    keywords: toKeywords(title, description, topic),\n    transparency_note: '원문 접근 제한: RSS title/description 기반 요약',\n    scope_marker: clean(item.scope_marker || '', 120),\n    telegram_chat_id: String(item.telegram_chat_id || ''),\n    article_count: Number(item.article_count || 5),\n    request_source: clean(item.request_source || 'program', 30),\n    topic,\n    include_youtube: item.include_youtube !== false,\n  };\n};\n\nconst isLowQuality = (obj) => {\n  if (!obj || typeof obj !== 'object') return true;\n  const bullets = Array.isArray(obj.summary_bullets)\n    ? obj.summary_bullets.map((b) => clean(b, 190)).filter(Boolean)\n    : [];\n  if (bullets.length < 3) return true;\n  if (bullets.some((b) => containsJsonArtifact(b))) return true;\n  if (clean(bullets.join(' '), 1000).length < 140) return true;\n\n  const why = clean(obj.why_it_matters || '', 240);\n  if (!why || why.length < 28 || containsJsonArtifact(why)) return true;\n\n  const keywords = Array.isArray(obj.keywords)\n    ? obj.keywords.map((k) => clean(k, 30)).filter(Boolean)\n    : [];\n  if (keywords.length < 3) return true;\n  if (keywords.some((k) => containsJsonArtifact(k))) return true;\n  return false;\n};\n\nconst rows = $input.all();\nconst out = rows.map((item, idx) => {\n  const content = String(item.json?.message?.content || item.json?.content || item.json?.text || '').trim();\n  let parsed = parseJsonSafely(content);\n  if (!parsed || typeof parsed !== 'object' || isLowQuality(parsed)) {\n    parsed = fallbackSummary(item.json || {}, idx);\n  }\n\n  const bullets = Array.isArray(parsed.summary_bullets)\n    ? parsed.summary_bullets.map((b) => clean(b, 190)).filter(Boolean).slice(0, 6)\n    : [];\n  while (bullets.length < 3) bullets.push('핵심 요점 보완 필요');\n\n  const title = clean(parsed.title || item.json.title || `기사 ${idx + 1}`, 220);\n  const topic = clean(parsed.topic || item.json.topic || item.json.topic_label || '뉴스', 80);\n  const keywords = Array.isArray(parsed.keywords)\n    ? parsed.keywords.map((k) => clean(k, 30)).filter(Boolean).slice(0, 3)\n    : toKeywords(title, item.json.description || '', topic);\n  while (keywords.length < 3) keywords.push([topic || '뉴스', '트렌드', '요약'][keywords.length]);\n\n  return {\n    json: {\n      title,\n      link: clean(parsed.link || item.json.link || '', 500),\n      source: clean(parsed.source || item.json.source || 'Unknown', 120),\n      pubDate: clean(parsed.pubDate || item.json.pubDate || '', 120),\n      description: clean(item.json.description || '', 500),\n      summary_bullets: bullets,\n      why_it_matters: clean(parsed.why_it_matters || '왜 중요한지 정보 없음', 220),\n      keywords: keywords.slice(0, 3),\n      transparency_note: clean(parsed.transparency_note || '원문 접근 제한: RSS title/description 기반 요약', 180),\n      youtube_link: `https://www.youtube.com/results?search_query=${encodeURIComponent(title)}`,\n      scope_marker: clean(parsed.scope_marker || item.json.scope_marker || '', 120),\n      telegram_chat_id: (() => { const cid = String(item.json.telegram_chat_id || '').trim(); return /^-?\\d+$/.test(cid) ? cid : ''; })(),\n      article_count: Number(parsed.article_count || item.json.article_count || rows.length || 5),\n      request_source: clean(parsed.request_source || item.json.request_source || 'program', 30),\n      topic,\n      topic_label: topic,\n      include_youtube: parsed.include_youtube !== false && item.json.include_youtube !== false,\n    },\n  };\n});\n\nreturn out;\n"
+      },
+      "id": "n7",
+      "name": "Parse Summary JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1590,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const rows = $input.all().map(i => i.json).filter(r => r && (r.title || r.link));\nif (!rows.length) throw new Error('No summarized rows to aggregate');\nconst desired = Number(rows[0].article_count || 5);\nconst N = Math.max(1, Math.min(10, desired));\nconst articles = rows.slice(0, N);\nconst topic = String(rows[0].topic || rows[0].topic_label || '최신 이슈').trim() || '최신 이슈';\nconst includeYoutube = rows[0].include_youtube !== false;\n\nreturn [{\n  json: {\n    scope_marker: rows[0].scope_marker || '',\n    telegram_chat_id: String(rows[0].telegram_chat_id || ''),\n    request_source: String(rows[0].request_source || 'program'),\n    article_count: N,\n    digest_date: new Date().toISOString().slice(0, 10),\n    topic,\n    topic_label: topic,\n    include_youtube: includeYoutube,\n    articles,\n  },\n}];\n"
+      },
+      "id": "n8",
+      "name": "Aggregate Articles",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1820,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const j = $input.first().json;\nconst articles = Array.isArray(j.articles) ? j.articles : [];\nif (!articles.length) throw new Error('No articles for Notion build');\n\nconst t = (content, url = '') => {\n  const text = { content: String(content || '').slice(0, 1900) };\n  if (url) text.link = { url };\n  return { type: 'text', text };\n};\n\nconst blocks = [];\nconst lines = [];\nconst topicLabel = String(j.topic_label || j.topic || 'AI').trim() || 'AI';\nconst includeYoutube = j.include_youtube !== false;\n\nconst markerLine = `SCOPE_MARKER: ${j.scope_marker}`;\nblocks.push({\n  object: 'block',\n  type: 'code',\n  code: {\n    language: 'plain text',\n    rich_text: [t(markerLine)],\n  },\n});\nlines.push(markerLine);\n\nconst digestTitle = `오늘의 ${topicLabel} Digest (${j.digest_date})`;\nblocks.push({\n  object: 'block',\n  type: 'heading_1',\n  heading_1: { rich_text: [t(digestTitle)] },\n});\nlines.push(digestTitle);\n\narticles.forEach((a, idx) => {\n  const heading = `기사 ${idx + 1}. ${a.title}`;\n  blocks.push({\n    object: 'block',\n    type: 'heading_2',\n    heading_2: { rich_text: [t(heading)] },\n  });\n\n  blocks.push({\n    object: 'block',\n    type: 'paragraph',\n    paragraph: {\n      rich_text: [\n        t('원문 링크: '),\n        t('기사 원문 열기', a.link),\n      ],\n    },\n  });\n\n  if (includeYoutube) {\n    blocks.push({\n      object: 'block',\n      type: 'paragraph',\n      paragraph: {\n        rich_text: [\n          t('YouTube 링크: '),\n          t('검색 바로가기', a.youtube_link),\n        ],\n      },\n    });\n  }\n\n  const bullets = Array.isArray(a.summary_bullets) ? a.summary_bullets : [];\n  bullets.forEach((bullet) => {\n    blocks.push({\n      object: 'block',\n      type: 'bulleted_list_item',\n      bulleted_list_item: {\n        rich_text: [t(String(bullet || '').trim())],\n      },\n    });\n  });\n\n  blocks.push({\n    object: 'block',\n    type: 'paragraph',\n    paragraph: {\n      rich_text: [\n        t('왜 중요한가: '),\n        t(a.why_it_matters),\n      ],\n    },\n  });\n\n  blocks.push({\n    object: 'block',\n    type: 'paragraph',\n    paragraph: {\n      rich_text: [\n        t('키워드: '),\n        t((Array.isArray(a.keywords) ? a.keywords : []).join(', ')),\n      ],\n    },\n  });\n\n  if (a.transparency_note) {\n    blocks.push({\n      object: 'block',\n      type: 'paragraph',\n      paragraph: {\n        rich_text: [\n          t('참고: '),\n          t(a.transparency_note),\n        ],\n      },\n    });\n  }\n\n  if (idx < articles.length - 1) {\n    blocks.push({ object: 'block', type: 'divider', divider: {} });\n  }\n\n  lines.push(heading);\n  lines.push(`원문 링크: ${a.link}`);\n  if (includeYoutube) lines.push(`YouTube 링크: ${a.youtube_link}`);\n  bullets.forEach((b) => lines.push(`- ${String(b || '').trim()}`));\n  lines.push(`왜 중요한가: ${a.why_it_matters}`);\n  lines.push(`키워드: ${(Array.isArray(a.keywords) ? a.keywords : []).join(', ')}`);\n  if (a.transparency_note) lines.push(`참고: ${a.transparency_note}`);\n  lines.push('');\n});\n\nconst notion_text = lines.join('\\n').trim();\nconst top_headlines = articles.slice(0, 5).map((a) => a.title);\nconst top_headlines_text = top_headlines.map((h, i) => `${i + 1}. ${h}`).join('\\n');\n\nreturn [{\n  json: {\n    ...j,\n    topic_label: topicLabel,\n    include_youtube: includeYoutube,\n    digest_title: digestTitle,\n    notion_text,\n    notion_children: blocks.slice(0, 95),\n    top_headlines,\n    top_headlines_text,\n  },\n}];\n"
+      },
+      "id": "n9",
+      "name": "Build Notion Blocks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2050,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const input = $input.first().json;\nconst ENV = typeof $env === 'object' && $env ? $env : {};\nconst token = String(ENV.NOTION_API_TOKEN || '').trim();\nif (!token) {\n  throw new Error('NOTION_API_TOKEN missing');\n}\n\nconst parentPageId = '305ac3aa760580ba8991c6338e6f9332';\nconst notionVersion = '2022-06-28';\n\nconst request = async (method, url, body) => {\n  const options = {\n    method,\n    url,\n    headers: {\n      Authorization: `Bearer ${token}`,\n      'Notion-Version': notionVersion,\n      'Content-Type': 'application/json',\n    },\n    json: true,\n    timeout: 60000,\n  };\n  if (body) options.body = body;\n\n  if (typeof this !== 'undefined' && this?.helpers?.httpRequest) {\n    return await this.helpers.httpRequest(options);\n  }\n  if (typeof $httpRequest === 'function') {\n    return await $httpRequest(options);\n  }\n  throw new Error('HTTP_HELPER_NOT_AVAILABLE');\n};\n\nconst fallbackTopic = String(input.topic_label || input.topic || \"뉴스\").trim() || \"뉴스\";\nconst title = String(input.digest_title || `오늘의 ${fallbackTopic} Digest (${new Date().toISOString().slice(0, 10)})`).slice(0, 200);\nlet children = Array.isArray(input.notion_children) ? input.notion_children : [];\n\nif (!children.length) {\n  const fallbackText = String(input.notion_text || '').trim();\n  if (!fallbackText) {\n    throw new Error('No Notion content available');\n  }\n  children = [{\n    object: 'block',\n    type: 'paragraph',\n    paragraph: {\n      rich_text: [\n        {\n          type: 'text',\n          text: { content: fallbackText.slice(0, 1900) },\n        },\n      ],\n    },\n  }];\n}\n\nchildren = children.slice(0, 95);\n\nconst body = {\n  parent: { page_id: parentPageId },\n  properties: {\n    title: {\n      title: [\n        {\n          type: 'text',\n          text: { content: title },\n        },\n      ],\n    },\n  },\n  children,\n};\n\nconst created = await request('POST', 'https://api.notion.com/v1/pages', body);\n\nreturn [{\n  json: {\n    ...input,\n    id: created.id,\n    url: created.url,\n  },\n}];\n"
+      },
+      "id": "n10",
+      "name": "Create Notion Page",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2280,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "t1",
+              "name": "notion_url",
+              "type": "string",
+              "value": "={{$json.url || \"\"}}"
+            },
+            {
+              "id": "t2",
+              "name": "notion_page_id",
+              "type": "string",
+              "value": "={{$json.id || \"\"}}"
+            },
+            {
+              "id": "t3",
+              "name": "scope_marker",
+              "type": "string",
+              "value": "={{$item(0).$node[\"Build Notion Blocks\"].json.scope_marker}}"
+            },
+            {
+              "id": "t4",
+              "name": "telegram_chat_id",
+              "type": "string",
+              "value": "={{ /^-?\\d+$/.test(String($item(0).$node[\"Build Notion Blocks\"].json.telegram_chat_id || \"\").trim()) ? String($item(0).$node[\"Build Notion Blocks\"].json.telegram_chat_id || \"\").trim() : \"\" }}"
+            },
+            {
+              "id": "t5",
+              "name": "top_headlines_text",
+              "type": "string",
+              "value": "={{$item(0).$node[\"Build Notion Blocks\"].json.top_headlines_text}}"
+            },
+            {
+              "id": "t6",
+              "name": "request_source",
+              "type": "string",
+              "value": "={{$item(0).$node[\"Build Notion Blocks\"].json.request_source || \"program\"}}"
+            },
+            {
+              "id": "t7",
+              "name": "telegram_text",
+              "type": "string",
+              "value": "={{\"Notion: \" + ($json.url || \"\") + \"\\n\\nTop Headlines (\" + ($item(0).$node[\"Build Notion Blocks\"].json.topic_label || \"AI\") + \"):\\n\" + $item(0).$node[\"Build Notion Blocks\"].json.top_headlines_text + \"\\n\\nMarker: <code>\" + $item(0).$node[\"Build Notion Blocks\"].json.scope_marker + \"</code>\"}}"
+            },
+            {
+              "id": "t8",
+              "name": "topic_label",
+              "type": "string",
+              "value": "={{$item(0).$node[\"Build Notion Blocks\"].json.topic_label || \"AI\"}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "n11",
+      "name": "Prepare Telegram Reply",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2510,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{$json.telegram_chat_id}}",
+        "text": "={{$json.telegram_text}}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "n12",
+      "name": "Telegram Send Message",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2740,
+        300
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "e5YQROS5TvXGoETb",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "id": "n13",
+      "name": "ProgramTrigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        220,
+        120
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ai-digest-program",
+        "responseMode": "lastNode",
+        "responseData": "firstEntryJson",
+        "options": {}
+      }
+    },
+    {
+      "id": "n14",
+      "name": "Telegram Dispatch Gate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        2740,
+        300
+      ],
+      "parameters": {
+        "combineOperation": "all",
+        "conditions": {
+          "string": [
+            {
+              "operation": "isNotEmpty",
+              "value1": "={{$json.telegram_chat_id}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n15",
+      "name": "Program Output",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2970,
+        420
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "p1",
+              "name": "ok",
+              "type": "boolean",
+              "value": "={{true}}"
+            },
+            {
+              "id": "p2",
+              "name": "notion_url",
+              "type": "string",
+              "value": "={{$json.notion_url || $json.url || \"\"}}"
+            },
+            {
+              "id": "p3",
+              "name": "notion_page_id",
+              "type": "string",
+              "value": "={{$json.notion_page_id || $json.id || \"\"}}"
+            },
+            {
+              "id": "p4",
+              "name": "scope_marker",
+              "type": "string",
+              "value": "={{$json.scope_marker || \"\"}}"
+            },
+            {
+              "id": "p5",
+              "name": "top_headlines_text",
+              "type": "string",
+              "value": "={{$json.top_headlines_text || \"\"}}"
+            },
+            {
+              "id": "p6",
+              "name": "request_source",
+              "type": "string",
+              "value": "={{$json.request_source || \"program\"}}"
+            },
+            {
+              "id": "p7",
+              "name": "telegram_chat_id",
+              "type": "string",
+              "value": "={{$json.telegram_chat_id || \"\"}}"
+            },
+            {
+              "id": "p8",
+              "name": "topic_label",
+              "type": "string",
+              "value": "={{$json.topic_label || $item(0).$node[\"Build Notion Blocks\"].json.topic_label || \"AI\"}}"
+            }
+          ]
+        },
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Set Scope Marker": {
+      "main": [
+        [
+          {
+            "node": "Parse Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Request": {
+      "main": [
+        [
+          {
+            "node": "Fetch AI News RSS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch AI News RSS": {
+      "main": [
+        [
+          {
+            "node": "Extract Top N Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Top N Items": {
+      "main": [
+        [
+          {
+            "node": "Summarize Each Article",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summarize Each Article": {
+      "main": [
+        [
+          {
+            "node": "Parse Summary JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Summary JSON": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Articles",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate Articles": {
+      "main": [
+        [
+          {
+            "node": "Build Notion Blocks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Notion Blocks": {
+      "main": [
+        [
+          {
+            "node": "Create Notion Page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Notion Page": {
+      "main": [
+        [
+          {
+            "node": "Prepare Telegram Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Telegram Reply": {
+      "main": [
+        [
+          {
+            "node": "Telegram Dispatch Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Dispatch Gate": {
+      "main": [
+        [
+          {
+            "node": "Telegram Send Message",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Program Output",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Program Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ProgramTrigger": {
+      "main": [
+        [
+          {
+            "node": "Set Scope Marker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "staticData": {},
+  "pinData": {},
+  "versionId": "2642bdd6-088f-41a7-8c9d-3eb194803911",
+  "updatedAt": "2026-02-22 09:44:31.481",
+  "createdAt": "2026-02-21 20:03:17.752"
+}

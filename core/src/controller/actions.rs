@@ -2193,16 +2193,116 @@ impl ActionRunner {
 
     fn goal_targets_ai_news_to_notion(goal: &str) -> bool {
         let lower = goal.to_lowercase();
-        let asks_google = lower.contains("google") || lower.contains("구글");
-        let asks_ai = lower.contains("ai");
-        let asks_news = lower.contains("news") || lower.contains("기사");
-        let asks_summary = lower.contains("요약") || lower.contains("summary");
+        let asks_news = lower.contains("news")
+            || lower.contains("뉴스")
+            || lower.contains("헤드라인")
+            || lower.contains("headline")
+            || lower.contains("기사");
+        let asks_summary = lower.contains("요약")
+            || lower.contains("summary")
+            || lower.contains("정리")
+            || lower.contains("선정")
+            || lower.contains("digest");
         let asks_notion = lower.contains("notion") || lower.contains("노션");
-        asks_google && asks_ai && asks_news && asks_summary && asks_notion
+        asks_news && asks_summary && asks_notion
     }
 
-    async fn fetch_google_ai_news(limit: usize) -> Result<Vec<AiNewsItem>> {
-        let url = "https://news.google.com/rss/search?q=trending+AI+news&hl=en-US&gl=US&ceid=US:en";
+    fn infer_news_topic_from_goal(goal: &str) -> String {
+        let lower = goal.to_lowercase();
+        let topic_map: &[(&[&str], &str)] = &[
+            (
+                &[
+                    "스포츠",
+                    "sport",
+                    "nba",
+                    "nfl",
+                    "mlb",
+                    "epl",
+                    "축구",
+                    "야구",
+                    "농구",
+                ],
+                "스포츠",
+            ),
+            (
+                &[
+                    "경제", "금융", "finance", "market", "stock", "주식", "증시", "코인",
+                ],
+                "경제",
+            ),
+            (
+                &[
+                    "정치",
+                    "politic",
+                    "election",
+                    "정부",
+                    "대통령",
+                    "의회",
+                    "외교",
+                ],
+                "정치",
+            ),
+            (&["과학", "science", "연구", "우주"], "과학"),
+            (&["기술", "tech", "it", "startup", "반도체"], "기술"),
+            (&["ai", "인공지능", "머신러닝", "생성형"], "AI"),
+            (
+                &["연예", "엔터", "entertainment", "movie", "music"],
+                "엔터테인먼트",
+            ),
+            (&["건강", "의료", "health", "medicine"], "건강"),
+        ];
+        for (needles, topic) in topic_map.iter().copied() {
+            if needles.iter().any(|needle| lower.contains(needle)) {
+                return topic.to_string();
+            }
+        }
+
+        let compact_topic_re =
+            regex::Regex::new(r"([가-힣A-Za-z0-9+#.&/\-]{2,40})\s*(?:뉴스|기사|헤드라인)").ok();
+        if let Some(re) = compact_topic_re {
+            if let Some(captures) = re.captures(goal) {
+                if let Some(raw) = captures.get(1) {
+                    let candidate = raw
+                        .as_str()
+                        .trim()
+                        .trim_matches(|c: char| c == '"' || c == '\'')
+                        .to_string();
+                    if !candidate.is_empty()
+                        && !["요약", "정리", "선정", "최신", "오늘", "개"]
+                            .iter()
+                            .any(|w| candidate.eq_ignore_ascii_case(w))
+                    {
+                        return candidate;
+                    }
+                }
+            }
+        }
+
+        "latest".to_string()
+    }
+
+    async fn fetch_google_ai_news(topic: &str, limit: usize) -> Result<Vec<AiNewsItem>> {
+        let topic = if topic.trim().is_empty() {
+            "latest".to_string()
+        } else {
+            topic.trim().to_string()
+        };
+        let query = if topic.eq_ignore_ascii_case("latest") {
+            "trending latest news".to_string()
+        } else {
+            format!("trending {} news", topic)
+        };
+        let encoded_query = urlencoding::encode(&query).replace("%20", "+");
+        let has_korean = topic.chars().any(|c| ('가'..='힣').contains(&c));
+        let (hl, gl, ceid) = if has_korean {
+            ("ko", "KR", "KR:ko")
+        } else {
+            ("en-US", "US", "US:en")
+        };
+        let url = format!(
+            "https://news.google.com/rss/search?q={}&hl={}&gl={}&ceid={}",
+            encoded_query, hl, gl, ceid
+        );
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()?;
@@ -2249,14 +2349,19 @@ impl ActionRunner {
         }
 
         if out.is_empty() {
-            return Err(anyhow::anyhow!("google ai news rss returned no items"));
+            return Err(anyhow::anyhow!("google news rss returned no items"));
         }
         Ok(out)
     }
 
-    fn build_ai_news_digest(items: &[AiNewsItem], marker: Option<&str>) -> String {
+    fn build_ai_news_digest(topic: &str, items: &[AiNewsItem], marker: Option<&str>) -> String {
+        let topic = if topic.trim().is_empty() {
+            "최신"
+        } else {
+            topic.trim()
+        };
         let mut lines = vec![
-            "AI 트렌드 기사 요약 (실기사 기반)".to_string(),
+            format!("{} 뉴스 기사 요약 (실기사 기반)", topic),
             format!(
                 "작성시각(UTC): {}",
                 chrono::Utc::now().format("%Y-%m-%d %H:%M")
@@ -2292,7 +2397,7 @@ impl ActionRunner {
         } else {
             marker.trim().to_string()
         };
-        let query_value = "trending AI news".to_string();
+        let query_value = "trending latest news".to_string();
         serde_json::json!({
             "name": name,
             "nodes": [
@@ -2321,12 +2426,12 @@ impl ActionRunner {
                 },
                 {
                     "id": uuid::Uuid::new_v4().to_string(),
-                    "name": "Fetch AI News RSS",
+                    "name": "Fetch News RSS",
                     "type": "n8n-nodes-base.httpRequest",
                     "typeVersion": 4,
                     "position": [560, 0],
                     "parameters": {
-                        "url": "https://news.google.com/rss/search?q=trending+AI+news",
+                        "url": "https://news.google.com/rss/search?q=trending+latest+news",
                         "options": {},
                         "responseFormat": "string"
                     }
@@ -2347,9 +2452,9 @@ impl ActionRunner {
                     "main": [[{ "node": "Set Scope Marker", "type": "main", "index": 0 }]]
                 },
                 "Set Scope Marker": {
-                    "main": [[{ "node": "Fetch AI News RSS", "type": "main", "index": 0 }]]
+                    "main": [[{ "node": "Fetch News RSS", "type": "main", "index": 0 }]]
                 },
-                "Fetch AI News RSS": {
+                "Fetch News RSS": {
                     "main": [[{ "node": "Extract Top 3 Headlines", "type": "main", "index": 0 }]]
                 }
             },
@@ -4400,9 +4505,11 @@ impl ActionRunner {
                 } else {
                     let marker = Self::preferred_run_scope_marker(Some(goal)).unwrap_or_default();
                     if Self::goal_targets_ai_news_to_notion(goal) {
-                        if let Ok(items) = Self::fetch_google_ai_news(3).await {
+                        let topic = Self::infer_news_topic_from_goal(goal);
+                        if let Ok(items) = Self::fetch_google_ai_news(&topic, 3).await {
                             if items.len() >= 3 {
                                 content = Self::build_ai_news_digest(
+                                    &topic,
                                     &items,
                                     if marker.is_empty() {
                                         None
@@ -4410,6 +4517,13 @@ impl ActionRunner {
                                         Some(marker.as_str())
                                     },
                                 );
+                                if title.trim() == "Steer Note" {
+                                    title = format!(
+                                        "{} 뉴스 요약 {}",
+                                        topic,
+                                        chrono::Utc::now().format("%Y-%m-%d %H:%M")
+                                    );
+                                }
                             }
                         }
                     }
@@ -5466,5 +5580,29 @@ mod tests {
         assert!(ActionRunner::goal_mentions_mail("Mail 앱에서 보내줘"));
         assert!(ActionRunner::goal_mentions_mail("gmail digest"));
         assert!(!ActionRunner::goal_mentions_mail("notes only"));
+    }
+
+    #[test]
+    fn goal_targets_news_to_notion_matches_non_ai_topic() {
+        assert!(ActionRunner::goal_targets_ai_news_to_notion(
+            "스포츠 뉴스 5개 선정해서 노션에 정리해줘"
+        ));
+        assert!(!ActionRunner::goal_targets_ai_news_to_notion(
+            "스포츠 뉴스 5개만 보여줘"
+        ));
+    }
+
+    #[test]
+    fn infer_news_topic_from_goal_prefers_domain_topic() {
+        assert_eq!(
+            ActionRunner::infer_news_topic_from_goal(
+                "구글에서 현재가장 트렌디한 ai 관련 기사 찾아서 요약 후 노션 정리"
+            ),
+            "AI"
+        );
+        assert_eq!(
+            ActionRunner::infer_news_topic_from_goal("스포츠 뉴스 5개 선정해서 노션에 정리해줘"),
+            "스포츠"
+        );
     }
 }

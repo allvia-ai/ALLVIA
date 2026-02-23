@@ -29,6 +29,7 @@ import {
     runAgentPreflightFix,
     recordAgentRecoveryEvent,
     fetchTaskRuns,
+    fetchTaskRun,
     fetchTaskRunStages,
     fetchTaskRunAssertions,
     fetchTaskRunArtifacts,
@@ -38,7 +39,9 @@ import type {
     AgentPreflightCheck,
     ExecutionProfile,
     LockMetrics,
+    Recommendation,
     TaskRunArtifact,
+    TaskRun,
     TaskStageAssertion,
     TaskStageRun,
 } from "@/lib/types";
@@ -267,6 +270,12 @@ const isNlChatFallbackEnabled = (): boolean => {
     return import.meta.env.VITE_ENABLE_NL_CHAT_FALLBACK !== "0";
 };
 
+const isLegacyGoalFallbackEnabled = (): boolean => {
+    if (typeof import.meta === "undefined") return false;
+    // Default OFF: keep routing on modern goal-run / intent-plan-execute path unless explicitly enabled.
+    return import.meta.env.VITE_ENABLE_LEGACY_GOAL_FALLBACK === "1";
+};
+
 const shouldTryNlChatFallback = (error: unknown): boolean => {
     if (!isNlChatFallbackEnabled()) return false;
     if (!axios.isAxiosError(error)) return false;
@@ -288,6 +297,48 @@ const shouldTryNlChatFallback = (error: unknown): boolean => {
         (text.includes("goal/run") || text.includes("goal-run")) &&
         (text.includes("not found") || text.includes("no route"))
     );
+};
+
+const TERMINAL_RUN_STATUSES = new Set([
+    "business_completed",
+    "business_failed",
+    "failed",
+    "error",
+    "blocked",
+    "approval_required",
+    "manual_required",
+    "completed",
+    "success",
+]);
+
+const IN_PROGRESS_RUN_STATUSES = new Set([
+    "accepted",
+    "busy",
+    "queued",
+    "running",
+    "started",
+    "retrying",
+    "business_incomplete",
+]);
+
+const N8N_EDITOR_BASE_URL = (() => {
+    if (typeof import.meta !== "undefined") {
+        const raw = import.meta.env.VITE_N8N_EDITOR_URL as string | undefined;
+        const trimmed = raw?.trim().replace(/\/+$/, "");
+        if (trimmed) return trimmed;
+    }
+    return "http://localhost:5678";
+})();
+
+const resolveRecommendationWorkflowUrl = (
+    rec?: Pick<Recommendation, "workflow_url" | "workflow_id"> | null,
+    workflowIdFallback?: string | null
+): string | null => {
+    const explicitUrl = rec?.workflow_url?.trim();
+    if (explicitUrl) return explicitUrl;
+    const workflowId = rec?.workflow_id?.trim() || workflowIdFallback?.trim();
+    if (!workflowId) return null;
+    return `${N8N_EDITOR_BASE_URL}/workflow/${encodeURIComponent(workflowId)}`;
 };
 
 const markdownComponents: Components = {
@@ -388,12 +439,14 @@ export default function Launcher() {
     const [lockMetricsError, setLockMetricsError] = useState<string | null>(null);
     const [artifactOpenBusy, setArtifactOpenBusy] = useState<string | null>(null);
     const [artifactActionMessage, setArtifactActionMessage] = useState<string | null>(null);
+    const [n8nOpenBusyKey, setN8nOpenBusyKey] = useState<string | null>(null);
     const [recoveryActionBusyKey, setRecoveryActionBusyKey] = useState<string | null>(null);
     const [manualChecklist, setManualChecklist] = useState<ManualResumeChecklist>({
         focusReady: false,
         manualStepDone: false,
         handsOffReady: false,
     });
+    const runPollTokenRef = useRef(0);
     const lastDispatchRef = useRef<{ promptKey: string; ts: number } | null>(null);
     const sendThrottleRef = useRef<number>(0);
     const inputRef = useRef<HTMLInputElement>(null);
@@ -403,6 +456,12 @@ export default function Launcher() {
     // Auto-focus input on mount
     useEffect(() => {
         inputRef.current?.focus();
+    }, []);
+
+    useEffect(() => {
+        return () => {
+            runPollTokenRef.current += 1;
+        };
     }, []);
 
     useEffect(() => {
@@ -954,8 +1013,16 @@ export default function Launcher() {
             setRunPhase("manual_required");
             return;
         }
+        if (IN_PROGRESS_RUN_STATUSES.has(statusLower)) {
+            setRunPhase("running");
+            return;
+        }
         if (["failed", "error", "blocked"].includes(statusLower)) {
             setRunPhase("failed");
+            return;
+        }
+        if (statusLower === "business_completed") {
+            setRunPhase("completed");
             return;
         }
         if ((statusLower === "completed" || statusLower === "success") && snapshot.verifyOk) {
@@ -1210,6 +1277,67 @@ export default function Launcher() {
         }
     }, []);
 
+    const toSnapshotFromTaskRun = (run: TaskRun): ExecutionSnapshot => {
+        const statusLower = run.status.toLowerCase();
+        const verifyOk = run.business_complete || statusLower === "business_completed";
+        return {
+            status: run.status,
+            runId: run.run_id,
+            resumeToken: null,
+            plannerComplete: !!run.planner_complete,
+            executionComplete: !!run.execution_complete,
+            businessComplete: !!run.business_complete,
+            verifyOk,
+            verifyIssues: verifyOk ? [] : [`status=${run.status}`],
+            completionScore: null,
+        };
+    };
+
+    const pollRunStatusUntilTerminal = useCallback(
+        async (runId: string) => {
+            if (!runId) return;
+            const token = Date.now();
+            runPollTokenRef.current = token;
+
+            for (let i = 0; i < 60; i += 1) {
+                if (runPollTokenRef.current !== token) return;
+                try {
+                    const run = await fetchTaskRun(runId);
+                    if (runPollTokenRef.current !== token) return;
+                    setLastStatus(run.status);
+                    updateExecutionState(toSnapshotFromTaskRun(run));
+
+                    if (i % 2 === 0) {
+                        await loadRunDiagnostics(runId);
+                    }
+
+                    const statusLower = run.status.toLowerCase();
+                    if (TERMINAL_RUN_STATUSES.has(statusLower)) {
+                        await loadRunDiagnostics(runId);
+                        await loadDodHistory();
+                        if (statusLower === "business_completed") {
+                            triggerSuccess();
+                        } else if (!["approval_required", "manual_required"].includes(statusLower)) {
+                            triggerError();
+                        }
+                        return;
+                    }
+                } catch (error) {
+                    // transient read failure while run is still being updated
+                    console.warn("run polling failed", error);
+                }
+                await new Promise((resolve) => window.setTimeout(resolve, 1500));
+            }
+        },
+        [
+            loadDodHistory,
+            loadRunDiagnostics,
+            updateExecutionState,
+            triggerError,
+            triggerSuccess,
+        ]
+    );
+
     const runPreflightCheck = useCallback(async (silent: boolean = false): Promise<boolean> => {
         setPreflightLoading(true);
         setPreflightError(null);
@@ -1389,6 +1517,25 @@ export default function Launcher() {
             setArtifactOpenBusy(null);
         }
     }, [recordRecoveryAction]);
+
+    const openExternalTarget = useCallback(async (target: string) => {
+        const candidate = target.trim();
+        if (!candidate) {
+            throw new Error("empty target");
+        }
+        const tauriMeta =
+            (window as WindowWithTauriMeta).__TAURI_METADATA__ ||
+            (window as WindowWithTauriMeta).__TAURI__?.metadata ||
+            (window as WindowWithTauriMeta).__TAURI_INTERNALS__?.metadata;
+        if (tauriMeta) {
+            await invoke<string>("open_external_target", { target: candidate });
+            return;
+        }
+        const popup = window.open(candidate, "_blank", "noopener,noreferrer");
+        if (!popup) {
+            throw new Error("popup_blocked");
+        }
+    }, []);
 
     const copyArtifactPayload = useCallback(async (artifact: TaskRunArtifact) => {
         const payload = JSON.stringify(
@@ -1757,6 +1904,8 @@ export default function Launcher() {
                     if (goalRunAvailable !== true) {
                         setGoalRunAvailable(true);
                     }
+                    const goalStatusLower = goalRes.status.toLowerCase();
+                    const goalStatusInProgress = IN_PROGRESS_RUN_STATUSES.has(goalStatusLower);
                     setLastPlanId(null);
                     setLastStatus(goalRes.status);
                     updateExecutionState({
@@ -1784,18 +1933,30 @@ export default function Launcher() {
                     ];
 
                     setResults([{
-                        type: goalRes.business_complete ? "response" : "error",
+                        type:
+                            goalRes.business_complete ||
+                            goalStatusInProgress ||
+                            goalStatusLower === "approval_required" ||
+                            goalStatusLower === "manual_required"
+                                ? "response"
+                                : "error",
                         content: summaryLines.filter(Boolean).join("\n"),
                     }]);
                     setInput("");
 
-                    if (goalRes.status === "approval_required") {
+                    if (goalStatusLower === "approval_required") {
                         setRunPhase("approval_required");
-                    } else if (goalRes.status === "manual_required") {
+                    } else if (goalStatusLower === "manual_required") {
                         setRunPhase("manual_required");
-                    } else if (goalRes.business_complete) {
+                    } else if (
+                        goalRes.business_complete ||
+                        goalStatusLower === "business_completed"
+                    ) {
                         setRunPhase("completed");
                         triggerSuccess();
+                    } else if (goalStatusInProgress) {
+                        setRunPhase("running");
+                        void pollRunStatusUntilTerminal(goalRes.run_id);
                     } else {
                         setRunPhase("failed");
                         triggerError();
@@ -1806,11 +1967,18 @@ export default function Launcher() {
                         throw goalRunError;
                     }
                     setGoalRunAvailable(false);
-                    fallbackToLegacyFromGoalRun = true;
-                    console.warn(
-                        "goal-run endpoint unavailable. Falling back to legacy goal path.",
-                        goalRunError
-                    );
+                    if (isLegacyGoalFallbackEnabled()) {
+                        fallbackToLegacyFromGoalRun = true;
+                        console.warn(
+                            "goal-run endpoint unavailable. Falling back to legacy goal path.",
+                            goalRunError
+                        );
+                    } else {
+                        console.warn(
+                            "goal-run endpoint unavailable. Legacy fallback disabled; using intent/plan/execute path.",
+                            goalRunError
+                        );
+                    }
                 }
             }
 
@@ -2096,6 +2264,40 @@ export default function Launcher() {
         await dispatchPrompt(action.prompt);
     };
 
+    const handleTelegramListenerCommand = async (
+        command: "telegram listener start" | "telegram listener status"
+    ) => {
+        if (loading || isExecutionLocked) return;
+        setShowDetailPanel(true);
+        setLoading(true);
+        setRunPhase("running");
+        setPendingApproval(null);
+        setRecoveryActionBusyKey(null);
+        try {
+            const res = await sendChatMessage(command);
+            setResults([
+                {
+                    type: "response",
+                    content: [
+                        "**Telegram Listener**",
+                        `- 요청: \`${command}\``,
+                        `- 응답: ${res.response}`,
+                    ].join("\n"),
+                },
+            ]);
+            setRunPhase("completed");
+            triggerSuccess();
+        } catch (error) {
+            const message =
+                error instanceof Error ? error.message : "Telegram listener command failed.";
+            setResults([{ type: "error", content: message }]);
+            setRunPhase("failed");
+            triggerError();
+        } finally {
+            setLoading(false);
+        }
+    };
+
     const extractErrorMessage = (error: unknown) => {
         if (typeof error === "string") return error;
         if (error && typeof error === "object") {
@@ -2373,7 +2575,52 @@ export default function Launcher() {
         });
         setApprovingIds(prev => new Set(prev).add(id));
         try {
-            await approveRecommendation(id);
+            const approved = await approveRecommendation(id);
+            const sourceRec = (recs ?? []).find((rec) => rec.id === id);
+            const workflowId = approved.workflow_id?.trim() || approved.id?.trim() || sourceRec?.workflow_id?.trim() || null;
+            const workflowUrl = approved.workflow_url?.trim() || resolveRecommendationWorkflowUrl(sourceRec ?? null, workflowId);
+
+            if (workflowUrl) {
+                const busyKey = `approve:${id}`;
+                setN8nOpenBusyKey(busyKey);
+                try {
+                    await openExternalTarget(workflowUrl);
+                    setResults([
+                        {
+                            type: "response",
+                            content: [
+                                "**Workflow 승인 완료**",
+                                `- recommendation_id: \`${id}\``,
+                                workflowId ? `- workflow_id: \`${workflowId}\`` : "",
+                                `- n8n 편집기: ${workflowUrl}`,
+                                "- n8n 화면을 열어 생성 결과를 바로 확인하세요.",
+                            ]
+                                .filter(Boolean)
+                                .join("\n"),
+                        },
+                    ]);
+                } catch (openError) {
+                    const openMsg =
+                        openError instanceof Error ? openError.message : String(openError);
+                    setResults([
+                        {
+                            type: "response",
+                            content: [
+                                "**Workflow 승인 완료 (열기 실패)**",
+                                `- recommendation_id: \`${id}\``,
+                                workflowId ? `- workflow_id: \`${workflowId}\`` : "",
+                                `- n8n URL: ${workflowUrl}`,
+                                `- 열기 오류: ${openMsg}`,
+                            ]
+                                .filter(Boolean)
+                                .join("\n"),
+                        },
+                    ]);
+                } finally {
+                    setShowDetailPanel(true);
+                    setN8nOpenBusyKey(null);
+                }
+            }
             triggerSuccess();
         } catch (e) {
             console.error("Approve failed", e);
@@ -2679,7 +2926,6 @@ export default function Launcher() {
                                 onBlur={() => setIsComposing(false)}
                                 onPaste={handleInputPaste}
                                 onKeyDown={handleKeyDown}
-                                disabled={isExecutionLocked}
                                 autoComplete="off"
                                 autoCorrect="off"
                                 autoCapitalize="none"
@@ -2944,6 +3190,22 @@ export default function Launcher() {
                                 title="대화 모드"
                             >
                                 <MessageCircle className="w-4 h-4" />
+                            </button>
+                            <button
+                                onClick={() => void handleTelegramListenerCommand("telegram listener start")}
+                                disabled={loading || isExecutionLocked}
+                                className="text-[11px] px-2.5 py-1 rounded-full border border-sky-400/30 bg-sky-500/15 text-sky-200 hover:bg-sky-500/25 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                title="텔레그램 리스너 시작"
+                            >
+                                TG 시작
+                            </button>
+                            <button
+                                onClick={() => void handleTelegramListenerCommand("telegram listener status")}
+                                disabled={loading || isExecutionLocked}
+                                className="text-[11px] px-2.5 py-1 rounded-full border border-white/20 bg-white/5 text-gray-200 hover:bg-white/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                title="텔레그램 리스너 상태"
+                            >
+                                TG 상태
                             </button>
                             <span className="text-xl font-semibold text-gray-300 ml-1">5.2</span>
                         </div>
@@ -3675,6 +3937,7 @@ export default function Launcher() {
                                         </div>
                                         {pendingRecs.map((rec, idx) => {
                                             const isSel = navigableItems[selectedIndex]?.id === `rec-${rec.id}`;
+                                            const recWorkflowUrl = resolveRecommendationWorkflowUrl(rec);
                                             return (
                                                 <div
                                                     key={rec.id}
@@ -3718,6 +3981,49 @@ export default function Launcher() {
                                                         >
                                                             <Pin className="w-3 h-3" />
                                                         </button>
+
+                                                        {recWorkflowUrl && (
+                                                            <button
+                                                                onClick={async (e) => {
+                                                                    e.stopPropagation();
+                                                                    const busyKey = `rec:${rec.id}`;
+                                                                    setN8nOpenBusyKey(busyKey);
+                                                                    try {
+                                                                        await openExternalTarget(recWorkflowUrl);
+                                                                        setResults([
+                                                                            {
+                                                                                type: "response",
+                                                                                content: [
+                                                                                    "**n8n 편집기 열기**",
+                                                                                    `- recommendation_id: \`${rec.id}\``,
+                                                                                    rec.workflow_id ? `- workflow_id: \`${rec.workflow_id}\`` : "",
+                                                                                    `- URL: ${recWorkflowUrl}`,
+                                                                                ]
+                                                                                    .filter(Boolean)
+                                                                                    .join("\n"),
+                                                                            },
+                                                                        ]);
+                                                                        setShowDetailPanel(true);
+                                                                    } catch (openError) {
+                                                                        const openMsg =
+                                                                            openError instanceof Error ? openError.message : String(openError);
+                                                                        setApproveErrors((prev) => ({
+                                                                            ...prev,
+                                                                            [rec.id]: `n8n 열기 실패: ${openMsg}`,
+                                                                        }));
+                                                                    } finally {
+                                                                        setN8nOpenBusyKey(null);
+                                                                    }
+                                                                }}
+                                                                disabled={n8nOpenBusyKey === `rec:${rec.id}`}
+                                                                className={`text-xs px-2 py-1 rounded transition-colors border ${isSel
+                                                                    ? 'bg-sky-500 text-white border-sky-400'
+                                                                    : 'text-sky-200 bg-sky-500/20 border-sky-400/30 hover:bg-sky-500/30'
+                                                                    } ${n8nOpenBusyKey === `rec:${rec.id}` ? 'opacity-60 cursor-wait' : ''}`}
+                                                            >
+                                                                {n8nOpenBusyKey === `rec:${rec.id}` ? '열기…' : 'n8n'}
+                                                            </button>
+                                                        )}
 
                                                         <button
                                                             onClick={(e) => {

@@ -1894,6 +1894,25 @@ pub fn mark_stale_running_task_runs_finished() -> Result<usize> {
     Ok(0)
 }
 
+pub fn mark_orphaned_inflight_task_runs_failed() -> Result<usize> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        let finished_at = chrono::Utc::now().to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE task_runs
+             SET status = 'business_failed',
+                 finished_at = COALESCE(finished_at, ?1),
+                 summary = COALESCE(summary, 'auto-finalized orphaned in-flight run after core restart'),
+                 details = COALESCE(details, '{\"source\":\"db.mark_orphaned_inflight_task_runs_failed\",\"reason\":\"orphaned_inflight_run\"}')
+             WHERE finished_at IS NULL
+               AND lower(status) IN ('queued', 'running', 'accepted', 'started', 'retrying', 'business_incomplete')",
+            params![finished_at],
+        )?;
+        return Ok(rows);
+    }
+    Ok(0)
+}
+
 fn parse_stage_max_retries() -> i64 {
     std::env::var("STEER_STAGE_MAX_RETRIES")
         .ok()
@@ -2321,6 +2340,40 @@ pub fn list_task_runs(limit: i64, status: Option<&str>) -> Result<Vec<TaskRunRec
         return Ok(out);
     }
     Ok(Vec::new())
+}
+
+pub fn get_latest_inflight_task_run() -> Result<Option<TaskRunRecord>> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        let mut stmt = conn.prepare(
+            "SELECT run_id, created_at, finished_at, intent, prompt,
+                    planner_complete, execution_complete, business_complete,
+                    status, summary, details
+             FROM task_runs
+             WHERE finished_at IS NULL
+               AND lower(status) IN ('queued', 'running', 'accepted', 'started', 'retrying', 'business_incomplete')
+             ORDER BY created_at DESC
+             LIMIT 1",
+        )?;
+
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(TaskRunRecord {
+                run_id: row.get(0)?,
+                created_at: row.get(1)?,
+                finished_at: row.get(2).ok(),
+                intent: row.get(3)?,
+                prompt: row.get(4)?,
+                planner_complete: row.get::<_, i64>(5)? != 0,
+                execution_complete: row.get::<_, i64>(6)? != 0,
+                business_complete: row.get::<_, i64>(7)? != 0,
+                status: row.get(8)?,
+                summary: row.get(9).ok(),
+                details: row.get(10).ok(),
+            }));
+        }
+    }
+    Ok(None)
 }
 
 pub fn list_task_stage_runs(run_id: &str) -> Result<Vec<TaskStageRunRecord>> {

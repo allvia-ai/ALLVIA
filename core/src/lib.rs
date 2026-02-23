@@ -1,4 +1,5 @@
 pub mod action_schema;
+pub mod ai_digest;
 pub mod analyzer;
 pub mod applescript;
 pub mod approval_gate;

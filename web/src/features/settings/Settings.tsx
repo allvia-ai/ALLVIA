@@ -13,6 +13,8 @@ type SystemHealth = {
 export default function Settings() {
     const [n8nRestarting, setN8nRestarting] = useState(false);
     const [manualStatus, setManualStatus] = useState<"error" | null>(null);
+    const [telegramListenerBusy, setTelegramListenerBusy] = useState(false);
+    const [telegramListenerStatus, setTelegramListenerStatus] = useState<string | null>(null);
     const { data: healthData, isError: healthError, refetch: refetchHealth } = useQuery({
         queryKey: ["systemHealth"],
         queryFn: getHealth,
@@ -49,6 +51,34 @@ export default function Settings() {
         } catch {
             setManualStatus("error");
             setN8nRestarting(false);
+        }
+    };
+
+    const handleTelegramListenerStart = async () => {
+        setTelegramListenerBusy(true);
+        try {
+            const { data } = await axios.post(`${API_BASE_URL}/chat`, {
+                message: "telegram listener start",
+            });
+            setTelegramListenerStatus(data?.response ?? "Telegram listener start requested.");
+        } catch {
+            setTelegramListenerStatus("Telegram listener 시작 요청 실패");
+        } finally {
+            setTelegramListenerBusy(false);
+        }
+    };
+
+    const handleTelegramListenerStatus = async () => {
+        setTelegramListenerBusy(true);
+        try {
+            const { data } = await axios.post(`${API_BASE_URL}/chat`, {
+                message: "telegram listener status",
+            });
+            setTelegramListenerStatus(data?.response ?? "상태 응답 없음");
+        } catch {
+            setTelegramListenerStatus("Telegram listener 상태 조회 실패");
+        } finally {
+            setTelegramListenerBusy(false);
         }
     };
 
@@ -137,6 +167,42 @@ export default function Settings() {
                                     <RefreshCw className={`w-4 h-4 ${n8nRestarting ? 'animate-spin' : ''}`} />
                                     {n8nRestarting ? "Restarting..." : "Restart n8n Server"}
                                 </motion.button>
+                            </div>
+
+                            <div className="p-4 rounded-lg bg-white/5 border border-white/5">
+                                <div className="flex items-center justify-between mb-3">
+                                    <div className="flex items-center gap-2">
+                                        <Power className="w-4 h-4 text-sky-400" />
+                                        <span className="font-medium">Telegram Listener</span>
+                                    </div>
+                                </div>
+                                <div className="flex gap-2">
+                                    <motion.button
+                                        onClick={handleTelegramListenerStart}
+                                        disabled={telegramListenerBusy}
+                                        className="flex-1 py-2 rounded-lg bg-sky-500/10 text-sky-400 hover:bg-sky-500/20 transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
+                                        whileHover={{ scale: 1.02 }}
+                                        whileTap={{ scale: 0.98 }}
+                                    >
+                                        <Power className="w-4 h-4" />
+                                        {telegramListenerBusy ? "Starting..." : "Start Listener"}
+                                    </motion.button>
+                                    <motion.button
+                                        onClick={handleTelegramListenerStatus}
+                                        disabled={telegramListenerBusy}
+                                        className="flex-1 py-2 rounded-lg bg-white/5 text-muted-foreground hover:bg-white/10 transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
+                                        whileHover={{ scale: 1.02 }}
+                                        whileTap={{ scale: 0.98 }}
+                                    >
+                                        <RefreshCw className={`w-4 h-4 ${telegramListenerBusy ? "animate-spin" : ""}`} />
+                                        Check Status
+                                    </motion.button>
+                                </div>
+                                {telegramListenerStatus && (
+                                    <div className="mt-3 text-xs text-muted-foreground whitespace-pre-wrap">
+                                        {telegramListenerStatus}
+                                    </div>
+                                )}
                             </div>
 
                             <div className="pt-4 border-t border-white/10 text-sm text-muted-foreground">
