@@ -12,14 +12,14 @@ ensure_steer_app_installed() {
   local app_id
   app_id="$(osascript <<'APPLESCRIPT' 2>/dev/null || true
 try
-  return id of application "Steer OS"
+  return id of application "AllvIa"
 on error
   return ""
 end try
 APPLESCRIPT
 )"
   if [ -z "$app_id" ]; then
-    echo "❌ Steer OS 앱을 찾을 수 없습니다. 앱 설치 후 다시 실행하세요."
+    echo "❌ AllvIa 앱을 찾을 수 없습니다. 앱 설치 후 다시 실행하세요."
     exit 1
   fi
 }
@@ -188,7 +188,7 @@ if [ "${STEER_DEMO_SKIP_STATE_RESET:-0}" != "1" ]; then
   "$ROOT_DIR/scripts/demo_state_reset.sh"
 fi
 
-open -a "Steer OS" >/dev/null 2>&1 || true
+open -a "AllvIa" >/dev/null 2>&1 || true
 
 echo "== demo_record =="
 if [ "$MODE" = "preset" ]; then

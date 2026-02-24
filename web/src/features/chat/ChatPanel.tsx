@@ -105,7 +105,7 @@ function InlineRoutineCard({ hint, onClose, onCreated, onError }: { hint: string
 export default function ChatPanel() {
     const [input, setInput] = useState("");
     const [messages, setMessages] = useState<Message[]>([
-        { role: "assistant", text: "Hello! I am Steer OS. Try saying '매일 아침 뉴스 요약 해줘' to create a routine!" }
+        { role: "assistant", text: "Hello! I am AllvIa. Try saying '매일 아침 뉴스 요약 해줘' to create a routine!" }
     ]);
     const [showRoutineCard, setShowRoutineCard] = useState(false);
     const [routineHint, setRoutineHint] = useState("");
@@ -115,7 +115,11 @@ export default function ChatPanel() {
     const mutation = useMutation({
         mutationFn: sendChatMessage,
         onSuccess: (data) => {
-            setMessages(prev => [...prev, { role: "assistant", text: data.response, command: data.command }]);
+            const text =
+                typeof data.response === "string" && data.response.trim().length > 0
+                    ? data.response
+                    : "✅ 요청을 받았어요. 한 문장만 더 구체적으로 말해주면 바로 도와줄게요.";
+            setMessages(prev => [...prev, { role: "assistant", text, command: data.command }]);
             if (data.command === "analyze_patterns") {
                 queryClient.invalidateQueries({ queryKey: ["recommendations"] });
             }

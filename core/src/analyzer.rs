@@ -246,7 +246,7 @@ async fn process_buffer(
                 if let Err(e) = db::insert_recommendation(&proposal) {
                     eprintln!("⚠️ [Analyzer] DB Error: {}", e);
                 } else {
-                    let _ = notifier::send("Steer OS", &format!("💡 New Idea: {}", proposal.title));
+                    let _ = notifier::send("AllvIa", &format!("💡 New Idea: {}", proposal.title));
                     remaining_budget -= 1;
                 }
                 continue; // Skip LLM if template matched
@@ -300,7 +300,7 @@ async fn process_buffer(
                         eprintln!("⚠️ [Analyzer] DB Error: {}", e);
                     } else {
                         let _ = notifier::send(
-                            "Steer OS",
+                            "AllvIa",
                             &format!("✨ New Idea (AI): {}", proposal.title),
                         );
                         remaining_budget -= 1;

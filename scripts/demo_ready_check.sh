@@ -54,17 +54,17 @@ check_steer_app() {
   local app_id
   app_id="$(osascript <<'APPLESCRIPT' 2>/dev/null || true
 try
-  return id of application "Steer OS"
+  return id of application "AllvIa"
 on error
   return ""
 end try
 APPLESCRIPT
 )"
   if [ -n "$app_id" ]; then
-    ok "Steer OS app installed ($app_id)"
+    ok "AllvIa app installed ($app_id)"
     return 0
   fi
-  fail "Steer OS app not found. 앱 번들이 설치되어 있어야 UI 시연이 가능합니다."
+  fail "AllvIa app not found. 앱 번들이 설치되어 있어야 UI 시연이 가능합니다."
   return 1
 }
 
@@ -72,15 +72,15 @@ check_steer_process() {
   local running
   running="$(osascript <<'APPLESCRIPT' 2>/dev/null || true
 tell application "System Events"
-  if exists process "Steer OS" then return "1"
+  if exists process "AllvIa" then return "1"
 end tell
 return "0"
 APPLESCRIPT
 )"
   if [ "$running" = "1" ]; then
-    ok "Steer OS process running"
+    ok "AllvIa process running"
   else
-    warn "Steer OS process not running now (시연 시작 시 자동 실행됨)"
+    warn "AllvIa process not running now (시연 시작 시 자동 실행됨)"
   fi
 }
 

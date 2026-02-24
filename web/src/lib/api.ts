@@ -528,7 +528,17 @@ export async function analyzePatterns(): Promise<string[]> {
 export async function sendChatMessage(message: string): Promise<{ response: string; command?: string }> {
     try {
         const { data } = await api.post("/chat", { message }, { timeout: 30000 });
-        return data;
+        const response =
+            typeof data?.response === "string" && data.response.trim().length > 0
+                ? data.response
+                : typeof data?.message === "string" && data.message.trim().length > 0
+                  ? data.message
+                  : "✅ 요청을 받았어요. 한 문장만 더 구체적으로 말해주면 바로 도와줄게요.";
+        const command =
+            typeof data?.command === "string" && data.command.trim().length > 0
+                ? data.command
+                : undefined;
+        return { response, command };
     } catch (e) {
         if (axios.isAxiosError(e)) {
             const status = e.response?.status;

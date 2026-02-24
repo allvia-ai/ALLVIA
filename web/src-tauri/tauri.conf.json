@@ -1,6 +1,6 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "Steer OS",
+  "productName": "AllvIa",
   "version": "0.1.0",
   "identifier": "com.steer.os",
   "build": {
@@ -13,7 +13,7 @@
     "macOSPrivateApi": true,
     "windows": [
       {
-        "title": "Steer OS Launcher",
+        "title": "AllvIa Launcher",
         "width": 1240,
         "height": 214,
         "minWidth": 980,

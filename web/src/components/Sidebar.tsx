@@ -19,10 +19,14 @@ export function Sidebar({ active, onNavigate }: SidebarProps) {
     return (
         <aside className="w-64 border-r border-white/5 bg-black/40 backdrop-blur-xl flex flex-col h-full">
             <div className="p-6 flex items-center gap-3">
-                <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-white font-bold">
-                    S
+                <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-slate-800 to-slate-950 border border-cyan-300/40 flex items-center justify-center text-[11px] font-bold tracking-wide">
+                    <span className="text-cyan-300">A</span>
+                    <span className="text-white/90">I</span>
                 </div>
-                <h1 className="text-xl font-bold tracking-tight text-white/90">Steer OS</h1>
+                <h1 className="text-xl font-bold tracking-tight text-white/90">
+                    <span className="text-cyan-300 font-extrabold">A</span>llv
+                    <span className="text-cyan-300 font-extrabold">I</span>a
+                </h1>
             </div>
 
             <nav className="flex-1 px-4 space-y-2 mt-4">

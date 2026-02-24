@@ -7,12 +7,13 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CORE_CRATE_DIR="${ROOT_DIR}/core"
 WEB_DIR="${ROOT_DIR}/web"
 EXTERNAL_CORE_BIN="${WEB_DIR}/src-tauri/binaries/core-aarch64-apple-darwin"
-BUNDLE_APP="${WEB_DIR}/src-tauri/target/release/bundle/macos/Steer OS.app"
-APP_DST="/Applications/Steer OS.app"
+BUNDLE_APP="${WEB_DIR}/src-tauri/target/release/bundle/macos/AllvIa.app"
+APP_DST="/Applications/AllvIa.app"
 HEALTH_URL="http://127.0.0.1:5680/api/system/health"
+RUNTIME_INFO_URL="http://127.0.0.1:5680/api/system/runtime-info"
 
 echo "[1/6] Build core server binary (local_os_agent)..."
-cargo build --manifest-path "${CORE_CRATE_DIR}/Cargo.toml" --release
+cargo build --manifest-path "${CORE_CRATE_DIR}/Cargo.toml" --release --bin local_os_agent
 
 echo "[2/6] Sync externalBin core payload..."
 cp "${CORE_CRATE_DIR}/target/release/local_os_agent" "${EXTERNAL_CORE_BIN}"
@@ -29,7 +30,9 @@ if [[ ! -d "${BUNDLE_APP}" ]]; then
   exit 1
 fi
 
-echo "[4/6] Stop running Steer OS processes..."
+echo "[4/6] Stop running AllvIa processes..."
+pkill -f "AllvIa.app/Contents/MacOS/app" || true
+pkill -f "AllvIa.app/Contents/MacOS/core" || true
 pkill -f "Steer OS.app/Contents/MacOS/app" || true
 pkill -f "Steer OS.app/Contents/MacOS/core" || true
 sleep 1
@@ -53,11 +56,19 @@ done
 if [[ "${ok}" -ne 1 ]]; then
   echo "ERROR: health check failed: ${HEALTH_URL}"
   echo "Debug:"
-  ps aux | rg -i "/Applications/Steer OS.app/Contents/MacOS/(app|core)" || true
+  ps aux | rg -i "/Applications/AllvIa.app/Contents/MacOS/(app|core)" || true
   lsof -iTCP:5680 -sTCP:LISTEN -n -P || true
   exit 1
 fi
 
+runtime_bin="$(curl -fsS --max-time 3 "${RUNTIME_INFO_URL}" | jq -r '.binary_path // ""' || true)"
+if [[ "${runtime_bin}" != *"/Applications/AllvIa.app/Contents/MacOS/core"* ]]; then
+  echo "ERROR: runtime core mismatch (expected AllvIa bundle core)"
+  echo "runtime binary_path: ${runtime_bin}"
+  ps aux | rg -i "/Applications/(AllvIa|Steer OS).app/Contents/MacOS/(app|core)" || true
+  exit 1
+fi
+
 echo "OK: deploy complete"
-ps aux | rg -i "/Applications/Steer OS.app/Contents/MacOS/(app|core)" || true
+ps aux | rg -i "/Applications/AllvIa.app/Contents/MacOS/(app|core)" || true
 curl -sS --max-time 3 "${HEALTH_URL}" || true

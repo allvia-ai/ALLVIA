@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Record a demo that starts from the Steer OS app UI input box.
+# Record a demo that starts from the AllvIa app UI input box.
 # Usage:
 #   scripts/record_ui_nl_demo.sh "자연어 요청"
 #
@@ -232,31 +232,31 @@ if ! start_recording "$DISPLAY_INPUT" "$FPS"; then
   exit 1
 fi
 
-echo "🚀 Opening Steer OS and submitting prompt from UI..."
-open -a "Steer OS" >/dev/null 2>&1 || true
+echo "🚀 Opening AllvIa and submitting prompt from UI..."
+open -a "AllvIa" >/dev/null 2>&1 || true
 sleep 0.6
 osascript <<'APPLESCRIPT' >/dev/null 2>&1
-tell application "Steer OS" to activate
+tell application "AllvIa" to activate
 delay 1.0
 APPLESCRIPT
 
 STEER_PROCESS_READY="$(osascript <<'APPLESCRIPT' 2>/dev/null || true
 tell application "System Events"
-  if exists process "Steer OS" then return "1"
+  if exists process "AllvIa" then return "1"
 end tell
 return "0"
 APPLESCRIPT
 )"
 if [ "$STEER_PROCESS_READY" != "1" ]; then
-  echo "❌ Steer OS process not found. 앱이 실행되지 않아 시연을 시작할 수 없습니다."
+  echo "❌ AllvIa process not found. 앱이 실행되지 않아 시연을 시작할 수 없습니다."
   exit 1
 fi
 
 ensure_nl_mode() {
   osascript <<'APPLESCRIPT' 2>/dev/null || true
 tell application "System Events"
-  if not (exists process "Steer OS") then return "NO_PROCESS"
-  tell process "Steer OS"
+  if not (exists process "AllvIa") then return "NO_PROCESS"
+  tell process "AllvIa"
     set frontmost to true
     try
       repeat with w in windows
@@ -290,8 +290,8 @@ wait_for_launcher_input_ready() {
   while true; do
     ready="$(osascript <<'APPLESCRIPT' 2>/dev/null || true
 tell application "System Events"
-  if not (exists process "Steer OS") then return "0"
-  tell process "Steer OS"
+  if not (exists process "AllvIa") then return "0"
+  tell process "AllvIa"
     try
       repeat with w in windows
         try
@@ -315,15 +315,15 @@ APPLESCRIPT
 }
 
 if ! wait_for_launcher_input_ready 20; then
-  echo "❌ Steer OS 런처 입력창을 찾지 못했습니다(타임아웃)."
+  echo "❌ AllvIa 런처 입력창을 찾지 못했습니다(타임아웃)."
   exit 2
 fi
 
-# Read Steer OS launcher window geometry.
+# Read AllvIa launcher window geometry.
 WINDOW_GEOMETRY="$(osascript <<'APPLESCRIPT'
 tell application "System Events"
-  if not (exists process "Steer OS") then return ""
-  tell process "Steer OS"
+  if not (exists process "AllvIa") then return ""
+  tell process "AllvIa"
     set frontmost to true
     try
       set p to position of window 1
@@ -364,8 +364,8 @@ normalize_for_compare() {
 read_ui_input_value() {
   osascript <<'APPLESCRIPT' 2>/dev/null || true
 tell application "System Events"
-  if not (exists process "Steer OS") then return "__UNAVAILABLE__"
-  tell process "Steer OS"
+  if not (exists process "AllvIa") then return "__UNAVAILABLE__"
+  tell process "AllvIa"
     set frontmost to true
     try
       repeat with w in windows
@@ -389,8 +389,8 @@ set_prompt_ax() {
 on run argv
   set promptText to item 1 of argv
   tell application "System Events"
-    if not (exists process "Steer OS") then return "NO_PROCESS"
-    tell process "Steer OS"
+    if not (exists process "AllvIa") then return "NO_PROCESS"
+    tell process "AllvIa"
       set frontmost to true
       repeat with w in windows
         try

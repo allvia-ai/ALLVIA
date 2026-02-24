@@ -1003,7 +1003,7 @@ pub async fn start_api_server(
 async fn root_handler() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "online",
-        "service": "Steer OS Core API",
+        "service": "AllvIa Core API",
         "version": "v0.1.0",
         "ui_url": "http://localhost:5174",
         "docs": "/api/health"
@@ -2574,6 +2574,17 @@ async fn handle_chat(
             command: Some("greeting_local".to_string()),
         });
     }
+    if message == "야"
+        || message == "야!"
+        || message == "야?"
+        || message_lc == "hey"
+        || message_lc == "yo"
+    {
+        return Json(ChatResponse {
+            response: "응, 듣고 있어요. 바로 할 일을 말해줘.\n예: `오늘 일정 보여줘`, `패턴 분석`, `n8n 열어줘`".to_string(),
+            command: Some("greeting_local".to_string()),
+        });
+    }
     if message_lc == "system_status" || message == "시스템 상태" || message == "코어 상태"
     {
         let mut rm = monitor::ResourceMonitor::new();
@@ -2799,12 +2810,18 @@ async fn handle_chat(
                         }
                     },
                     "help" => "💡 사용 가능한 명령:\n• '이메일 보여줘'\n• '오늘 일정 뭐야?'\n• '매일 아침 9시 뉴스 요약해줘' (New!)".to_string(),
-                    _ => format!("✅ '{}' 명령을 실행합니다.", command),
+                    _ => "🤔 요청을 정확히 해석하지 못했어요.\n원하는 작업을 한 문장으로 더 구체적으로 말해줘.\n예: `오늘 일정 보여줘`, `최근 메일 5개 요약해줘`, `n8n 열어줘`".to_string(),
+                };
+
+                let response_command = if command == "unknown" {
+                    None
+                } else {
+                    Some(command.clone())
                 };
 
                 let final_response = ChatResponse {
                     response: response.clone(),
-                    command: Some(command),
+                    command: response_command,
                 };
 
                 // [Memory] Save Assistant Response
@@ -3410,7 +3427,7 @@ async fn runtime_info_handler() -> Json<RuntimeInfoResponse> {
         .cloned()
         .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
     Json(RuntimeInfoResponse {
-        service: "Steer OS Core API".to_string(),
+        service: "AllvIa Core API".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         profile: if cfg!(debug_assertions) {
             "debug".to_string()

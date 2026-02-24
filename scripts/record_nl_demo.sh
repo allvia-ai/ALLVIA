@@ -98,7 +98,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if [ "$OPEN_APP" = "1" ]; then
-  open -a "Steer OS" >/dev/null 2>&1 || true
+  open -a "AllvIa" >/dev/null 2>&1 || true
   sleep 1
 fi
 

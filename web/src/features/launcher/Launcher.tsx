@@ -278,9 +278,9 @@ const preflightPermissionHint = (message: string): string | null => {
     if (!likelyAutomationAuth) return null;
     return [
         "권한 안내:",
-        "- 시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용: `Steer OS`, `Terminal` 허용",
-        "- 시스템 설정 > 개인정보 보호 및 보안 > 자동화: `Steer OS`가 `Finder`/대상 앱 제어 허용",
-        "- 시스템 설정 > 개인정보 보호 및 보안 > 화면 기록: `Steer OS`, `Terminal` 허용 후 앱 재시작",
+        "- 시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용: `AllvIa`, `Terminal` 허용",
+        "- 시스템 설정 > 개인정보 보호 및 보안 > 자동화: `AllvIa`가 `Finder`/대상 앱 제어 허용",
+        "- 시스템 설정 > 개인정보 보호 및 보안 > 화면 기록: `AllvIa`, `Terminal` 허용 후 앱 재시작",
     ].join("\n");
 };
 
@@ -425,6 +425,7 @@ const resolveRecommendationWorkflowUrl = (
 const APPROVAL_MONITOR_MAX_ATTEMPTS = 200;
 const APPROVAL_MONITOR_INTERVAL_MS = 1800;
 const APPROVAL_MONITOR_PENDING_NOTICE_ATTEMPT = 10;
+const CHAT_TRANSCRIPT_MAX_ITEMS = 14;
 
 type ProvisioningUiState = {
     phase: "provisioning" | "failed";
@@ -452,10 +453,56 @@ const formatRecommendationStatusLabel = (
     return rec.status;
 };
 
+const recommendationStatusToneClass = (
+    rec: Recommendation,
+    uiState?: ProvisioningUiState
+): string => {
+    const label = formatRecommendationStatusLabel(rec, uiState).toLowerCase();
+    if (label.includes("provisioning")) {
+        return "border-sky-400/40 bg-sky-500/15 text-sky-200";
+    }
+    if (label.includes("failed")) {
+        return "border-rose-400/40 bg-rose-500/15 text-rose-200";
+    }
+    if (label.includes("approved") || label.includes("success")) {
+        return "border-emerald-400/40 bg-emerald-500/15 text-emerald-200";
+    }
+    return "border-white/20 bg-white/5 text-gray-300";
+};
+
+const formatProvisionUpdatedAt = (updatedAt?: number): string => {
+    if (!updatedAt) return "";
+    const deltaMs = Date.now() - updatedAt;
+    if (deltaMs < 10_000) return "just now";
+    if (deltaMs < 60_000) return `${Math.floor(deltaMs / 1000)}s ago`;
+    if (deltaMs < 3_600_000) return `${Math.floor(deltaMs / 60_000)}m ago`;
+    return `${Math.floor(deltaMs / 3_600_000)}h ago`;
+};
+
+const appendChatTranscript = (
+    prev: LauncherResult[],
+    prompt: string,
+    reply: string,
+    isError: boolean
+): LauncherResult[] => {
+    const next: LauncherResult[] = [
+        ...prev,
+        { type: "response", content: `**🙋 요청**\n${prompt}` },
+        {
+            type: isError ? "error" : "response",
+            content: `${isError ? "**⚠️ 오류**" : "**🤖 답변**"}\n${reply}`,
+        },
+    ];
+    return next.slice(-CHAT_TRANSCRIPT_MAX_ITEMS);
+};
+
 const classifyCoreBinary = (binaryPath?: string | null): "bundle" | "workspace" | "custom" | "unknown" => {
     const normalized = binaryPath?.trim() ?? "";
     if (!normalized) return "unknown";
-    if (normalized.includes("/Applications/Steer OS.app/Contents/MacOS/core")) return "bundle";
+    if (
+        normalized.includes("/Applications/AllvIa.app/Contents/MacOS/core") ||
+        normalized.includes("/Applications/Steer OS.app/Contents/MacOS/core")
+    ) return "bundle";
     if (normalized.includes("/local-os-agent/")) return "workspace";
     return "custom";
 };
@@ -574,6 +621,7 @@ export default function Launcher() {
     const runPollTokenRef = useRef(0);
     const approvalMonitorIdsRef = useRef<Set<number>>(new Set());
     const lastDispatchRef = useRef<{ promptKey: string; ts: number } | null>(null);
+    const prevComposerModeRef = useRef<ComposerMode>("nl");
     const sendThrottleRef = useRef<number>(0);
     const inputRef = useRef<HTMLInputElement>(null);
     const scrollRef = useRef<HTMLDivElement>(null);
@@ -589,6 +637,14 @@ export default function Launcher() {
             runPollTokenRef.current += 1;
         };
     }, []);
+
+    useEffect(() => {
+        if (composerMode === "chat" && prevComposerModeRef.current !== "chat") {
+            setResults([]);
+            setShowDetailPanel(true);
+        }
+        prevComposerModeRef.current = composerMode;
+    }, [composerMode]);
 
     useEffect(() => {
         if (typeof window === "undefined") return;
@@ -674,7 +730,7 @@ export default function Launcher() {
             await emit('pin-data', {
                 type: 'text',
                 content,
-                title: title || 'Pinned from Steer'
+                title: title || 'Pinned from AllvIa'
             });
 
             // 2. Show 'widget' window if hidden
@@ -1268,6 +1324,10 @@ export default function Launcher() {
         stageAssertions.length > 0 ||
         taskRunArtifacts.length > 0 ||
         !!runSnapshot;
+    const isChatComposerMode = composerMode === "chat";
+    const shouldShowDetailPanel = isChatComposerMode ? true : showDetailPanel;
+    const shouldRenderDetailPanel =
+        shouldShowDetailPanel && (isChatComposerMode || hasDetailContent);
     const checkpointHoldActive =
         runPhase === "manual_required" || runPhase === "approval_required";
     const isExecutionLocked =
@@ -1797,6 +1857,35 @@ export default function Launcher() {
             addWatchRecommendation(id, fallback ?? null);
             let trackedProvisionOpId = initialProvisionOpId ?? null;
             let pendingNoticeShown = false;
+            const reportProvisionFailure = (reason: string) => {
+                setProvisioningUiState(id, "failed", {
+                    opId: trackedProvisionOpId,
+                    detail: reason,
+                });
+                setApproveErrors((prev) => ({
+                    ...prev,
+                    [id]: `워크플로 생성 실패: ${reason}`,
+                }));
+                setResults((prev) => [
+                    ...prev.slice(-6),
+                    {
+                        type: "error",
+                        content: [
+                            "**Workflow 생성 실패**",
+                            `- recommendation_id: \`${id}\``,
+                            trackedProvisionOpId != null
+                                ? `- provision_op_id: \`${trackedProvisionOpId}\``
+                                : "",
+                            `- 상세: ${reason}`,
+                            `- 수동 확인: ${N8N_EDITOR_BASE_URL}`,
+                            "- Retry를 누르면 다시 생성을 시도합니다.",
+                        ]
+                            .filter(Boolean)
+                            .join("\n"),
+                    },
+                ]);
+                setShowDetailPanel(true);
+            };
             try {
                 for (let attempt = 0; attempt < APPROVAL_MONITOR_MAX_ATTEMPTS; attempt += 1) {
                     const latest = await fetchRecommendations();
@@ -1807,14 +1896,7 @@ export default function Launcher() {
                     const currentStatus = current?.status?.toLowerCase() ?? "";
                     if (currentStatus === "failed" || currentStatus === "rejected") {
                         const reason = current?.last_error?.trim() || "workflow provisioning failed";
-                        setProvisioningUiState(id, "failed", {
-                            opId: trackedProvisionOpId,
-                            detail: reason,
-                        });
-                        setApproveErrors((prev) => ({
-                            ...prev,
-                            [id]: `워크플로 생성 실패: ${reason}`,
-                        }));
+                        reportProvisionFailure(reason);
                         removeWatchRecommendation(id);
                         return;
                     }
@@ -1846,14 +1928,7 @@ export default function Launcher() {
                             latestProvisionOp?.error?.trim() ||
                             current?.last_error?.trim() ||
                             "workflow provisioning failed";
-                        setProvisioningUiState(id, "failed", {
-                            opId: trackedProvisionOpId,
-                            detail: reason,
-                        });
-                        setApproveErrors((prev) => ({
-                            ...prev,
-                            [id]: `워크플로 생성 실패: ${reason}`,
-                        }));
+                        reportProvisionFailure(reason);
                         removeWatchRecommendation(id);
                         return;
                     }
@@ -1928,25 +2003,10 @@ export default function Launcher() {
                         window.setTimeout(resolve, APPROVAL_MONITOR_INTERVAL_MS)
                     );
                 }
-                setApproveErrors((prev) => ({
-                    ...prev,
-                    [id]:
-                        "승인은 완료됐지만 n8n workflow URL 생성이 지연되고 있습니다. n8n 상태를 확인한 뒤 다시 시도하세요.",
-                }));
-                setProvisioningUiState(id, "failed", {
-                    opId: trackedProvisionOpId,
-                    detail: "workflow URL generation timeout",
-                });
+                reportProvisionFailure("workflow URL generation timeout");
             } catch (error) {
                 const message = error instanceof Error ? error.message : String(error);
-                setApproveErrors((prev) => ({
-                    ...prev,
-                    [id]: `워크플로 추적 실패: ${message}`,
-                }));
-                setProvisioningUiState(id, "failed", {
-                    opId: trackedProvisionOpId,
-                    detail: message,
-                });
+                reportProvisionFailure(`workflow monitor failed: ${message}`);
             } finally {
                 approvalMonitorIdsRef.current.delete(id);
                 void refetch();
@@ -1961,6 +2021,31 @@ export default function Launcher() {
             setProvisioningUiState,
         ]
     );
+
+    const copyTextValue = useCallback(async (value: string, label: string) => {
+        const candidate = value.trim();
+        if (!candidate) return;
+        try {
+            if (navigator?.clipboard?.writeText) {
+                await navigator.clipboard.writeText(candidate);
+                setArtifactActionMessage(`${label} 복사 완료: ${candidate}`);
+                return;
+            }
+            const el = document.createElement("textarea");
+            el.value = candidate;
+            el.style.position = "fixed";
+            el.style.left = "-9999px";
+            document.body.appendChild(el);
+            el.focus();
+            el.select();
+            document.execCommand("copy");
+            document.body.removeChild(el);
+            setArtifactActionMessage(`${label} 복사 완료: ${candidate}`);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            setArtifactActionMessage(`${label} 복사 실패: ${message}`);
+        }
+    }, []);
 
     const copyArtifactPayload = useCallback(async (artifact: TaskRunArtifact) => {
         const payload = JSON.stringify(
@@ -2010,6 +2095,12 @@ export default function Launcher() {
     }, []);
 
     useEffect(() => {
+        if (composerMode === "chat") {
+            if (runPhase === "completed" || runPhase === "running") {
+                setShowDetailPanel(true);
+            }
+            return;
+        }
         if (
             pendingApproval ||
             lastStatus === "manual_required" ||
@@ -2026,7 +2117,7 @@ export default function Launcher() {
         ) {
             setShowDetailPanel(false);
         }
-    }, [pendingApproval, lastStatus, runPhase, failedAssertions.length]);
+    }, [pendingApproval, lastStatus, runPhase, failedAssertions.length, composerMode]);
 
     useEffect(() => {
         if (lastStatus === "manual_required") {
@@ -2072,7 +2163,7 @@ export default function Launcher() {
         }
 
         const showOperationalPanels = composerMode !== "chat";
-        const isExpanded = showDetailPanel && hasDetailContent;
+        const isExpanded = shouldRenderDetailPanel;
         const preflightExpanded =
             showOperationalPanels &&
             showPreflightPanel &&
@@ -2107,6 +2198,7 @@ export default function Launcher() {
     }, [
         showDetailPanel,
         hasDetailContent,
+        shouldRenderDetailPanel,
         showPreflightPanel,
         showPreflightDetail,
         showAdvancedControls,
@@ -2232,20 +2324,23 @@ export default function Launcher() {
             setShowDetailPanel(true);
             setLoading(true);
             setRunPhase("running");
-            setResults([]);
             setPendingApproval(null);
             setRecoveryActionBusyKey(null);
 
             try {
                 const res = await sendChatMessage(prompt);
-                setResults([{ type: "response", content: res.response }]);
+                const content =
+                    typeof res.response === "string" && res.response.trim().length > 0
+                        ? res.response
+                        : "✅ 요청을 받았어요. 한 문장만 더 구체적으로 말해주면 바로 도와줄게요.";
+                setResults((prev) => appendChatTranscript(prev, prompt, content, false));
                 setInput("");
                 setRunPhase("completed");
                 triggerSuccess();
             } catch (error) {
                 const message =
                     error instanceof Error ? error.message : "Failed to reach chat agent.";
-                setResults([{ type: "error", content: message }]);
+                setResults((prev) => appendChatTranscript(prev, prompt, message, true));
                 setRunPhase("failed");
                 triggerError();
             } finally {
@@ -2607,7 +2702,11 @@ export default function Launcher() {
             if (shouldTryNlChatFallback(error)) {
                 try {
                     const res = await sendChatMessage(prompt);
-                    setResults([{ type: 'response', content: res.response }]);
+                    const content =
+                        typeof res.response === "string" && res.response.trim().length > 0
+                            ? res.response
+                            : "✅ 요청을 받았어요. 한 문장만 더 구체적으로 말해주면 바로 도와줄게요.";
+                    setResults([{ type: "response", content }]);
                     setInput("");
                     setRunPhase("completed");
                     triggerSuccess();
@@ -2632,7 +2731,7 @@ export default function Launcher() {
             const normalizedMsg =
                 lowerErr.includes("screen capture unavailable") ||
                 lowerErr.includes("permission missing")
-                    ? "화면 캡처 권한이 없어 실행이 중단됐습니다. 시스템 설정에서 Steer OS/Terminal의 화면 기록 권한을 켠 뒤 다시 시도하세요."
+                    ? "화면 캡처 권한이 없어 실행이 중단됐습니다. 시스템 설정에서 AllvIa/Terminal의 화면 기록 권한을 켠 뒤 다시 시도하세요."
                     : detailMsg;
             setResults([
                 {
@@ -3265,6 +3364,7 @@ export default function Launcher() {
                                 onClick={() => {
                                     setIsComposing(false);
                                     setComposerMode("chat");
+                                    setShowDetailPanel(true);
                                 }}
                                 disabled={isExecutionLocked}
                                 className={`px-3 py-1.5 text-xs rounded-lg font-medium transition-colors ${composerMode === "chat"
@@ -3697,7 +3797,11 @@ export default function Launcher() {
                             >
                                 TG 상태
                             </button>
-                            <span className="text-xl font-semibold text-gray-300 ml-1">5.2</span>
+                            <span className="text-sm font-semibold tracking-wide text-gray-200 ml-1">
+                                <span className="text-cyan-300 font-extrabold">A</span>llv
+                                <span className="text-cyan-300 font-extrabold">I</span>a
+                            </span>
+                            <span className="text-xl font-semibold text-gray-300">5.2</span>
                             {runtimeInfo && (
                                 <span
                                     className={`text-[11px] px-2 py-0.5 rounded-full border ${
@@ -3715,7 +3819,7 @@ export default function Launcher() {
                         </div>
 
                         <div className="flex items-center gap-1.5">
-                            {hasDetailContent && (
+                            {!isChatComposerMode && hasDetailContent && (
                                 <button
                                     onClick={() => setShowDetailPanel(prev => !prev)}
                                     className="text-xs px-2.5 py-1.5 rounded-full border border-white/15 bg-white/5 hover:bg-white/10 transition-colors"
@@ -3754,7 +3858,15 @@ export default function Launcher() {
                             {currentHud.label}
                         </span>
                         {runSnapshot?.runId && (
-                            <span className="text-[11px] text-gray-500">run: {runSnapshot.runId}</span>
+                            <span className="inline-flex items-center gap-1.5 text-[11px] text-gray-500">
+                                <span>run: {runSnapshot.runId}</span>
+                                <button
+                                    onClick={() => void copyTextValue(runSnapshot.runId ?? "", "run_id")}
+                                    className="px-1.5 py-0.5 rounded border border-white/15 text-gray-300 hover:bg-white/10"
+                                >
+                                    복사
+                                </button>
+                            </span>
                         )}
                         <span
                             className={`text-[11px] px-2 py-0.5 rounded-full border ${
@@ -3787,7 +3899,7 @@ export default function Launcher() {
                 </div>
 
                 <AnimatePresence>
-                    {showDetailPanel && hasDetailContent && (
+                    {shouldRenderDetailPanel && (
                         <motion.div
                             initial={{ opacity: 0, height: 0 }}
                             animate={{ opacity: 1, height: "auto" }}
@@ -4487,6 +4599,9 @@ export default function Launcher() {
                                             const canRetryProvision =
                                                 uiProvision?.phase === "failed" || rec.status === "failed";
                                             const canApprove = rec.status === "pending" || canRetryProvision;
+                                            const recN8nTarget =
+                                                recWorkflowUrl ||
+                                                (isProvisioning || canRetryProvision ? N8N_EDITOR_BASE_URL : null);
                                             return (
                                                 <div
                                                     key={rec.id}
@@ -4511,9 +4626,34 @@ export default function Launcher() {
                                                             <div className="text-xs text-gray-500 line-clamp-1">
                                                                 {rec.summary}
                                                             </div>
-                                                            <div className="mt-1 text-[10px] text-slate-400">
-                                                                status: {statusLabel}
+                                                            <div className="mt-1 flex items-center gap-1.5">
+                                                                <span
+                                                                    className={`text-[10px] px-2 py-0.5 rounded-full border ${recommendationStatusToneClass(rec, uiProvision)}`}
+                                                                >
+                                                                    {statusLabel}
+                                                                </span>
+                                                                {uiProvision?.updatedAt ? (
+                                                                    <span className="text-[10px] text-gray-500">
+                                                                        {formatProvisionUpdatedAt(uiProvision.updatedAt)}
+                                                                    </span>
+                                                                ) : null}
                                                             </div>
+                                                            {uiProvision?.opId != null && (
+                                                                <div className="mt-1 flex items-center gap-1.5">
+                                                                    <span className="text-[10px] text-gray-400">
+                                                                        op_id: {uiProvision.opId}
+                                                                    </span>
+                                                                    <button
+                                                                        onClick={(e) => {
+                                                                            e.stopPropagation();
+                                                                            void copyTextValue(String(uiProvision.opId), "provision_op_id");
+                                                                        }}
+                                                                        className="text-[10px] px-1.5 py-0.5 rounded border border-white/15 text-gray-300 hover:bg-white/10"
+                                                                    >
+                                                                        복사
+                                                                    </button>
+                                                                </div>
+                                                            )}
                                                             {(approveErrors[rec.id] || uiProvision?.phase === "failed") && (
                                                                 <div className="mt-1 text-[10px] text-rose-300">
                                                                     {approveErrors[rec.id] || uiProvision?.detail}
@@ -4534,14 +4674,14 @@ export default function Launcher() {
                                                             <Pin className="w-3 h-3" />
                                                         </button>
 
-                                                        {recWorkflowUrl && (
+                                                        {recN8nTarget && (
                                                             <button
                                                                 onClick={async (e) => {
                                                                     e.stopPropagation();
                                                                     const busyKey = `rec:${rec.id}`;
                                                                     setN8nOpenBusyKey(busyKey);
                                                                     try {
-                                                                        await openExternalTarget(recWorkflowUrl);
+                                                                        await openExternalTarget(recN8nTarget);
                                                                         setResults([
                                                                             {
                                                                                 type: "response",
@@ -4549,7 +4689,7 @@ export default function Launcher() {
                                                                                     "**n8n 편집기 열기**",
                                                                                     `- recommendation_id: \`${rec.id}\``,
                                                                                     rec.workflow_id ? `- workflow_id: \`${rec.workflow_id}\`` : "",
-                                                                                    `- URL: ${recWorkflowUrl}`,
+                                                                                    `- URL: ${recN8nTarget}`,
                                                                                 ]
                                                                                     .filter(Boolean)
                                                                                     .join("\n"),
@@ -4574,7 +4714,11 @@ export default function Launcher() {
                                                                     : 'text-sky-200 bg-sky-500/20 border-sky-400/30 hover:bg-sky-500/30'
                                                                     } ${n8nOpenBusyKey === `rec:${rec.id}` ? 'opacity-60 cursor-wait' : ''}`}
                                                             >
-                                                                {n8nOpenBusyKey === `rec:${rec.id}` ? '열기…' : 'n8n'}
+                                                                {n8nOpenBusyKey === `rec:${rec.id}`
+                                                                    ? '열기…'
+                                                                    : recWorkflowUrl
+                                                                    ? 'n8n'
+                                                                    : 'n8n 홈'}
                                                             </button>
                                                         )}
 
