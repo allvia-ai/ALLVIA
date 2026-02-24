@@ -18,6 +18,8 @@ import {
 import {
     sendChatMessage,
     approveRecommendation,
+    fetchRecommendations,
+    fetchWorkflowProvisionOps,
     agentGoalRun,
     executeGoal,
     agentIntent,
@@ -34,12 +36,14 @@ import {
     fetchTaskRunAssertions,
     fetchTaskRunArtifacts,
     fetchLockMetrics,
+    fetchRuntimeInfo,
 } from "@/lib/api";
 import type {
     AgentPreflightCheck,
     ExecutionProfile,
     LockMetrics,
     Recommendation,
+    RuntimeInfo,
     TaskRunArtifact,
     TaskRun,
     TaskStageAssertion,
@@ -218,6 +222,68 @@ const QUICK_PROGRAM_ACTIONS: QuickProgramAction[] = [
     }
 ];
 
+const summarizeGoalRunStatus = (params: {
+    mode: ComposerMode;
+    status: string;
+    runId: string;
+    plannerComplete: boolean;
+    executionComplete: boolean;
+    businessComplete: boolean;
+    summary?: string | null;
+}) => {
+    const {
+        mode,
+        status,
+        runId,
+        plannerComplete,
+        executionComplete,
+        businessComplete,
+        summary,
+    } = params;
+    const lines = [
+        `**Mode**: goal-run (${mode})`,
+        `**Status**: ${status}`,
+        `**Run ID**: ${runId}`,
+        `**Planner Complete**: ${plannerComplete ? "yes" : "no"}`,
+        `**Execution Complete**: ${executionComplete ? "yes" : "no"}`,
+        `**Business Complete**: ${businessComplete ? "yes" : "no"}`,
+        summary ? `**Summary**: ${summary}` : "",
+    ];
+    return lines.filter(Boolean).join("\n");
+};
+
+const toGoalRunResultType = (status: string, businessComplete: boolean): LauncherResult["type"] => {
+    const statusLower = status.toLowerCase();
+    const inProgress = IN_PROGRESS_RUN_STATUSES.has(statusLower);
+    if (
+        businessComplete ||
+        inProgress ||
+        statusLower === "approval_required" ||
+        statusLower === "manual_required" ||
+        statusLower === "business_completed"
+    ) {
+        return "response";
+    }
+    return "error";
+};
+
+const preflightPermissionHint = (message: string): string | null => {
+    const lower = message.toLowerCase();
+    const likelyAutomationAuth =
+        lower.includes("not authorized") ||
+        lower.includes("permission denied") ||
+        lower.includes("osstatus error -1002") ||
+        lower.includes("(-1002)") ||
+        lower.includes("osascript");
+    if (!likelyAutomationAuth) return null;
+    return [
+        "권한 안내:",
+        "- 시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용: `Steer OS`, `Terminal` 허용",
+        "- 시스템 설정 > 개인정보 보호 및 보안 > 자동화: `Steer OS`가 `Finder`/대상 앱 제어 허용",
+        "- 시스템 설정 > 개인정보 보호 및 보안 > 화면 기록: `Steer OS`, `Terminal` 허용 후 앱 재시작",
+    ].join("\n");
+};
+
 const QUICK_NL_SUGGESTIONS = [
     "오늘 받은 메일 5개 요약해줘",
     "노트에서 최근 TODO 정리해줘",
@@ -321,13 +387,27 @@ const IN_PROGRESS_RUN_STATUSES = new Set([
     "business_incomplete",
 ]);
 
+const normalizeLoopbackTarget = (raw: string): string => {
+    const trimmed = raw.trim();
+    if (!trimmed) return trimmed;
+    try {
+        const parsed = new URL(trimmed);
+        if (parsed.hostname === "127.0.0.1" || parsed.hostname === "0.0.0.0" || parsed.hostname === "::1") {
+            parsed.hostname = "localhost";
+        }
+        return parsed.toString().replace(/\/+$/, "");
+    } catch {
+        return trimmed.replace(/\/+$/, "");
+    }
+};
+
 const N8N_EDITOR_BASE_URL = (() => {
     if (typeof import.meta !== "undefined") {
         const raw = import.meta.env.VITE_N8N_EDITOR_URL as string | undefined;
-        const trimmed = raw?.trim().replace(/\/+$/, "");
-        if (trimmed) return trimmed;
+        const trimmed = raw?.trim();
+        if (trimmed) return normalizeLoopbackTarget(trimmed);
     }
-    return "http://localhost:5678";
+    return normalizeLoopbackTarget("http://localhost:5678");
 })();
 
 const resolveRecommendationWorkflowUrl = (
@@ -335,10 +415,49 @@ const resolveRecommendationWorkflowUrl = (
     workflowIdFallback?: string | null
 ): string | null => {
     const explicitUrl = rec?.workflow_url?.trim();
-    if (explicitUrl) return explicitUrl;
+    if (explicitUrl) return normalizeLoopbackTarget(explicitUrl);
     const workflowId = rec?.workflow_id?.trim() || workflowIdFallback?.trim();
     if (!workflowId) return null;
+    if (workflowId.startsWith("provisioning:")) return null;
     return `${N8N_EDITOR_BASE_URL}/workflow/${encodeURIComponent(workflowId)}`;
+};
+
+const APPROVAL_MONITOR_MAX_ATTEMPTS = 200;
+const APPROVAL_MONITOR_INTERVAL_MS = 1800;
+const APPROVAL_MONITOR_PENDING_NOTICE_ATTEMPT = 10;
+
+type ProvisioningUiState = {
+    phase: "provisioning" | "failed";
+    opId: number | null;
+    detail?: string;
+    updatedAt: number;
+};
+
+const formatRecommendationStatusLabel = (
+    rec: Recommendation,
+    uiState?: ProvisioningUiState
+): string => {
+    if (uiState?.phase === "provisioning") {
+        return "Provisioning (생성 중...)";
+    }
+    if (uiState?.phase === "failed") {
+        return "Failed (재시도)";
+    }
+    if (rec.status === "failed") {
+        return "Failed (재시도)";
+    }
+    if (rec.workflow_id?.startsWith("provisioning:")) {
+        return "Provisioning (생성 중...)";
+    }
+    return rec.status;
+};
+
+const classifyCoreBinary = (binaryPath?: string | null): "bundle" | "workspace" | "custom" | "unknown" => {
+    const normalized = binaryPath?.trim() ?? "";
+    if (!normalized) return "unknown";
+    if (normalized.includes("/Applications/Steer OS.app/Contents/MacOS/core")) return "bundle";
+    if (normalized.includes("/local-os-agent/")) return "workspace";
+    return "custom";
 };
 
 const markdownComponents: Components = {
@@ -390,7 +509,11 @@ export default function Launcher() {
     const [shake, setShake] = useState(false);
     const [approvingIds, setApprovingIds] = useState<Set<number>>(new Set());
     const [approveErrors, setApproveErrors] = useState<Record<number, string>>({});
+    const [provisioningUiByRecId, setProvisioningUiByRecId] =
+        useState<Record<number, ProvisioningUiState>>({});
     const [approveCooldowns, setApproveCooldowns] = useState<Record<number, number>>({});
+    const [watchRecommendationIds, setWatchRecommendationIds] = useState<Set<number>>(new Set());
+    const [watchRecommendationCache, setWatchRecommendationCache] = useState<Record<number, Recommendation>>({});
     const [pendingApproval, setPendingApproval] = useState<ApprovalContext | null>(null);
     const [approvalBusy, setApprovalBusy] = useState(false);
     const [lastPlanId, setLastPlanId] = useState<string | null>(null);
@@ -437,6 +560,8 @@ export default function Launcher() {
     const [showDiagnostics, setShowDiagnostics] = useState(false);
     const [lockMetrics, setLockMetrics] = useState<LockMetrics | null>(null);
     const [lockMetricsError, setLockMetricsError] = useState<string | null>(null);
+    const [runtimeInfo, setRuntimeInfo] = useState<RuntimeInfo | null>(null);
+    const [runtimeInfoError, setRuntimeInfoError] = useState<string | null>(null);
     const [artifactOpenBusy, setArtifactOpenBusy] = useState<string | null>(null);
     const [artifactActionMessage, setArtifactActionMessage] = useState<string | null>(null);
     const [n8nOpenBusyKey, setN8nOpenBusyKey] = useState<string | null>(null);
@@ -447,6 +572,7 @@ export default function Launcher() {
         handsOffReady: false,
     });
     const runPollTokenRef = useRef(0);
+    const approvalMonitorIdsRef = useRef<Set<number>>(new Set());
     const lastDispatchRef = useRef<{ promptKey: string; ts: number } | null>(null);
     const sendThrottleRef = useRef<number>(0);
     const inputRef = useRef<HTMLInputElement>(null);
@@ -567,6 +693,27 @@ export default function Launcher() {
 
     // Combine all navigable items
     const pendingRecs = recs?.filter(r => r.status === 'pending') ?? [];
+    const suggestionRecs = (() => {
+        const merged = new Map<number, Recommendation>();
+        pendingRecs.forEach((rec) => merged.set(rec.id, rec));
+        watchRecommendationIds.forEach((id) => {
+            const live = recs?.find((rec) => rec.id === id);
+            if (live) {
+                merged.set(id, live);
+                return;
+            }
+            const cached = watchRecommendationCache[id];
+            if (cached) {
+                merged.set(id, cached);
+            }
+        });
+        return Array.from(merged.values());
+    })();
+    const coreBinaryKind = classifyCoreBinary(runtimeInfo?.binary_path);
+    const isDevBundleMismatch =
+        typeof import.meta !== "undefined" &&
+        Boolean(import.meta.env.DEV) &&
+        coreBinaryKind === "bundle";
     const failedAssertions = stageAssertions.filter(a => !a.passed);
     const compactEvidence = (raw?: string | null) => {
         if (!raw) return "";
@@ -1114,7 +1261,7 @@ export default function Launcher() {
 
     const hasDetailContent =
         results.length > 0 ||
-        pendingRecs.length > 0 ||
+        suggestionRecs.length > 0 ||
         !!pendingApproval ||
         (lastStatus === "manual_required" && !!lastPlanId) ||
         stageRuns.length > 0 ||
@@ -1164,8 +1311,68 @@ export default function Launcher() {
         !!preflightError;
     const navigableItems = [
         ...results.map((r, i) => ({ type: 'result', data: r, id: `res-${i}` })),
-        ...pendingRecs.map(r => ({ type: 'recommendation', data: r, id: `rec-${r.id}` }))
+        ...suggestionRecs.map(r => ({ type: 'recommendation', data: r, id: `rec-${r.id}` }))
     ];
+
+    const setProvisioningUiState = useCallback(
+        (
+            id: number,
+            phase: ProvisioningUiState["phase"],
+            options?: { opId?: number | null; detail?: string }
+        ) => {
+            setProvisioningUiByRecId((prev) => ({
+                ...prev,
+                [id]: {
+                    phase,
+                    opId: options?.opId ?? prev[id]?.opId ?? null,
+                    detail: options?.detail,
+                    updatedAt: Date.now(),
+                },
+            }));
+        },
+        []
+    );
+
+    const clearProvisioningUiState = useCallback((id: number) => {
+        setProvisioningUiByRecId((prev) => {
+            if (!(id in prev)) return prev;
+            const next = { ...prev };
+            delete next[id];
+            return next;
+        });
+    }, []);
+
+    const addWatchRecommendation = useCallback((id: number, fallback?: Recommendation | null) => {
+        setWatchRecommendationIds((prev) => {
+            const next = new Set(prev);
+            next.add(id);
+            return next;
+        });
+        if (fallback) {
+            setWatchRecommendationCache((prev) => ({ ...prev, [id]: fallback }));
+        }
+    }, []);
+
+    const removeWatchRecommendation = useCallback((id: number) => {
+        setWatchRecommendationIds((prev) => {
+            if (!prev.has(id)) return prev;
+            const next = new Set(prev);
+            next.delete(id);
+            return next;
+        });
+        setWatchRecommendationCache((prev) => {
+            if (!(id in prev)) return prev;
+            const next = { ...prev };
+            delete next[id];
+            return next;
+        });
+        setProvisioningUiByRecId((prev) => {
+            if (!(id in prev)) return prev;
+            const next = { ...prev };
+            delete next[id];
+            return next;
+        });
+    }, []);
 
     const loadRunDiagnostics = async (runId?: string | null) => {
         if (!runId) {
@@ -1203,10 +1410,27 @@ export default function Launcher() {
         }
     }, []);
 
+    const loadRuntimeInfo = useCallback(async () => {
+        try {
+            const info = await fetchRuntimeInfo();
+            setRuntimeInfo(info);
+            setRuntimeInfoError(null);
+        } catch (error) {
+            console.error("Failed to load runtime info", error);
+            setRuntimeInfo(null);
+            setRuntimeInfoError("runtime info unavailable");
+        }
+    }, []);
+
+    useEffect(() => {
+        void loadRuntimeInfo();
+    }, [loadRuntimeInfo]);
+
     useEffect(() => {
         if (!showDiagnostics) return;
         void loadLockMetrics();
-    }, [showDiagnostics, loadLockMetrics]);
+        void loadRuntimeInfo();
+    }, [showDiagnostics, loadLockMetrics, loadRuntimeInfo]);
 
     const loadDodHistory = useCallback(async () => {
         setDodHistoryLoading(true);
@@ -1294,7 +1518,7 @@ export default function Launcher() {
     };
 
     const pollRunStatusUntilTerminal = useCallback(
-        async (runId: string) => {
+        async (runId: string, mode: ComposerMode = "nl") => {
             if (!runId) return;
             const token = Date.now();
             runPollTokenRef.current = token;
@@ -1315,6 +1539,23 @@ export default function Launcher() {
                     if (TERMINAL_RUN_STATUSES.has(statusLower)) {
                         await loadRunDiagnostics(runId);
                         await loadDodHistory();
+                        const terminalSummary = summarizeGoalRunStatus({
+                            mode,
+                            status: run.status,
+                            runId: run.run_id,
+                            plannerComplete: !!run.planner_complete,
+                            executionComplete: !!run.execution_complete,
+                            businessComplete: !!run.business_complete,
+                            summary: statusLower === "business_completed"
+                                ? "goal completed and business checks passed"
+                                : undefined,
+                        });
+                        setResults([
+                            {
+                                type: toGoalRunResultType(run.status, !!run.business_complete),
+                                content: terminalSummary,
+                            },
+                        ]);
                         if (statusLower === "business_completed") {
                             triggerSuccess();
                         } else if (!["approval_required", "manual_required"].includes(statusLower)) {
@@ -1430,7 +1671,12 @@ export default function Launcher() {
                     : currentRunId
                       ? " · 기록 없음(run 미존재)"
                       : "";
-            setPreflightFixMessage(`${fix.message}${front}${recordedMessage}`);
+            const hint = preflightPermissionHint(fix.message);
+            setPreflightFixMessage(
+                hint
+                    ? `${fix.message}${front}${recordedMessage}\n${hint}`
+                    : `${fix.message}${front}${recordedMessage}`
+            );
             if (fix.recorded && fix.run_id) {
                 await loadRunDiagnostics(fix.run_id);
                 await loadDodHistory();
@@ -1438,7 +1684,10 @@ export default function Launcher() {
             await runPreflightCheck(true);
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            setPreflightFixMessage(`자동 조치 실패: ${message}`);
+            const hint = preflightPermissionHint(message);
+            setPreflightFixMessage(
+                hint ? `자동 조치 실패: ${message}\n${hint}` : `자동 조치 실패: ${message}`
+            );
         } finally {
             setPreflightFixBusy(null);
         }
@@ -1454,7 +1703,7 @@ export default function Launcher() {
             expected?: string;
             actual?: string;
         }) => {
-            const runId = payload.runId ?? runSnapshot?.runId ?? null;
+            const runId = payload.runId ?? runSnapshot?.runId ?? dodHistory[0]?.runId ?? null;
             if (!runId) return;
             try {
                 const rec = await recordAgentRecoveryEvent({
@@ -1475,7 +1724,7 @@ export default function Launcher() {
                 setArtifactActionMessage(`복구 기록 실패: ${message}`);
             }
         },
-        [loadDodHistory, loadRunDiagnostics, runSnapshot?.runId]
+        [dodHistory, loadDodHistory, loadRunDiagnostics, runSnapshot?.runId]
     );
 
     const openArtifactPath = useCallback(async (path: string) => {
@@ -1536,6 +1785,182 @@ export default function Launcher() {
             throw new Error("popup_blocked");
         }
     }, []);
+
+    const monitorApprovedWorkflow = useCallback(
+        async (
+            id: number,
+            fallback?: Recommendation | null,
+            initialProvisionOpId?: number | null
+        ) => {
+            if (approvalMonitorIdsRef.current.has(id)) return;
+            approvalMonitorIdsRef.current.add(id);
+            addWatchRecommendation(id, fallback ?? null);
+            let trackedProvisionOpId = initialProvisionOpId ?? null;
+            let pendingNoticeShown = false;
+            try {
+                for (let attempt = 0; attempt < APPROVAL_MONITOR_MAX_ATTEMPTS; attempt += 1) {
+                    const latest = await fetchRecommendations();
+                    const current = latest.find((rec) => rec.id === id) ?? null;
+                    if (current) {
+                        setWatchRecommendationCache((prev) => ({ ...prev, [id]: current }));
+                    }
+                    const currentStatus = current?.status?.toLowerCase() ?? "";
+                    if (currentStatus === "failed" || currentStatus === "rejected") {
+                        const reason = current?.last_error?.trim() || "workflow provisioning failed";
+                        setProvisioningUiState(id, "failed", {
+                            opId: trackedProvisionOpId,
+                            detail: reason,
+                        });
+                        setApproveErrors((prev) => ({
+                            ...prev,
+                            [id]: `워크플로 생성 실패: ${reason}`,
+                        }));
+                        removeWatchRecommendation(id);
+                        return;
+                    }
+
+                    let latestProvisionOp: Awaited<
+                        ReturnType<typeof fetchWorkflowProvisionOps>
+                    >[number] | null = null;
+                    try {
+                        const ops = await fetchWorkflowProvisionOps({
+                            recommendationId: id,
+                            limit: 10,
+                        });
+                        if (trackedProvisionOpId != null) {
+                            latestProvisionOp =
+                                ops.find((op) => op.id === trackedProvisionOpId) ?? ops[0] ?? null;
+                        } else {
+                            latestProvisionOp = ops[0] ?? null;
+                        }
+                        if (latestProvisionOp) {
+                            trackedProvisionOpId = latestProvisionOp.id;
+                        }
+                    } catch {
+                        // Ignore transient provision-op API failures and continue fallback polling.
+                    }
+
+                    const opStatus = latestProvisionOp?.status?.toLowerCase() ?? "";
+                    if (opStatus === "failed" || opStatus === "reconcile_needed") {
+                        const reason =
+                            latestProvisionOp?.error?.trim() ||
+                            current?.last_error?.trim() ||
+                            "workflow provisioning failed";
+                        setProvisioningUiState(id, "failed", {
+                            opId: trackedProvisionOpId,
+                            detail: reason,
+                        });
+                        setApproveErrors((prev) => ({
+                            ...prev,
+                            [id]: `워크플로 생성 실패: ${reason}`,
+                        }));
+                        removeWatchRecommendation(id);
+                        return;
+                    }
+
+                    const workflowIdFromOp = latestProvisionOp?.workflow_id?.trim() || null;
+                    const workflowUrl =
+                        resolveRecommendationWorkflowUrl(current, workflowIdFromOp) ||
+                        resolveRecommendationWorkflowUrl(fallback ?? null, workflowIdFromOp);
+                    const workflowId =
+                        workflowIdFromOp || current?.workflow_id?.trim() || fallback?.workflow_id?.trim() || null;
+
+                    if (workflowUrl) {
+                        await openExternalTarget(workflowUrl);
+                        clearProvisioningUiState(id);
+                        setResults([
+                            {
+                                type: "response",
+                                content: [
+                                    "**Workflow 승인 완료**",
+                                    `- recommendation_id: \`${id}\``,
+                                    workflowId ? `- workflow_id: \`${workflowId}\`` : "",
+                                    trackedProvisionOpId != null
+                                        ? `- provision_op_id: \`${trackedProvisionOpId}\``
+                                        : "",
+                                    `- n8n 편집기: ${workflowUrl}`,
+                                    "- 워크플로를 자동으로 열었습니다.",
+                                ]
+                                    .filter(Boolean)
+                                    .join("\n"),
+                            },
+                        ]);
+                        setShowDetailPanel(true);
+                        removeWatchRecommendation(id);
+                        triggerSuccess();
+                        return;
+                    }
+
+                    if (
+                        (opStatus === "requested" || opStatus === "created") &&
+                        attempt >= APPROVAL_MONITOR_PENDING_NOTICE_ATTEMPT &&
+                        !pendingNoticeShown
+                    ) {
+                        setProvisioningUiState(id, "provisioning", {
+                            opId: trackedProvisionOpId,
+                            detail: opStatus || "requested",
+                        });
+                        pendingNoticeShown = true;
+                        setResults([
+                            {
+                                type: "response",
+                                content: [
+                                    "**승인 완료 · 생성 대기**",
+                                    `- recommendation_id: \`${id}\``,
+                                    trackedProvisionOpId != null
+                                        ? `- provision_op_id: \`${trackedProvisionOpId}\``
+                                        : "",
+                                    "- n8n 워크플로 생성 요청은 접수됐지만 아직 완료되지 않았습니다.",
+                                    "- 잠시 후 자동 재시도하거나, n8n 상태를 먼저 확인하세요.",
+                                ]
+                                    .filter(Boolean)
+                                    .join("\n"),
+                            },
+                        ]);
+                    } else if (opStatus === "requested" || opStatus === "created") {
+                        setProvisioningUiState(id, "provisioning", {
+                            opId: trackedProvisionOpId,
+                            detail: opStatus,
+                        });
+                    }
+
+                    await new Promise((resolve) =>
+                        window.setTimeout(resolve, APPROVAL_MONITOR_INTERVAL_MS)
+                    );
+                }
+                setApproveErrors((prev) => ({
+                    ...prev,
+                    [id]:
+                        "승인은 완료됐지만 n8n workflow URL 생성이 지연되고 있습니다. n8n 상태를 확인한 뒤 다시 시도하세요.",
+                }));
+                setProvisioningUiState(id, "failed", {
+                    opId: trackedProvisionOpId,
+                    detail: "workflow URL generation timeout",
+                });
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                setApproveErrors((prev) => ({
+                    ...prev,
+                    [id]: `워크플로 추적 실패: ${message}`,
+                }));
+                setProvisioningUiState(id, "failed", {
+                    opId: trackedProvisionOpId,
+                    detail: message,
+                });
+            } finally {
+                approvalMonitorIdsRef.current.delete(id);
+                void refetch();
+            }
+        },
+        [
+            addWatchRecommendation,
+            clearProvisioningUiState,
+            openExternalTarget,
+            refetch,
+            removeWatchRecommendation,
+            setProvisioningUiState,
+        ]
+    );
 
     const copyArtifactPayload = useCallback(async (artifact: TaskRunArtifact) => {
         const payload = JSON.stringify(
@@ -1695,7 +2120,7 @@ export default function Launcher() {
     // Reset selection when items change
     useEffect(() => {
         setSelectedIndex(0);
-    }, [results, pendingRecs.length]);
+    }, [results, suggestionRecs.length]);
 
     // Scroll to selected item
     useEffect(() => {
@@ -1879,6 +2304,19 @@ export default function Launcher() {
 
         // [Phase 6.3] Performance Test Command
         if (prompt === "test_perf") {
+            if (!import.meta.env.DEV) {
+                setResults([
+                    {
+                        type: "error",
+                        content: "`test_perf`는 개발 모드에서만 사용할 수 있습니다.",
+                    },
+                ]);
+                setShowDetailPanel(true);
+                setRunPhase("failed");
+                triggerError();
+                setLoading(false);
+                return;
+            }
             const start = performance.now();
             const dummyItems: LauncherResult[] = Array.from({ length: 1000 }, (_, i) => ({
                 type: 'response' as const,
@@ -1921,27 +2359,21 @@ export default function Launcher() {
                     });
                     await loadRunDiagnostics(goalRes.run_id);
                     await loadDodHistory();
-
-                    const summaryLines = [
-                        `**Mode**: goal-run (${composerMode})`,
-                        `**Status**: ${goalRes.status}`,
-                        `**Run ID**: ${goalRes.run_id}`,
-                        `**Planner Complete**: ${goalRes.planner_complete ? "yes" : "no"}`,
-                        `**Execution Complete**: ${goalRes.execution_complete ? "yes" : "no"}`,
-                        `**Business Complete**: ${goalRes.business_complete ? "yes" : "no"}`,
-                        goalRes.summary ? `**Summary**: ${goalRes.summary}` : "",
-                    ];
-
-                    setResults([{
-                        type:
-                            goalRes.business_complete ||
-                            goalStatusInProgress ||
-                            goalStatusLower === "approval_required" ||
-                            goalStatusLower === "manual_required"
-                                ? "response"
-                                : "error",
-                        content: summaryLines.filter(Boolean).join("\n"),
-                    }]);
+                    const summary = summarizeGoalRunStatus({
+                        mode: composerMode,
+                        status: goalRes.status,
+                        runId: goalRes.run_id,
+                        plannerComplete: !!goalRes.planner_complete,
+                        executionComplete: !!goalRes.execution_complete,
+                        businessComplete: !!goalRes.business_complete,
+                        summary: goalRes.summary,
+                    });
+                    setResults([
+                        {
+                            type: toGoalRunResultType(goalRes.status, !!goalRes.business_complete),
+                            content: summary,
+                        },
+                    ]);
                     setInput("");
 
                     if (goalStatusLower === "approval_required") {
@@ -1956,7 +2388,7 @@ export default function Launcher() {
                         triggerSuccess();
                     } else if (goalStatusInProgress) {
                         setRunPhase("running");
-                        void pollRunStatusUntilTerminal(goalRes.run_id);
+                        void pollRunStatusUntilTerminal(goalRes.run_id, composerMode);
                     } else {
                         setRunPhase("failed");
                         triggerError();
@@ -2574,13 +3006,21 @@ export default function Launcher() {
             return next;
         });
         setApprovingIds(prev => new Set(prev).add(id));
+        const sourceRec = (recs ?? []).find((rec) => rec.id === id) ?? null;
+        addWatchRecommendation(id, sourceRec);
+        setProvisioningUiState(id, "provisioning", {
+            opId: provisioningUiByRecId[id]?.opId ?? null,
+            detail: "requested",
+        });
         try {
             const approved = await approveRecommendation(id);
-            const sourceRec = (recs ?? []).find((rec) => rec.id === id);
             const workflowId = approved.workflow_id?.trim() || approved.id?.trim() || sourceRec?.workflow_id?.trim() || null;
             const workflowUrl = approved.workflow_url?.trim() || resolveRecommendationWorkflowUrl(sourceRec ?? null, workflowId);
+            const provisionOpId = approved.provision_op_id ?? null;
+            const provisionStatus = approved.provision_status?.trim() || null;
 
             if (workflowUrl) {
+                clearProvisioningUiState(id);
                 const busyKey = `approve:${id}`;
                 setN8nOpenBusyKey(busyKey);
                 try {
@@ -2592,6 +3032,7 @@ export default function Launcher() {
                                 "**Workflow 승인 완료**",
                                 `- recommendation_id: \`${id}\``,
                                 workflowId ? `- workflow_id: \`${workflowId}\`` : "",
+                                provisionOpId != null ? `- provision_op_id: \`${provisionOpId}\`` : "",
                                 `- n8n 편집기: ${workflowUrl}`,
                                 "- n8n 화면을 열어 생성 결과를 바로 확인하세요.",
                             ]
@@ -2609,6 +3050,7 @@ export default function Launcher() {
                                 "**Workflow 승인 완료 (열기 실패)**",
                                 `- recommendation_id: \`${id}\``,
                                 workflowId ? `- workflow_id: \`${workflowId}\`` : "",
+                                provisionOpId != null ? `- provision_op_id: \`${provisionOpId}\`` : "",
                                 `- n8n URL: ${workflowUrl}`,
                                 `- 열기 오류: ${openMsg}`,
                             ]
@@ -2620,13 +3062,61 @@ export default function Launcher() {
                     setShowDetailPanel(true);
                     setN8nOpenBusyKey(null);
                 }
+                removeWatchRecommendation(id);
+            } else {
+                setProvisioningUiState(id, "provisioning", {
+                    opId: provisionOpId,
+                    detail: provisionStatus ?? "requested",
+                });
+                const busyKey = `approve:${id}`;
+                setN8nOpenBusyKey(busyKey);
+                let editorOpenNote = "- n8n 편집기 홈을 먼저 열었습니다. workflow URL 준비 시 상세 페이지를 자동으로 엽니다.";
+                try {
+                    await openExternalTarget(N8N_EDITOR_BASE_URL);
+                } catch (openError) {
+                    const openMsg =
+                        openError instanceof Error ? openError.message : String(openError);
+                    editorOpenNote = `- n8n 편집기 자동 열기 실패: ${openMsg}`;
+                } finally {
+                    setN8nOpenBusyKey(null);
+                }
+                setResults([
+                    {
+                        type: "response",
+                        content: [
+                            "**승인 완료 · 생성 대기**",
+                            `- recommendation_id: \`${id}\``,
+                            provisionOpId != null ? `- provision_op_id: \`${provisionOpId}\`` : "",
+                            provisionStatus ? `- provision_status: \`${provisionStatus}\`` : "",
+                            editorOpenNote,
+                            "- workflow URL 생성 중입니다. 준비되면 해당 워크플로 편집기를 자동으로 엽니다.",
+                        ].join("\n"),
+                    },
+                ]);
+                setShowDetailPanel(true);
+                void monitorApprovedWorkflow(id, sourceRec, provisionOpId);
             }
             triggerSuccess();
         } catch (e) {
             console.error("Approve failed", e);
             triggerError();
             const raw = extractErrorMessage(e);
-            setApproveErrors(prev => ({ ...prev, [id]: mapApproveError(raw) }));
+            const mapped = mapApproveError(raw);
+            setProvisioningUiState(id, "failed", { opId: null, detail: mapped });
+            setApproveErrors(prev => ({ ...prev, [id]: mapped }));
+            setResults([
+                {
+                    type: "response",
+                    content: [
+                        "**승인 요청 지연/실패 감지**",
+                        `- recommendation_id: \`${id}\``,
+                        `- 상세: ${mapped}`,
+                        "- 백엔드 반영 여부를 확인하면서 workflow URL 생성을 추적합니다.",
+                    ].join("\n"),
+                },
+            ]);
+            setShowDetailPanel(true);
+            void monitorApprovedWorkflow(id, sourceRec, null);
         } finally {
             setApprovingIds(prev => {
                 const next = new Set(prev);
@@ -2646,7 +3136,7 @@ export default function Launcher() {
             return "워크플로우 노드가 비어 있음 (재시도 또는 최소 템플릿 확인)";
         }
         if (msg.includes("timeout")) {
-            return "요청 시간이 초과됨. 잠시 후 재시도";
+            return "요청 시간이 초과됨. 승인 접수는 됐을 수 있으니 잠시 후 상태를 확인하세요.";
         }
         if (msg.includes("connection refused")) {
             return "코어 서버 연결 실패 (5680 실행 상태 확인)";
@@ -2739,11 +3229,11 @@ export default function Launcher() {
 
     return (
         <div
-            className="w-full h-full bg-[radial-gradient(120%_90%_at_50%_0%,rgba(18,44,89,0.45),rgba(9,13,22,0.96)_62%,rgba(7,10,17,0.98)_100%)] flex items-end justify-center pb-2 sm:pb-3 px-2 sm:px-3 pointer-events-none"
+            className="launcher-root w-full h-full bg-[radial-gradient(120%_90%_at_50%_0%,rgba(18,44,89,0.45),rgba(9,13,22,0.96)_62%,rgba(7,10,17,0.98)_100%)] flex items-end justify-center pb-2 sm:pb-3 px-2 sm:px-3 pointer-events-none"
             onMouseDown={handleBackgroundClick}
         >
             <motion.div
-                className={`pointer-events-auto w-full ${launcherWidthClass} max-h-[calc(100vh-6px)] bg-[#121722]/96 backdrop-blur-2xl rounded-[18px] shadow-2xl overflow-hidden border transition-colors duration-500
+                className={`launcher-card pointer-events-auto w-full ${launcherWidthClass} max-h-[calc(100vh-6px)] bg-[#121722]/96 backdrop-blur-2xl rounded-[18px] shadow-2xl overflow-hidden border transition-colors duration-500
                     ${successPulse ? 'border-green-500/50 shadow-green-500/20' : 'border-white/10 ring-1 ring-black/5'}
                 `}
                 initial={{ scale: 0.9, opacity: 0 }}
@@ -2755,9 +3245,9 @@ export default function Launcher() {
                 transition={{ type: "spring", duration: 0.3 }}
             >
                 {/* Composer */}
-                <div className="px-4 py-3.5 bg-[#141820]">
-                    <div className="flex items-center gap-3">
-                        <div className="inline-flex items-center gap-1 rounded-xl bg-white/6 p-1 shrink-0">
+                <div className="launcher-composer px-4 py-3.5 bg-[#141820]">
+                    <div className="launcher-top-row flex items-center gap-3">
+                        <div className="launcher-mode-switch inline-flex items-center gap-1 rounded-xl bg-white/6 p-1 shrink-0">
                             <button
                                 onClick={() => {
                                     setIsComposing(false);
@@ -2901,11 +3391,11 @@ export default function Launcher() {
                             </div>
                         )}
 
-                        <div className="relative flex-1">
+                        <div className="launcher-input-wrap relative flex-1">
                             <input
                                 ref={inputRef}
                                 type="text"
-                                className="w-full h-11 sm:h-12 md:h-[50px] bg-white/[0.03] border border-white/15 rounded-xl px-3.5 sm:px-4 text-[16px] sm:text-[18px] md:text-[20px] text-white/95 placeholder-gray-500 outline-none focus:border-white/30 transition-colors"
+                                className="launcher-input w-full h-11 sm:h-12 md:h-[50px] bg-white/[0.03] border border-white/15 rounded-xl px-3.5 sm:px-4 text-[16px] sm:text-[18px] md:text-[20px] text-white/95 placeholder-gray-500 outline-none focus:border-white/30 transition-colors"
                                 placeholder={
                                     composerMode === "program"
                                         ? "버튼 또는 명령으로 실행"
@@ -2937,7 +3427,7 @@ export default function Launcher() {
                         <button
                             onClick={handleSend}
                             disabled={!input.trim() || isExecutionLocked || loading}
-                            className="w-11 h-11 sm:w-12 sm:h-12 rounded-full bg-white/18 hover:bg-white/30 disabled:opacity-40 text-white flex items-center justify-center transition-colors"
+                            className="launcher-send w-11 h-11 sm:w-12 sm:h-12 rounded-full bg-white/18 hover:bg-white/30 disabled:opacity-40 text-white flex items-center justify-center transition-colors"
                         >
                             {loading ? (
                                 <Activity className="w-5 h-5 animate-spin" />
@@ -3093,7 +3583,7 @@ export default function Launcher() {
                     )}
 
                     {composerMode === "nl" && !input.trim() && (
-                        <div className="mt-2.5 rounded-xl border border-white/10 bg-[#1b1b1b]/90 p-2.5 flex flex-nowrap gap-2 overflow-x-auto">
+                        <div className="launcher-quick-strip mt-2.5 rounded-xl border border-white/10 bg-[#1b1b1b]/90 p-2.5 flex flex-nowrap gap-2 overflow-x-auto">
                             {(compactLayoutMode ? QUICK_NL_SUGGESTIONS.slice(0, 2) : QUICK_NL_SUGGESTIONS).map((suggestion) => (
                                 <button
                                     key={suggestion}
@@ -3108,7 +3598,7 @@ export default function Launcher() {
                     )}
 
                     {composerMode === "chat" && !input.trim() && (
-                        <div className="mt-2.5 rounded-xl border border-white/10 bg-[#1b1b1b]/90 p-2.5 flex flex-nowrap gap-2 overflow-x-auto">
+                        <div className="launcher-quick-strip mt-2.5 rounded-xl border border-white/10 bg-[#1b1b1b]/90 p-2.5 flex flex-nowrap gap-2 overflow-x-auto">
                             {(compactLayoutMode ? QUICK_CHAT_SUGGESTIONS.slice(0, 2) : QUICK_CHAT_SUGGESTIONS).map((suggestion) => (
                                 <button
                                     key={suggestion}
@@ -3123,7 +3613,7 @@ export default function Launcher() {
                     )}
 
                     {composerMode === "program" && (
-                        <div className="mt-2.5 rounded-xl border border-white/10 bg-[#1b1b1b]/90 p-2.5 flex flex-nowrap gap-2 overflow-x-auto">
+                        <div className="launcher-quick-strip mt-2.5 rounded-xl border border-white/10 bg-[#1b1b1b]/90 p-2.5 flex flex-nowrap gap-2 overflow-x-auto">
                             {(compactLayoutMode ? QUICK_PROGRAM_ACTIONS.slice(0, 4) : QUICK_PROGRAM_ACTIONS).map((action) => (
                                 <button
                                     key={action.key}
@@ -3137,7 +3627,7 @@ export default function Launcher() {
                         </div>
                     )}
 
-                    <div className="mt-2.5 flex items-center justify-between text-gray-300">
+                    <div className="launcher-toolbar mt-2.5 flex items-center justify-between text-gray-300">
                         <div className="flex items-center gap-1.5">
                             <button
                                 onClick={() =>
@@ -3208,6 +3698,20 @@ export default function Launcher() {
                                 TG 상태
                             </button>
                             <span className="text-xl font-semibold text-gray-300 ml-1">5.2</span>
+                            {runtimeInfo && (
+                                <span
+                                    className={`text-[11px] px-2 py-0.5 rounded-full border ${
+                                        coreBinaryKind === "workspace"
+                                            ? "border-emerald-400/35 bg-emerald-500/15 text-emerald-200"
+                                            : coreBinaryKind === "bundle"
+                                              ? "border-amber-400/35 bg-amber-500/15 text-amber-100"
+                                              : "border-white/20 bg-white/5 text-gray-300"
+                                    }`}
+                                    title={`pid=${runtimeInfo.pid} | ${runtimeInfo.binary_path ?? "unknown"}`}
+                                >
+                                    core {runtimeInfo.version} · {coreBinaryKind}
+                                </span>
+                            )}
                         </div>
 
                         <div className="flex items-center gap-1.5">
@@ -3216,7 +3720,7 @@ export default function Launcher() {
                                     onClick={() => setShowDetailPanel(prev => !prev)}
                                     className="text-xs px-2.5 py-1.5 rounded-full border border-white/15 bg-white/5 hover:bg-white/10 transition-colors"
                                 >
-                                    {showDetailPanel ? "결과 숨기기" : `결과 보기${pendingRecs.length > 0 ? ` (${pendingRecs.length})` : ""}`}
+                                    {showDetailPanel ? "결과 숨기기" : `결과 보기${suggestionRecs.length > 0 ? ` (${suggestionRecs.length})` : ""}`}
                                 </button>
                             )}
                             {runScore && (
@@ -3243,7 +3747,7 @@ export default function Launcher() {
                     </div>
                 </div>
 
-                <div className="px-4 py-2 border-t border-white/10 bg-[#10141b] flex items-center justify-between">
+                <div className="launcher-statusbar px-4 py-2 border-t border-white/10 bg-[#10141b] flex items-center justify-between">
                     <div className="flex items-center gap-2">
                         <span className={`h-2 w-2 rounded-full ${currentHud.dot}`} />
                         <span className={`text-[11px] px-2 py-0.5 rounded-full border ${currentHud.chip}`}>
@@ -3261,6 +3765,16 @@ export default function Launcher() {
                         >
                             안전 {safeExecutionMode ? "ON" : "OFF"}
                         </span>
+                        {runtimeInfoError && (
+                            <span className="text-[11px] px-2 py-0.5 rounded-full border border-rose-400/35 bg-rose-500/15 text-rose-200">
+                                runtime info unavailable
+                            </span>
+                        )}
+                        {isDevBundleMismatch && (
+                            <span className="text-[11px] px-2 py-0.5 rounded-full border border-amber-400/35 bg-amber-500/15 text-amber-100">
+                                DEV 코드와 실행 코어가 다를 수 있음
+                            </span>
+                        )}
                     </div>
                     {runSnapshot && (
                         <div className="text-[11px] text-gray-500 text-right">
@@ -3278,7 +3792,7 @@ export default function Launcher() {
                             initial={{ opacity: 0, height: 0 }}
                             animate={{ opacity: 1, height: "auto" }}
                             exit={{ opacity: 0, height: 0 }}
-                            className="border-t border-white/10 bg-[#121212]/96"
+                            className="launcher-detail-panel border-t border-white/10 bg-[#121212]/96"
                         >
                             <div className="px-4 py-3 border-b border-white/5 bg-[#171717]">
                                 <div className="text-[11px] uppercase tracking-wider text-indigo-300 font-semibold mb-2">
@@ -3385,6 +3899,31 @@ export default function Launcher() {
                                         ) : (
                                             <div className="text-xs text-gray-400">
                                                 {lockMetricsError ?? "아직 lock telemetry를 불러오지 않았습니다."}
+                                            </div>
+                                        )}
+                                    </div>
+                                    <div className="mb-2 rounded border border-white/10 bg-white/5 px-2 py-2">
+                                        <div className="text-[11px] uppercase tracking-wider text-cyan-200 font-semibold mb-1">
+                                            Runtime Core Info
+                                        </div>
+                                        {runtimeInfo ? (
+                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-1.5 text-[11px]">
+                                                <div className="rounded border border-white/15 bg-black/20 px-2 py-1 text-gray-200">
+                                                    service={runtimeInfo.service} · version={runtimeInfo.version} · profile={runtimeInfo.profile}
+                                                </div>
+                                                <div className="rounded border border-white/15 bg-black/20 px-2 py-1 text-gray-200">
+                                                    pid={runtimeInfo.pid} · port={runtimeInfo.api_port} · no_key={runtimeInfo.allow_no_key ? "1" : "0"}
+                                                </div>
+                                                <div className="rounded border border-white/15 bg-black/20 px-2 py-1 text-gray-300 md:col-span-2 break-all">
+                                                    binary={runtimeInfo.binary_path ?? "unknown"}
+                                                </div>
+                                                <div className="rounded border border-white/15 bg-black/20 px-2 py-1 text-gray-400 md:col-span-2 break-all">
+                                                    cwd={runtimeInfo.current_dir ?? "unknown"} · started_at={runtimeInfo.started_at}
+                                                </div>
+                                            </div>
+                                        ) : (
+                                            <div className="text-xs text-gray-400">
+                                                {runtimeInfoError ?? "아직 runtime info를 불러오지 않았습니다."}
                                             </div>
                                         )}
                                     </div>
@@ -3904,7 +4443,7 @@ export default function Launcher() {
                                 </div>
                             )}
 
-                            <div ref={scrollRef} className="max-h-[240px] overflow-y-auto p-3 space-y-2">
+                            <div ref={scrollRef} className="launcher-feed max-h-[240px] overflow-y-auto p-3 space-y-2">
                                 <AnimatePresence>
                                     {results.map((res, i) => {
                                         const isSelected = navigableItems.findIndex(x => x.id === `res-${i}`) === selectedIndex;
@@ -3913,7 +4452,7 @@ export default function Launcher() {
                                                 key={i}
                                                 initial={{ opacity: 0, y: 10 }}
                                                 animate={{ opacity: 1, y: 0 }}
-                                                className={`p-3 rounded-lg text-gray-200 text-sm leading-relaxed transition-colors relative group ${isSelected ? 'bg-white/10' : 'bg-[#232323]'}`}
+                                                className={`launcher-feed-item p-3 rounded-lg text-gray-200 text-sm leading-relaxed transition-colors relative group ${isSelected ? 'bg-white/10' : 'bg-[#232323]'}`}
                                             >
                                                 <ReactMarkdown components={markdownComponents}>
                                                     {res.content}
@@ -3930,18 +4469,28 @@ export default function Launcher() {
                                     })}
                                 </AnimatePresence>
 
-                                {pendingRecs.length > 0 && (
+                                {suggestionRecs.length > 0 && (
                                     <div className="pt-1">
                                         <div className="px-1 py-1 text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-1">
                                             Suggestions
                                         </div>
-                                        {pendingRecs.map((rec, idx) => {
+                                        {suggestionRecs.map((rec, idx) => {
                                             const isSel = navigableItems[selectedIndex]?.id === `rec-${rec.id}`;
                                             const recWorkflowUrl = resolveRecommendationWorkflowUrl(rec);
+                                            const uiProvision = provisioningUiByRecId[rec.id];
+                                            const statusLabel = formatRecommendationStatusLabel(rec, uiProvision);
+                                            const isProvisioning =
+                                                uiProvision?.phase === "provisioning" ||
+                                                rec.workflow_id?.startsWith("provisioning:") ||
+                                                uiProvision?.detail === "requested" ||
+                                                uiProvision?.detail === "created";
+                                            const canRetryProvision =
+                                                uiProvision?.phase === "failed" || rec.status === "failed";
+                                            const canApprove = rec.status === "pending" || canRetryProvision;
                                             return (
                                                 <div
                                                     key={rec.id}
-                                                    className={`group flex items-center justify-between px-3 py-2 rounded-md cursor-pointer transition-all mb-1 ${isSel ? 'bg-blue-500/20 border border-blue-500/30' : 'hover:bg-white/5 border border-transparent'}`}
+                                                    className={`launcher-suggestion-row group flex items-center justify-between px-3 py-2 rounded-md cursor-pointer transition-all mb-1 ${isSel ? 'bg-blue-500/20 border border-blue-500/30' : 'hover:bg-white/5 border border-transparent'}`}
                                                     onClick={() => {
                                                         const navIndex = navigableItems.findIndex(x => x.id === `rec-${rec.id}`);
                                                         if (navIndex >= 0) {
@@ -3962,9 +4511,12 @@ export default function Launcher() {
                                                             <div className="text-xs text-gray-500 line-clamp-1">
                                                                 {rec.summary}
                                                             </div>
-                                                            {approveErrors[rec.id] && (
+                                                            <div className="mt-1 text-[10px] text-slate-400">
+                                                                status: {statusLabel}
+                                                            </div>
+                                                            {(approveErrors[rec.id] || uiProvision?.phase === "failed") && (
                                                                 <div className="mt-1 text-[10px] text-rose-300">
-                                                                    {approveErrors[rec.id]}
+                                                                    {approveErrors[rec.id] || uiProvision?.detail}
                                                                 </div>
                                                             )}
                                                         </div>
@@ -4004,6 +4556,7 @@ export default function Launcher() {
                                                                             },
                                                                         ]);
                                                                         setShowDetailPanel(true);
+                                                                        removeWatchRecommendation(rec.id);
                                                                     } catch (openError) {
                                                                         const openMsg =
                                                                             openError instanceof Error ? openError.message : String(openError);
@@ -4028,17 +4581,22 @@ export default function Launcher() {
                                                         <button
                                                             onClick={(e) => {
                                                                 e.stopPropagation();
+                                                                if (!canApprove) return;
                                                                 handleApprove(rec.id);
                                                             }}
-                                                            disabled={approvingIds.has(rec.id)}
+                                                            disabled={approvingIds.has(rec.id) || !canApprove}
                                                             className={`text-xs px-3 py-1.5 rounded transition-colors border ${isSel
                                                                 ? 'bg-blue-500 text-white border-blue-400'
                                                                 : 'text-gray-200 bg-white/10 border-white/10 hover:bg-white/20'
-                                                                } ${approvingIds.has(rec.id) ? 'opacity-60 cursor-wait' : ''}`}
+                                                                } ${(approvingIds.has(rec.id) || !canApprove) ? 'opacity-60 cursor-not-allowed' : ''}`}
                                                         >
                                                             {approvingIds.has(rec.id)
                                                                 ? 'Approving…'
-                                                                : approveErrors[rec.id]
+                                                                : isProvisioning
+                                                                    ? 'Provisioning…'
+                                                                    : !canApprove
+                                                                    ? 'Approved'
+                                                                    : canRetryProvision || approveErrors[rec.id]
                                                                     ? 'Retry'
                                                                     : 'Approve'}
                                                         </button>
@@ -4053,7 +4611,7 @@ export default function Launcher() {
                                     </div>
                                 )}
 
-                                {results.length === 0 && pendingRecs.length === 0 && !pendingApproval && (
+                                {results.length === 0 && suggestionRecs.length === 0 && !pendingApproval && (
                                     <div className="p-6 text-center text-gray-500">
                                         <Terminal className="w-10 h-10 mx-auto mb-2 opacity-20" />
                                         <p className="text-sm">결과가 준비되면 여기에 표시됩니다.</p>

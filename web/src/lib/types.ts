@@ -41,9 +41,25 @@ export const ApproveRecommendationResponseSchema = z.object({
     id: z.string().nullable().optional(),
     workflow_id: z.string().nullable().optional(),
     workflow_url: z.string().nullable().optional(),
+    provision_op_id: z.number().nullable().optional(),
+    provision_status: z.string().nullable().optional(),
+    provision_updated_at: z.string().nullable().optional(),
+    provision_claim: z.string().nullable().optional(),
     approved_now: z.boolean().optional(),
     reused_existing: z.boolean().optional(),
     message: z.string().optional(),
+});
+
+export const WorkflowProvisionOpSchema = z.object({
+    id: z.number(),
+    recommendation_id: z.number(),
+    claim_token: z.string().nullable().optional(),
+    status: z.string(),
+    workflow_id: z.string().nullable().optional(),
+    workflow_json: z.string().nullable().optional(),
+    error: z.string().nullable().optional(),
+    created_at: z.string(),
+    updated_at: z.string(),
 });
 
 export const RecommendationMetricsSchema = z.object({
@@ -445,11 +461,24 @@ export const LockMetricsSchema = z.object({
     rejected: z.number(),
 });
 
+export const RuntimeInfoSchema = z.object({
+    service: z.string(),
+    version: z.string(),
+    profile: z.string(),
+    pid: z.number(),
+    api_port: z.number(),
+    allow_no_key: z.boolean(),
+    started_at: z.string(),
+    binary_path: z.string().nullable().optional(),
+    current_dir: z.string().nullable().optional(),
+});
+
 export type SystemStatus = z.infer<typeof SystemStatusSchema>;
 export type LogEntry = z.infer<typeof LogEntrySchema>;
 export type Routine = z.infer<typeof RoutineSchema>;
 export type Recommendation = z.infer<typeof RecommendationSchema>;
 export type ApproveRecommendationResponse = z.infer<typeof ApproveRecommendationResponseSchema>;
+export type WorkflowProvisionOp = z.infer<typeof WorkflowProvisionOpSchema>;
 export type RecommendationMetrics = z.infer<typeof RecommendationMetricsSchema>;
 export type ExecApproval = z.infer<typeof ExecApprovalSchema>;
 export type ExecAllowlistEntry = z.infer<typeof ExecAllowlistSchema>;
@@ -487,3 +516,4 @@ export type ContextSelection = z.infer<typeof ContextSelectionSchema>;
 export type ProjectScan = z.infer<typeof ProjectScanSchema>;
 export type Judgment = z.infer<typeof JudgmentSchema>;
 export type LockMetrics = z.infer<typeof LockMetricsSchema>;
+export type RuntimeInfo = z.infer<typeof RuntimeInfoSchema>;

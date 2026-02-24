@@ -276,7 +276,10 @@ impl CLILLMClient {
         Some(text.to_string())
     }
 
-    fn wait_with_output_timeout(&self, mut child: std::process::Child) -> Result<std::process::Output> {
+    fn wait_with_output_timeout(
+        &self,
+        mut child: std::process::Child,
+    ) -> Result<std::process::Output> {
         let start = Instant::now();
         let timeout = Duration::from_secs(self.timeout_sec.max(1));
 

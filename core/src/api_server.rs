@@ -33,6 +33,8 @@ pub struct AppState {
 
 static INFLIGHT_AGENT_EXECUTIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static TELEGRAM_LISTENER_STARTED: OnceLock<AtomicBool> = OnceLock::new();
+static API_SERVER_STARTED_AT: OnceLock<String> = OnceLock::new();
+static INFLIGHT_PROVISION_OPS: OnceLock<Mutex<HashSet<i64>>> = OnceLock::new();
 
 fn inflight_agent_executions() -> &'static Mutex<HashSet<String>> {
     INFLIGHT_AGENT_EXECUTIONS.get_or_init(|| Mutex::new(HashSet::new()))
@@ -40,6 +42,85 @@ fn inflight_agent_executions() -> &'static Mutex<HashSet<String>> {
 
 fn telegram_listener_started_flag() -> &'static AtomicBool {
     TELEGRAM_LISTENER_STARTED.get_or_init(|| AtomicBool::new(false))
+}
+
+fn inflight_provision_ops() -> &'static Mutex<HashSet<i64>> {
+    INFLIGHT_PROVISION_OPS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn spawn_workflow_provision_recovery_loop(
+    llm_client: Option<std::sync::Arc<dyn llm_gateway::LLMClient>>,
+) {
+    tokio::spawn(async move {
+        // Startup kick to recover pending ops from previous process first.
+        let _ = db::reconcile_workflow_provision_ops(50);
+        loop {
+            match db::list_workflow_provision_ops(25, Some("requested"), None) {
+                Ok(requested_ops) => {
+                    for op in requested_ops {
+                        let claim_token = match op
+                            .claim_token
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|v| v.starts_with("provisioning:"))
+                        {
+                            Some(v) => v.to_string(),
+                            None => {
+                                let _ = db::mark_workflow_provision_failed(
+                                    op.id,
+                                    "workflow provisioning op missing valid claim token",
+                                );
+                                continue;
+                            }
+                        };
+
+                        let should_spawn = if let Ok(mut guard) = inflight_provision_ops().lock() {
+                            guard.insert(op.id)
+                        } else {
+                            false
+                        };
+                        if !should_spawn {
+                            continue;
+                        }
+
+                        let llm_for_op = llm_client.clone();
+                        tokio::spawn(async move {
+                            let preclaim = recommendation_executor::PreclaimedProvisioning {
+                                claim_token: Some(claim_token),
+                                provision_op_id: op.id,
+                                force_recreate: false,
+                            };
+                            if let Err(error) =
+                                recommendation_executor::execute_approved_recommendation_with_preclaim(
+                                    op.recommendation_id,
+                                    llm_for_op,
+                                    preclaim,
+                                )
+                                .await
+                            {
+                                eprintln!(
+                                    "⚠️ Provision recovery failed: op_id={} recommendation_id={} error={}",
+                                    op.id, op.recommendation_id, error
+                                );
+                            }
+                            if let Ok(mut guard) = inflight_provision_ops().lock() {
+                                guard.remove(&op.id);
+                            }
+                        });
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "⚠️ Failed to list requested workflow provision ops: {}",
+                        error
+                    );
+                }
+            }
+
+            let _ = db::reconcile_workflow_provision_ops(50);
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+        }
+    });
 }
 
 struct AgentExecutionGuard {
@@ -458,6 +539,7 @@ pub struct CollectorHandoffReceiptsQuery {
 pub struct WorkflowProvisionOpsQuery {
     pub limit: Option<i64>,
     pub status: Option<String>,
+    pub recommendation_id: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -479,6 +561,19 @@ pub struct RuntimeDbPathsResponse {
     pub collector_db_path: String,
     pub mismatch: bool,
     pub allow_mismatch: bool,
+}
+
+#[derive(Serialize)]
+pub struct RuntimeInfoResponse {
+    pub service: String,
+    pub version: String,
+    pub profile: String,
+    pub pid: u32,
+    pub api_port: u16,
+    pub allow_no_key: bool,
+    pub started_at: String,
+    pub binary_path: Option<String>,
+    pub current_dir: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -682,6 +777,8 @@ async fn auth_middleware(
 pub async fn start_api_server(
     llm_client: Option<std::sync::Arc<dyn llm_gateway::LLMClient>>,
 ) -> anyhow::Result<()> {
+    API_SERVER_STARTED_AT.get_or_init(|| chrono::Utc::now().to_rfc3339());
+
     if crate::env_flag("STEER_TELEGRAM_POLLING") {
         telegram_listener_started_flag().store(true, Ordering::SeqCst);
     }
@@ -703,6 +800,9 @@ pub async fn start_api_server(
         llm_client,
         current_goal: Arc::new(Mutex::new(None)),
     };
+
+    // Recover/resume in-flight workflow provisioning across core restarts.
+    spawn_workflow_provision_recovery_loop(state.llm_client.clone());
 
     // SECURITY: Restrict CORS to localhost only (Tauri/Dev Server)
     let allowed_origins = [
@@ -819,6 +919,7 @@ pub async fn start_api_server(
             get(list_collector_handoff_receipts_handler),
         )
         .route("/api/system/db-paths", get(runtime_db_paths_handler))
+        .route("/api/system/runtime-info", get(runtime_info_handler))
         .route("/api/system/lock-metrics", get(lock_metrics_handler))
         .route(
             "/api/workflow/provision-ops",
@@ -2369,7 +2470,8 @@ async fn handle_chat(
             Some(v) => v,
             None => {
                 return Json(ChatResponse {
-                    response: "❌ LLM 클라이언트가 없어 Telegram listener를 시작할 수 없습니다.".to_string(),
+                    response: "❌ LLM 클라이언트가 없어 Telegram listener를 시작할 수 없습니다."
+                        .to_string(),
                     command: Some("telegram_listener_start".to_string()),
                 })
             }
@@ -2378,7 +2480,8 @@ async fn handle_chat(
             Some(v) => v,
             None => {
                 return Json(ChatResponse {
-                    response: "❌ TELEGRAM_BOT_TOKEN이 없어 listener를 시작할 수 없습니다.".to_string(),
+                    response: "❌ TELEGRAM_BOT_TOKEN이 없어 listener를 시작할 수 없습니다."
+                        .to_string(),
                     command: Some("telegram_listener_start".to_string()),
                 })
             }
@@ -2471,7 +2574,8 @@ async fn handle_chat(
             command: Some("greeting_local".to_string()),
         });
     }
-    if message_lc == "system_status" || message == "시스템 상태" || message == "코어 상태" {
+    if message_lc == "system_status" || message == "시스템 상태" || message == "코어 상태"
+    {
         let mut rm = monitor::ResourceMonitor::new();
         return Json(ChatResponse {
             response: format!("📊 {}", rm.get_status()),
@@ -2823,10 +2927,28 @@ struct RecQueryParams {
 }
 
 fn n8n_editor_base_url() -> String {
+    let normalize = |input: &str| {
+        let mut base = input.trim().trim_end_matches('/').to_string();
+        for (from, to) in [
+            ("http://127.0.0.1", "http://localhost"),
+            ("https://127.0.0.1", "https://localhost"),
+            ("http://0.0.0.0", "http://localhost"),
+            ("https://0.0.0.0", "https://localhost"),
+            ("http://[::1]", "http://localhost"),
+            ("https://[::1]", "https://localhost"),
+        ] {
+            if base.starts_with(from) {
+                base = base.replacen(from, to, 1);
+                break;
+            }
+        }
+        base
+    };
+
     if let Ok(editor) = std::env::var("N8N_EDITOR_URL") {
         let trimmed = editor.trim().trim_end_matches('/');
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return normalize(trimmed);
         }
     }
 
@@ -2840,17 +2962,17 @@ fn n8n_editor_base_url() -> String {
         if let Some(stripped) = api.strip_suffix(suffix) {
             let candidate = stripped.trim_end_matches('/');
             if !candidate.is_empty() {
-                return candidate.to_string();
+                return normalize(candidate);
             }
         }
     }
 
-    api
+    normalize(&api)
 }
 
 fn workflow_editor_url(workflow_id: &str) -> Option<String> {
     let trimmed = workflow_id.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed.starts_with("provisioning:") {
         return None;
     }
     Some(format!("{}/workflow/{}", n8n_editor_base_url(), trimmed))
@@ -2859,6 +2981,7 @@ fn workflow_editor_url(workflow_id: &str) -> Option<String> {
 async fn list_recommendations(
     Query(params): Query<RecQueryParams>,
 ) -> Json<Vec<RecommendationItem>> {
+    let _ = db::reconcile_workflow_provision_ops(50);
     // Treat empty string as None; default to "all" for history view.
     let filter = params
         .status
@@ -2889,49 +3012,212 @@ async fn list_recommendations(
 async fn approve_recommendation(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<i64>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     println!("🔔 Received approval request for Recommendation ID: {}", id);
+    // NOTE: keep approve endpoint async-only to avoid frontend request timeout and duplicate submissions.
+    // Synchronous approval/provisioning was causing >20s hangs in production-like runs.
+    let latest_op_snapshot = |recommendation_id: i64| {
+        db::latest_workflow_provision_op(recommendation_id)
+            .ok()
+            .flatten()
+            .map(|op| (op.id, op.status, op.updated_at))
+    };
 
-    match recommendation_executor::approve_and_execute_recommendation(id, state.llm_client.clone())
-        .await
-    {
-        Ok(outcome) => {
-            let workflow_id = outcome.workflow_id;
-            let workflow_url = workflow_editor_url(&workflow_id);
-            Ok(Json(serde_json::json!({
-            "status": "success",
-            "id": workflow_id.clone(),
-            "workflow_id": workflow_id,
-            "workflow_url": workflow_url,
-            "approved_now": outcome.approved_now,
-            "reused_existing": outcome.reused_existing,
-            "message": if outcome.reused_existing {
-                "Workflow already existed; reused existing workflow_id"
-            } else {
-                "Workflow created successfully"
-            }
-        })))
-        }
-        Err(e) => {
-            let detail = e.to_string();
-            let status = if detail.contains("not found") {
-                StatusCode::NOT_FOUND
-            } else if detail.contains("rejected") {
-                StatusCode::CONFLICT
-            } else if detail.contains("workflow creation failed") {
-                StatusCode::BAD_GATEWAY
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            Err((
-                status,
+    let rec = db::get_recommendation(id)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
-                    "error": "Approval pipeline failed",
-                    "details": detail
+                    "error": "recommendation_lookup_failed",
+                    "details": e.to_string()
                 })),
-            ))
-        }
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "recommendation_not_found",
+                    "id": id
+                })),
+            )
+        })?;
+
+    if rec.status.eq_ignore_ascii_case("rejected") {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "recommendation_rejected",
+                "details": format!("recommendation {} is rejected", id),
+            })),
+        ));
     }
+
+    let approved_now = !rec.status.eq_ignore_ascii_case("approved");
+    if approved_now {
+        db::update_recommendation_review_status(id, "approved").map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "recommendation_approve_update_failed",
+                    "details": e.to_string(),
+                })),
+            )
+        })?;
+    }
+
+    if let Some(existing_id) = rec
+        .workflow_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if existing_id.starts_with("provisioning:") {
+            let latest_op = latest_op_snapshot(id);
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "status": "accepted",
+                    "id": serde_json::Value::Null,
+                    "workflow_id": serde_json::Value::Null,
+                    "workflow_url": serde_json::Value::Null,
+                    "provision_op_id": latest_op.as_ref().map(|(op_id, _, _)| *op_id),
+                    "provision_status": latest_op.as_ref().map(|(_, status, _)| status.clone()),
+                    "provision_updated_at": latest_op.as_ref().map(|(_, _, updated_at)| updated_at.clone()),
+                    "provision_claim": existing_id,
+                    "approved_now": approved_now,
+                    "reused_existing": false,
+                    "message": "Workflow provisioning already in progress",
+                })),
+            ));
+        }
+
+        let workflow_url = workflow_editor_url(existing_id);
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "success",
+                "id": existing_id,
+                "workflow_id": existing_id,
+                "workflow_url": workflow_url,
+                "provision_op_id": serde_json::Value::Null,
+                "provision_status": serde_json::Value::Null,
+                "provision_updated_at": serde_json::Value::Null,
+                "approved_now": approved_now,
+                "reused_existing": true,
+                "message": "Workflow already existed; reused existing workflow_id",
+            })),
+        ));
+    }
+
+    let provisioning = match recommendation_executor::precreate_async_provisioning(id) {
+        Ok(p) => p,
+        Err(error) => {
+            let message = error.to_string();
+            if message.contains("already being provisioned") {
+                let latest_op = latest_op_snapshot(id);
+                return Ok((
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({
+                        "status": "accepted",
+                        "id": serde_json::Value::Null,
+                        "workflow_id": serde_json::Value::Null,
+                        "workflow_url": serde_json::Value::Null,
+                        "provision_op_id": latest_op.as_ref().map(|(op_id, _, _)| *op_id),
+                        "provision_status": latest_op.as_ref().map(|(_, status, _)| status.clone()),
+                        "provision_updated_at": latest_op.as_ref().map(|(_, _, updated_at)| updated_at.clone()),
+                        "approved_now": approved_now,
+                        "reused_existing": false,
+                        "message": "Workflow provisioning already in progress",
+                    })),
+                ));
+            }
+            if message.contains("already provisioned") {
+                if let Ok(Some(latest_rec)) = db::get_recommendation(id) {
+                    if let Some(existing_id) = latest_rec
+                        .workflow_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .filter(|s| !s.starts_with("provisioning:"))
+                    {
+                        let workflow_url = workflow_editor_url(existing_id);
+                        return Ok((
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "status": "success",
+                                "id": existing_id,
+                                "workflow_id": existing_id,
+                                "workflow_url": workflow_url,
+                                "provision_op_id": serde_json::Value::Null,
+                                "provision_status": serde_json::Value::Null,
+                                "provision_updated_at": serde_json::Value::Null,
+                                "approved_now": approved_now,
+                                "reused_existing": true,
+                                "message": "Workflow already existed; reused existing workflow_id",
+                            })),
+                        ));
+                    }
+                }
+            }
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "workflow_provision_prepare_failed",
+                    "details": message,
+                })),
+            ));
+        }
+    };
+
+    let llm_client = state.llm_client.clone();
+    let provisioning_for_spawn = provisioning.clone();
+    tokio::spawn(async move {
+        match recommendation_executor::execute_approved_recommendation_with_preclaim(
+            id,
+            llm_client,
+            provisioning_for_spawn,
+        )
+        .await
+        {
+            Ok(workflow_id) => {
+                println!(
+                    "✅ Async workflow provisioning completed: recommendation={} workflow_id={}",
+                    id, workflow_id
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "⚠️ Async workflow provisioning failed: recommendation={} error={}",
+                    id, error
+                );
+            }
+        }
+    });
+
+    let latest_op = latest_op_snapshot(id);
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "status": "accepted",
+            "id": serde_json::Value::Null,
+            "workflow_id": serde_json::Value::Null,
+            "workflow_url": serde_json::Value::Null,
+            "provision_op_id": latest_op
+                .as_ref()
+                .map(|(op_id, _, _)| *op_id)
+                .or(Some(provisioning.provision_op_id)),
+            "provision_status": latest_op
+                .as_ref()
+                .map(|(_, status, _)| status.clone())
+                .or(Some("requested".to_string())),
+            "provision_updated_at": latest_op.as_ref().map(|(_, _, updated_at)| updated_at.clone()),
+            "provision_claim": provisioning.claim_token,
+            "approved_now": approved_now,
+            "reused_existing": false,
+            "message": "Approval accepted. Workflow provisioning is running asynchronously.",
+        })),
+    ))
 }
 
 async fn reject_recommendation(axum::extract::Path(id): axum::extract::Path<i64>) -> StatusCode {
@@ -3114,6 +3400,36 @@ async fn runtime_db_paths_handler() -> Json<RuntimeDbPathsResponse> {
     })
 }
 
+async fn runtime_info_handler() -> Json<RuntimeInfoResponse> {
+    let api_port = std::env::var("STEER_API_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(5680);
+    let started_at = API_SERVER_STARTED_AT
+        .get()
+        .cloned()
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    Json(RuntimeInfoResponse {
+        service: "Steer OS Core API".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        profile: if cfg!(debug_assertions) {
+            "debug".to_string()
+        } else {
+            "release".to_string()
+        },
+        pid: std::process::id(),
+        api_port,
+        allow_no_key: crate::env_flag("STEER_API_ALLOW_NO_KEY"),
+        started_at,
+        binary_path: std::env::current_exe()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string()),
+        current_dir: std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string()),
+    })
+}
+
 async fn lock_metrics_handler() -> Json<LockMetricsResponse> {
     let snapshot = crate::singleton_lock::lock_metrics_snapshot();
     Json(LockMetricsResponse {
@@ -3128,13 +3444,17 @@ async fn lock_metrics_handler() -> Json<LockMetricsResponse> {
 async fn list_workflow_provision_ops_handler(
     Query(query): Query<WorkflowProvisionOpsQuery>,
 ) -> Json<Vec<db::WorkflowProvisionOpRecord>> {
+    // Opportunistically reconcile stale requested/created ops on read so UI polling
+    // can surface terminal status without relying on a separate scheduler tick.
+    let _ = db::reconcile_workflow_provision_ops(50);
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
     let status = query
         .status
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let rows = db::list_workflow_provision_ops(limit, status).unwrap_or_default();
+    let rows =
+        db::list_workflow_provision_ops(limit, status, query.recommendation_id).unwrap_or_default();
     Json(rows)
 }
 
@@ -3513,11 +3833,7 @@ async fn run_goal_sync_handler(
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let result = planner
-            .run_goal_tracked_with_run_id(
-                &spawned_run_id,
-                &goal_owned,
-                session_owned.as_deref(),
-            )
+            .run_goal_tracked_with_run_id(&spawned_run_id, &goal_owned, session_owned.as_deref())
             .await;
         let _ = tx.send(result);
     });

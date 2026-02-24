@@ -1,10 +1,11 @@
-import { Home, PlayCircle, Settings, FileText } from "lucide-react";
+import { Home, PlayCircle, Settings, FileText, MessageCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const navItems = [
     { icon: Home, label: "Dashboard", id: "dashboard" },
     { icon: PlayCircle, label: "Routines", id: "routines" },
     { icon: FileText, label: "Workflows", id: "workflows" },
+    { icon: MessageCircle, label: "Chat", id: "chat" },
     { icon: Settings, label: "Settings", id: "settings" },
 ];
 

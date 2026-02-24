@@ -400,7 +400,8 @@ impl Planner {
             return true;
         }
 
-        let simple_open_goal = (apps.len() == 1 || (apps.is_empty() && inferred_open_app.is_some()))
+        let simple_open_goal = (apps.len() == 1
+            || (apps.is_empty() && inferred_open_app.is_some()))
             && Self::goal_has_open_signal(&lower)
             && !Self::goal_has_write_signal(&lower)
             && !Self::goal_has_payload_tokens(goal);
@@ -448,22 +449,8 @@ impl Planner {
         Self::goal_contains_any(
             lower,
             &[
-                "open",
-                "launch",
-                "열어",
-                "열고",
-                "실행",
-                "켜",
-                "띄워",
-                "abre",
-                "abrir",
-                "ouvre",
-                "ouvrir",
-                "öffne",
-                "oeffne",
-                "開",
-                "打开",
-                "開啟",
+                "open", "launch", "열어", "열고", "실행", "켜", "띄워", "abre", "abrir", "ouvre",
+                "ouvrir", "öffne", "oeffne", "開", "打开", "開啟",
             ],
         )
     }
@@ -969,11 +956,10 @@ impl Planner {
         }
 
         if Self::goal_targets_todo_summary(goal) {
-            let target_app =
-                if goal_lower.contains("notes")
-                    || goal_lower.contains("메모")
-                    || goal_lower.contains("노트")
-                {
+            let target_app = if goal_lower.contains("notes")
+                || goal_lower.contains("메모")
+                || goal_lower.contains("노트")
+            {
                 "Notes"
             } else {
                 Self::text_staging_app()
@@ -2519,10 +2505,8 @@ Rules:
             }
         );
 
-        let recovery_timeout = Duration::from_secs(Self::env_u64(
-            "STEER_PLANNER_RECOVERY_TIMEOUT_SEC",
-            14,
-        ));
+        let recovery_timeout =
+            Duration::from_secs(Self::env_u64("STEER_PLANNER_RECOVERY_TIMEOUT_SEC", 14));
         let messages = vec![
             serde_json::json!({"role": "system", "content": system_prompt}),
             serde_json::json!({"role": "user", "content": user_prompt}),
@@ -3150,7 +3134,8 @@ Rules:
         let max_wall_seconds = Self::env_u64("STEER_GOAL_MAX_WALL_SEC", 240);
         let max_wall_duration = Duration::from_secs(max_wall_seconds.max(30));
         let max_repeat_loop_hits = Self::env_usize("STEER_MAX_REPEAT_LOOP_HITS", 6).max(2);
-        let max_attempts_per_plan_key = Self::env_usize("STEER_MAX_ATTEMPTS_PER_PLAN_KEY", 12).max(3);
+        let max_attempts_per_plan_key =
+            Self::env_usize("STEER_MAX_ATTEMPTS_PER_PLAN_KEY", 12).max(3);
 
         Self::run_standard_cleanup_preset(goal, &mut history).await;
 
@@ -3226,20 +3211,20 @@ Rules:
                     Duration::from_secs(Self::env_u64("STEER_PLANNER_PLAN_TIMEOUT_SEC", 10));
                 let primary_result =
                     crate::retry_logic::with_retry(&retry_config, "LLM Vision", || async {
-                    tokio::time::timeout(
-                        plan_timeout,
-                        self.llm
-                            .plan_vision_step(goal, &image_b64, &history_with_context),
-                    )
-                    .await
-                    .map_err(|_| {
-                        anyhow::anyhow!(
-                            "planner plan_vision_step timeout after {}s",
-                            plan_timeout.as_secs()
+                        tokio::time::timeout(
+                            plan_timeout,
+                            self.llm
+                                .plan_vision_step(goal, &image_b64, &history_with_context),
                         )
-                    })?
-                })
-                .await;
+                        .await
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "planner plan_vision_step timeout after {}s",
+                                plan_timeout.as_secs()
+                            )
+                        })?
+                    })
+                    .await;
 
                 match primary_result {
                     Ok(v) => v,
@@ -3329,10 +3314,8 @@ Rules:
                             "STEER_PLANNER_SUPERVISOR_TIMEOUT_SEC",
                             6,
                         ));
-                        let supervisor_result = crate::retry_logic::with_retry(
-                            &retry_config,
-                            "Supervisor",
-                            || async {
+                        let supervisor_result =
+                            crate::retry_logic::with_retry(&retry_config, "Supervisor", || async {
                                 tokio::time::timeout(
                                     supervisor_timeout,
                                     Supervisor::consult(&*self.llm, goal, &plan, &history),
@@ -3344,9 +3327,8 @@ Rules:
                                         supervisor_timeout.as_secs()
                                     )
                                 })?
-                            },
-                        )
-                        .await;
+                            })
+                            .await;
 
                         match supervisor_result {
                             Ok(supervisor_decision) => {
@@ -3365,10 +3347,7 @@ Rules:
                                 let fail_open =
                                     Self::env_truthy_default("STEER_SUPERVISOR_FAIL_OPEN", true);
                                 if fail_open && Self::is_soft_planner_failure(&err_text) {
-                                    println!(
-                                        "   🧯 Supervisor fail-open: {}",
-                                        err_text
-                                    );
+                                    println!("   🧯 Supervisor fail-open: {}", err_text);
                                     history.push(format!("SUPERVISOR_FAIL_OPEN: {}", err_text));
                                     (
                                         "accept".to_string(),
@@ -3614,7 +3593,8 @@ Rules:
             if plan["action"].as_str() == Some("wait")
                 && Self::has_quota_exhaustion_marker(&history)
             {
-                let msg = "Planner aborted: provider quota/rate-limit detected and wait-loop suppressed.";
+                let msg =
+                    "Planner aborted: provider quota/rate-limit detected and wait-loop suppressed.";
                 history.push(format!("QUOTA_ABORTED: {}", msg));
                 return Err(anyhow::anyhow!(msg));
             }

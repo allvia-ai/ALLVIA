@@ -2579,21 +2579,24 @@ pub fn list_collector_handoff_receipts(limit: i64) -> Result<Vec<CollectorHandof
 pub fn list_workflow_provision_ops(
     limit: i64,
     status: Option<&str>,
+    recommendation_id: Option<i64>,
 ) -> Result<Vec<WorkflowProvisionOpRecord>> {
     let mut lock = get_db_lock();
     if let Some(conn) = lock.as_mut() {
         let capped = limit.clamp(1, 500);
         let mut rows_out = Vec::new();
-        match status.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(status_filter) => {
+        let status_filter = status.map(str::trim).filter(|s| !s.is_empty());
+        match (recommendation_id, status_filter) {
+            (Some(rec_id), Some(status_value)) => {
                 let mut stmt = conn.prepare(
                     "SELECT id, recommendation_id, claim_token, status, workflow_id, workflow_json, error, created_at, updated_at
                      FROM workflow_provision_ops
-                     WHERE status = ?1
+                     WHERE recommendation_id = ?1
+                       AND status = ?2
                      ORDER BY updated_at DESC
-                     LIMIT ?2",
+                     LIMIT ?3",
                 )?;
-                let rows = stmt.query_map(params![status_filter, capped], |row| {
+                let rows = stmt.query_map(params![rec_id, status_value, capped], |row| {
                     Ok(WorkflowProvisionOpRecord {
                         id: row.get(0)?,
                         recommendation_id: row.get(1)?,
@@ -2610,7 +2613,57 @@ pub fn list_workflow_provision_ops(
                     rows_out.push(row?);
                 }
             }
-            None => {
+            (Some(rec_id), None) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, recommendation_id, claim_token, status, workflow_id, workflow_json, error, created_at, updated_at
+                     FROM workflow_provision_ops
+                     WHERE recommendation_id = ?1
+                     ORDER BY updated_at DESC
+                     LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![rec_id, capped], |row| {
+                    Ok(WorkflowProvisionOpRecord {
+                        id: row.get(0)?,
+                        recommendation_id: row.get(1)?,
+                        claim_token: row.get(2)?,
+                        status: row.get(3)?,
+                        workflow_id: row.get(4)?,
+                        workflow_json: row.get(5)?,
+                        error: row.get(6)?,
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
+                    })
+                })?;
+                for row in rows {
+                    rows_out.push(row?);
+                }
+            }
+            (None, Some(status_value)) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, recommendation_id, claim_token, status, workflow_id, workflow_json, error, created_at, updated_at
+                     FROM workflow_provision_ops
+                     WHERE status = ?1
+                     ORDER BY updated_at DESC
+                     LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![status_value, capped], |row| {
+                    Ok(WorkflowProvisionOpRecord {
+                        id: row.get(0)?,
+                        recommendation_id: row.get(1)?,
+                        claim_token: row.get(2)?,
+                        status: row.get(3)?,
+                        workflow_id: row.get(4)?,
+                        workflow_json: row.get(5)?,
+                        error: row.get(6)?,
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
+                    })
+                })?;
+                for row in rows {
+                    rows_out.push(row?);
+                }
+            }
+            (None, None) => {
                 let mut stmt = conn.prepare(
                     "SELECT id, recommendation_id, claim_token, status, workflow_id, workflow_json, error, created_at, updated_at
                      FROM workflow_provision_ops
@@ -2638,6 +2691,13 @@ pub fn list_workflow_provision_ops(
         return Ok(rows_out);
     }
     Ok(Vec::new())
+}
+
+pub fn latest_workflow_provision_op(
+    recommendation_id: i64,
+) -> Result<Option<WorkflowProvisionOpRecord>> {
+    let rows = list_workflow_provision_ops(1, None, Some(recommendation_id))?;
+    Ok(rows.into_iter().next())
 }
 
 pub fn get_nl_run_metrics(limit: i64) -> Result<NLRunMetrics> {
@@ -3422,9 +3482,76 @@ pub fn commit_workflow_provision_success(
 
 pub fn reconcile_workflow_provision_ops(limit: i64) -> Result<Vec<String>> {
     let capped = limit.clamp(1, 200);
+    let requested_timeout_secs = std::env::var("STEER_WORKFLOW_PROVISION_REQUESTED_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .map(|v| v.clamp(15, 86_400))
+        .unwrap_or(180);
     let mut lock = get_db_lock();
     let mut outcomes = Vec::new();
     if let Some(conn) = lock.as_mut() {
+        let mut stale_stmt = conn.prepare(
+            "SELECT id, recommendation_id, claim_token, updated_at
+             FROM workflow_provision_ops
+             WHERE status = 'requested'
+             ORDER BY updated_at ASC
+             LIMIT ?1",
+        )?;
+        let stale_rows = stale_stmt.query_map(params![capped], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+
+        for stale in stale_rows {
+            let (op_id, recommendation_id, claim_token, updated_at) = stale?;
+            let updated = match chrono::DateTime::parse_from_rfc3339(&updated_at) {
+                Ok(ts) => ts.with_timezone(&chrono::Utc),
+                Err(_) => continue,
+            };
+            let age_secs = chrono::Utc::now()
+                .signed_duration_since(updated)
+                .num_seconds();
+            if age_secs < requested_timeout_secs {
+                continue;
+            }
+            let msg = format!(
+                "workflow provisioning request timed out after {}s (age={}s)",
+                requested_timeout_secs, age_secs
+            );
+            let _ =
+                update_workflow_provision_op_status_with_conn(conn, op_id, "failed", Some(&msg));
+            if let Some(token) = claim_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| v.starts_with("provisioning:"))
+            {
+                let _ = conn.execute(
+                    "UPDATE recommendations
+                     SET workflow_id = NULL,
+                         last_error = ?1
+                     WHERE id = ?2
+                       AND workflow_id = ?3",
+                    params![msg, recommendation_id, token],
+                );
+            } else {
+                let _ = conn.execute(
+                    "UPDATE recommendations
+                     SET last_error = ?1
+                     WHERE id = ?2",
+                    params![msg, recommendation_id],
+                );
+            }
+            outcomes.push(format!(
+                "op {} timed out from requested -> failed (recommendation {})",
+                op_id, recommendation_id
+            ));
+        }
+        drop(stale_stmt);
+
         let mut stmt = conn.prepare(
             "SELECT id, recommendation_id, claim_token, status, workflow_id, workflow_json, error, created_at, updated_at
              FROM workflow_provision_ops

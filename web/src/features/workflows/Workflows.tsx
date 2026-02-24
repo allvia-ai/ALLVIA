@@ -23,6 +23,21 @@ export default function Workflows() {
         onError: (error) => alert(`Reject failed: ${error}`),
     });
 
+    const n8nEditorBaseUrl = (() => {
+        const raw = import.meta.env.VITE_N8N_EDITOR_URL as string | undefined;
+        const trimmed = raw?.trim().replace(/\/+$/, "");
+        return trimmed || "http://localhost:5678";
+    })();
+
+    const resolveWorkflowUrl = (workflowUrl?: string | null, workflowId?: string | null) => {
+        const direct = workflowUrl?.trim();
+        if (direct) return direct;
+        const id = workflowId?.trim();
+        if (!id) return null;
+        if (id.startsWith("provisioning:")) return null;
+        return `${n8nEditorBaseUrl}/workflow/${encodeURIComponent(id)}`;
+    };
+
     return (
         <div className="space-y-6">
             <div className="flex items-center justify-between">
@@ -80,14 +95,26 @@ export default function Workflows() {
                                         </>
                                     )}
                                     {rec.status === 'approved' && (
-                                        <a
-                                            href="http://localhost:5678"
-                                            target="_blank"
-                                            rel="noopener noreferrer"
-                                            className="w-full flex items-center justify-center gap-2 py-2 rounded-lg bg-primary/10 text-primary hover:bg-primary/20 text-sm font-medium transition-colors"
-                                        >
-                                            <ExternalLink className="w-4 h-4" /> Open in n8n
-                                        </a>
+                                        (() => {
+                                            const workflowUrl = resolveWorkflowUrl(rec.workflow_url, rec.workflow_id);
+                                            if (!workflowUrl) {
+                                                return (
+                                                    <div className="w-full flex items-center justify-center gap-2 py-2 rounded-lg bg-white/5 text-muted-foreground text-sm font-medium border border-white/10">
+                                                        <ExternalLink className="w-4 h-4" /> Preparing workflow...
+                                                    </div>
+                                                );
+                                            }
+                                            return (
+                                                <a
+                                                    href={workflowUrl}
+                                                    target="_blank"
+                                                    rel="noopener noreferrer"
+                                                    className="w-full flex items-center justify-center gap-2 py-2 rounded-lg bg-primary/10 text-primary hover:bg-primary/20 text-sm font-medium transition-colors"
+                                                >
+                                                    <ExternalLink className="w-4 h-4" /> Open in n8n
+                                                </a>
+                                            );
+                                        })()
                                     )}
                                 </div>
                             </CardContent>

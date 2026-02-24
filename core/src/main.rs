@@ -767,7 +767,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(c) = llm_client.clone() {
         if env_flag("STEER_DISABLE_ANALYZER") {
             spawn_event_persist_only(log_rx);
-            println!("⚠️  Shadow Analyzer disabled via STEER_DISABLE_ANALYZER=1 (events still saved)");
+            println!(
+                "⚠️  Shadow Analyzer disabled via STEER_DISABLE_ANALYZER=1 (events still saved)"
+            );
         } else {
             analyzer::spawn(log_rx, c);
         }

@@ -123,7 +123,11 @@ impl Orchestrator {
         }
 
         // If the LLM chain fails, return a deterministic fallback response instead of bubbling an error.
-        let proposal = match self.llm.propose_workflow(&[workflow_request.to_string()]).await {
+        let proposal = match self
+            .llm
+            .propose_workflow(&[workflow_request.to_string()])
+            .await
+        {
             Ok(p) => p,
             Err(e) => {
                 return Ok(format!(

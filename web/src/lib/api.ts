@@ -6,6 +6,7 @@ import {
     RecommendationSchema,
     ApproveRecommendationResponseSchema,
     RecommendationMetricsSchema,
+    WorkflowProvisionOpSchema,
     ExecApprovalSchema,
     ExecAllowlistSchema,
     ExecResultSchema,
@@ -39,12 +40,14 @@ import {
     ProjectScanSchema,
     JudgmentSchema,
     LockMetricsSchema,
+    RuntimeInfoSchema,
     type SystemStatus,
     type Routine,
     type LogEntry,
     type Recommendation,
     type ApproveRecommendationResponse,
     type RecommendationMetrics,
+    type WorkflowProvisionOp,
     type ExecApproval,
     type ExecAllowlistEntry,
     type ExecResult,
@@ -79,6 +82,7 @@ import {
     type ProjectScan,
     type Judgment,
     type LockMetrics,
+    type RuntimeInfo,
     type QualityScore,
 } from "./types";
 import { z } from "zod";
@@ -107,6 +111,11 @@ export async function fetchLockMetrics(): Promise<LockMetrics> {
     return LockMetricsSchema.parse(data);
 }
 
+export async function fetchRuntimeInfo(): Promise<RuntimeInfo> {
+    const { data } = await api.get("/system/runtime-info");
+    return RuntimeInfoSchema.parse(data);
+}
+
 export async function fetchLogs(): Promise<LogEntry[]> {
     const { data } = await api.get("/logs");
     return z.array(LogEntrySchema).parse(data);
@@ -132,8 +141,28 @@ export async function fetchRecommendations(): Promise<Recommendation[]> {
 }
 
 export async function approveRecommendation(id: number): Promise<ApproveRecommendationResponse> {
-    const { data } = await api.post(`/recommendations/${id}/approve`, undefined, { timeout: 20000 });
+    const { data } = await api.post(`/recommendations/${id}/approve`, undefined, { timeout: 8000 });
     return ApproveRecommendationResponseSchema.parse(data);
+}
+
+export type WorkflowProvisionOpsQuery = {
+    limit?: number;
+    status?: string;
+    recommendationId?: number;
+};
+
+export async function fetchWorkflowProvisionOps(
+    query: WorkflowProvisionOpsQuery = {}
+): Promise<WorkflowProvisionOp[]> {
+    const params = new URLSearchParams();
+    if (query.limit != null) params.set("limit", String(query.limit));
+    if (query.status?.trim()) params.set("status", query.status.trim());
+    if (query.recommendationId != null) {
+        params.set("recommendation_id", String(query.recommendationId));
+    }
+    const qs = params.toString();
+    const { data } = await api.get(`/workflow/provision-ops${qs ? `?${qs}` : ""}`);
+    return z.array(WorkflowProvisionOpSchema).parse(data);
 }
 
 export async function rejectRecommendation(id: number): Promise<void> {

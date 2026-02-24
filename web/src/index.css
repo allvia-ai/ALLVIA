@@ -31,6 +31,10 @@
     --border: 240 3.7% 15.9%;
     --input: 240 3.7% 15.9%;
     --ring: 240 4.9% 83.9%;
+    --launcher-accent: 182 89% 59%;
+    --launcher-accent-2: 221 88% 67%;
+    --launcher-text-main: 213 34% 93%;
+    --launcher-text-dim: 214 16% 67%;
   }
 
   html,
@@ -46,10 +50,234 @@
 
   body {
     @apply bg-background text-foreground antialiased;
+    font-family: "Avenir Next", "Pretendard Variable", "Pretendard", "SUIT Variable", "SF Pro Display", "Noto Sans KR", "Segoe UI", sans-serif;
     font-feature-settings: "rlig" 1, "calt" 1;
     background-image: none;
     background-color: transparent;
     min-height: 100%;
+  }
+}
+
+@layer components {
+  @keyframes launcher-grain-shift {
+    0% { transform: translate3d(0, 0, 0); }
+    50% { transform: translate3d(-2%, 2%, 0); }
+    100% { transform: translate3d(0, 0, 0); }
+  }
+
+  @keyframes launcher-card-glow {
+    0% { opacity: 0.2; transform: translateX(-4%) scale(1); }
+    50% { opacity: 0.45; transform: translateX(5%) scale(1.05); }
+    100% { opacity: 0.2; transform: translateX(-4%) scale(1); }
+  }
+
+  .launcher-root {
+    position: relative;
+    color: hsl(var(--launcher-text-main));
+    background:
+      radial-gradient(130% 95% at 0% 0%, rgba(54, 91, 214, 0.28), transparent 52%),
+      radial-gradient(120% 90% at 100% 0%, rgba(23, 202, 214, 0.21), transparent 54%),
+      linear-gradient(164deg, rgba(5, 14, 32, 0.98) 0%, rgba(8, 18, 34, 0.96) 48%, rgba(20, 11, 33, 0.94) 100%);
+  }
+
+  .launcher-root::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    opacity: 0.28;
+    background-image:
+      radial-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1px),
+      radial-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+    background-size: 14px 14px, 22px 22px;
+    background-position: 0 0, 7px 7px;
+    animation: launcher-grain-shift 14s ease-in-out infinite;
+  }
+
+  .launcher-card {
+    position: relative;
+    border: 1px solid rgba(123, 175, 255, 0.22) !important;
+    border-radius: 20px !important;
+    background: linear-gradient(180deg, rgba(10, 19, 39, 0.9) 0%, rgba(9, 14, 28, 0.97) 100%) !important;
+    box-shadow:
+      0 28px 68px rgba(5, 9, 19, 0.58),
+      0 12px 30px rgba(47, 98, 247, 0.18),
+      inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  }
+
+  .launcher-card::after {
+    content: "";
+    position: absolute;
+    left: -12%;
+    right: -12%;
+    top: -54%;
+    height: 58%;
+    pointer-events: none;
+    border-radius: 50%;
+    background: radial-gradient(closest-side, rgba(94, 164, 255, 0.26), transparent 70%);
+    filter: blur(24px);
+    animation: launcher-card-glow 7s ease-in-out infinite;
+  }
+
+  .launcher-composer {
+    position: relative;
+    border-bottom: 1px solid rgba(129, 166, 245, 0.16);
+    background: linear-gradient(180deg, rgba(16, 26, 49, 0.92), rgba(13, 21, 38, 0.9)) !important;
+  }
+
+  .launcher-mode-switch {
+    border: 1px solid rgba(131, 170, 255, 0.24);
+    background: rgba(9, 17, 36, 0.75) !important;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  }
+
+  .launcher-mode-switch button {
+    border-radius: 10px;
+    color: hsl(var(--launcher-text-dim));
+  }
+
+  .launcher-mode-switch button:hover:not(:disabled) {
+    background: rgba(96, 133, 224, 0.24);
+    color: rgba(229, 240, 255, 0.96);
+  }
+
+  .launcher-mode-switch button[class*="bg-white/15"] {
+    background: linear-gradient(135deg, rgba(83, 129, 245, 0.9), rgba(52, 196, 207, 0.78)) !important;
+    color: rgba(237, 248, 255, 0.98) !important;
+    box-shadow: 0 10px 22px rgba(43, 122, 229, 0.28);
+  }
+
+  .launcher-input-wrap::before {
+    content: "";
+    position: absolute;
+    inset: -3px;
+    border-radius: 14px;
+    pointer-events: none;
+    background: radial-gradient(55% 75% at 50% 0%, rgba(80, 153, 251, 0.26), transparent 85%);
+    opacity: 0.9;
+  }
+
+  .launcher-input {
+    position: relative;
+    background: rgba(7, 16, 33, 0.88) !important;
+    border-color: rgba(120, 168, 255, 0.34) !important;
+    color: rgba(235, 244, 255, 0.98) !important;
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.08),
+      0 10px 26px rgba(8, 18, 41, 0.42);
+  }
+
+  .launcher-input::placeholder {
+    color: rgba(162, 181, 213, 0.82) !important;
+  }
+
+  .launcher-input:focus {
+    border-color: rgba(92, 196, 224, 0.82) !important;
+    box-shadow:
+      0 0 0 1px rgba(100, 208, 224, 0.44),
+      0 0 0 5px rgba(83, 136, 243, 0.14),
+      0 16px 34px rgba(9, 18, 39, 0.56) !important;
+  }
+
+  .launcher-send {
+    border: 1px solid rgba(139, 214, 230, 0.45);
+    background: linear-gradient(140deg, rgba(80, 130, 249, 0.9), rgba(45, 194, 206, 0.82)) !important;
+    box-shadow: 0 14px 26px rgba(36, 124, 228, 0.32);
+  }
+
+  .launcher-send:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 18px 32px rgba(36, 124, 228, 0.42);
+  }
+
+  .launcher-quick-strip {
+    border-color: rgba(127, 157, 219, 0.24) !important;
+    background: linear-gradient(180deg, rgba(13, 24, 47, 0.86), rgba(9, 17, 34, 0.88)) !important;
+  }
+
+  .launcher-quick-strip button {
+    border-color: rgba(111, 151, 230, 0.22) !important;
+    background: rgba(17, 31, 59, 0.74) !important;
+    color: rgba(222, 234, 252, 0.95) !important;
+  }
+
+  .launcher-quick-strip button:hover:not(:disabled) {
+    border-color: rgba(104, 212, 224, 0.48) !important;
+    background: rgba(33, 65, 122, 0.86) !important;
+  }
+
+  .launcher-toolbar {
+    border-top: 1px solid rgba(128, 154, 214, 0.14);
+    padding-top: 10px;
+  }
+
+  .launcher-toolbar button {
+    border-color: rgba(116, 146, 213, 0.18);
+  }
+
+  .launcher-statusbar {
+    border-top-color: rgba(132, 165, 235, 0.16) !important;
+    background: linear-gradient(180deg, rgba(7, 14, 27, 0.95), rgba(8, 12, 21, 0.92)) !important;
+  }
+
+  .launcher-detail-panel {
+    background: linear-gradient(180deg, rgba(11, 18, 34, 0.95), rgba(9, 13, 23, 0.97)) !important;
+  }
+
+  .launcher-detail-panel > div:nth-child(odd) {
+    background: rgba(18, 25, 41, 0.6) !important;
+  }
+
+  .launcher-detail-panel > div:nth-child(even) {
+    background: rgba(13, 20, 34, 0.6) !important;
+  }
+
+  .launcher-feed {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(97, 143, 222, 0.66) rgba(12, 20, 36, 0.75);
+  }
+
+  .launcher-feed::-webkit-scrollbar {
+    width: 9px;
+    height: 9px;
+  }
+
+  .launcher-feed::-webkit-scrollbar-track {
+    background: rgba(12, 20, 36, 0.7);
+    border-radius: 999px;
+  }
+
+  .launcher-feed::-webkit-scrollbar-thumb {
+    background: linear-gradient(180deg, rgba(69, 124, 228, 0.95), rgba(52, 185, 210, 0.9));
+    border-radius: 999px;
+    border: 2px solid rgba(12, 20, 36, 0.74);
+  }
+
+  .launcher-feed-item {
+    border: 1px solid rgba(103, 136, 198, 0.26);
+    background: linear-gradient(160deg, rgba(16, 28, 54, 0.86), rgba(13, 22, 41, 0.8)) !important;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07);
+  }
+
+  .launcher-feed-item:hover {
+    border-color: rgba(112, 205, 221, 0.42);
+    transform: translateY(-1px);
+  }
+
+  .launcher-suggestion-row {
+    border: 1px solid rgba(107, 136, 197, 0.24) !important;
+    border-radius: 12px !important;
+    background: rgba(15, 24, 46, 0.74);
+  }
+
+  .launcher-suggestion-row:hover {
+    border-color: rgba(100, 204, 225, 0.44) !important;
+    background: rgba(22, 41, 79, 0.8) !important;
+  }
+
+  .launcher-suggestion-row[class*="bg-blue-500/20"] {
+    border-color: rgba(96, 170, 255, 0.68) !important;
+    background: linear-gradient(135deg, rgba(62, 115, 233, 0.44), rgba(44, 178, 197, 0.34)) !important;
   }
 }
 
