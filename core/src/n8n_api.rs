@@ -118,6 +118,315 @@ fn parse_u64_env_with_default(key: &str, default: u64, min: u64, max: u64) -> u6
         .unwrap_or(default.clamp(min, max))
 }
 
+fn slugify_for_path(input: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in input.chars() {
+        let normalized = ch.to_ascii_lowercase();
+        if normalized.is_ascii_alphanumeric() {
+            out.push(normalized);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+        if out.len() >= 48 {
+            break;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "steer-workflow".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn compact_prompt_seed(prompt: Option<&str>) -> String {
+    let mut seed = prompt.unwrap_or_default().trim().replace('\n', " ");
+    if seed.len() > 240 {
+        seed.truncate(240);
+    }
+    seed
+}
+
+fn workflow_is_too_simple(value: &Value) -> bool {
+    let nodes = match value.get("nodes").and_then(|n| n.as_array()) {
+        Some(v) if !v.is_empty() => v,
+        _ => return true,
+    };
+
+    let min_nodes = std::env::var("STEER_N8N_MIN_NODE_COUNT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|v| v.clamp(3, 20))
+        .unwrap_or(6);
+
+    if nodes.len() < min_nodes {
+        return true;
+    }
+
+    let mut has_trigger = false;
+    let mut has_set = false;
+    let mut has_router = false;
+    let mut has_branch = false;
+
+    for node in nodes {
+        let Some(ty) = node.get("type").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        match ty {
+            "n8n-nodes-base.manualTrigger" | "n8n-nodes-base.webhook" => has_trigger = true,
+            "n8n-nodes-base.set" => has_set = true,
+            "n8n-nodes-base.code" => has_router = true,
+            "n8n-nodes-base.if" | "n8n-nodes-base.switch" => has_branch = true,
+            _ => {}
+        }
+    }
+
+    !(has_trigger && has_set && has_router && has_branch)
+}
+
+pub fn build_orchestrator_fallback_workflow(
+    name: &str,
+    prompt: Option<&str>,
+    reason: &str,
+) -> Value {
+    let webhook_path = format!("steer-{}", slugify_for_path(name));
+    let prompt_seed = compact_prompt_seed(prompt);
+    let js_code = r#"return items.map((item, index) => {
+  const request = String(
+    item.json.request_text ||
+    item.json.request_seed ||
+    item.json.request_title ||
+    ""
+  ).toLowerCase();
+  const keywords = ["telegram", "notion", "email", "calendar", "news", "summary", "webhook", "api"];
+  const matched = keywords.filter((k) => request.includes(k));
+  const route =
+    matched.includes("telegram") || matched.includes("notion")
+      ? "integration_pipeline"
+      : matched.includes("news") || matched.includes("summary")
+      ? "research_digest"
+      : "local_assist";
+  const priority = matched.length >= 3 ? "high" : matched.length >= 1 ? "medium" : "normal";
+  return {
+    json: {
+      ...item.json,
+      route,
+      priority,
+      matched_keywords: matched,
+      routing_reason: `fallback_orchestrator_${index}`,
+      orchestrator_contract: "route -> branch -> blueprint"
+    }
+  };
+});"#;
+
+    json!({
+        "name": name,
+        "nodes": [
+            {
+                "id": uuid::Uuid::new_v4().to_string(),
+                "name": "Manual Trigger",
+                "type": "n8n-nodes-base.manualTrigger",
+                "typeVersion": 1,
+                "position": [-420, -120],
+                "parameters": {}
+            },
+            {
+                "id": uuid::Uuid::new_v4().to_string(),
+                "name": "Program Webhook",
+                "type": "n8n-nodes-base.webhook",
+                "typeVersion": 2,
+                "position": [-420, 120],
+                "parameters": {
+                    "httpMethod": "POST",
+                    "path": webhook_path,
+                    "responseMode": "lastNode"
+                }
+            },
+            {
+                "id": uuid::Uuid::new_v4().to_string(),
+                "name": "Input Envelope",
+                "type": "n8n-nodes-base.set",
+                "typeVersion": 2,
+                "position": [-150, 0],
+                "parameters": {
+                    "keepOnlySet": false,
+                    "values": {
+                        "string": [
+                            { "name": "request_title", "value": name },
+                            { "name": "request_seed", "value": prompt_seed },
+                            { "name": "request_text", "value": "={{$json.body && $json.body.prompt ? $json.body.prompt : ($json.request_text || $json.request_seed || '')}}" },
+                            { "name": "source_trigger", "value": "={{$json.headers ? 'webhook' : 'manual'}}" },
+                            { "name": "orchestrator_version", "value": "steer_fallback_v2" },
+                            { "name": "fallback_reason", "value": reason },
+                            { "name": "started_at", "value": "={{$now}}" }
+                        ]
+                    }
+                }
+            },
+            {
+                "id": uuid::Uuid::new_v4().to_string(),
+                "name": "Route Planner",
+                "type": "n8n-nodes-base.code",
+                "typeVersion": 2,
+                "position": [130, 0],
+                "parameters": {
+                    "mode": "runOnceForAllItems",
+                    "jsCode": js_code
+                }
+            },
+            {
+                "id": uuid::Uuid::new_v4().to_string(),
+                "name": "If Integration Route",
+                "type": "n8n-nodes-base.if",
+                "typeVersion": 2,
+                "position": [390, -140],
+                "parameters": {
+                    "conditions": {
+                        "string": [
+                            {
+                                "value1": "={{$json.route}}",
+                                "operation": "equal",
+                                "value2": "integration_pipeline"
+                            }
+                        ]
+                    }
+                }
+            },
+            {
+                "id": uuid::Uuid::new_v4().to_string(),
+                "name": "If Research Route",
+                "type": "n8n-nodes-base.if",
+                "typeVersion": 2,
+                "position": [670, 40],
+                "parameters": {
+                    "conditions": {
+                        "string": [
+                            {
+                                "value1": "={{$json.route}}",
+                                "operation": "equal",
+                                "value2": "research_digest"
+                            }
+                        ]
+                    }
+                }
+            },
+            {
+                "id": uuid::Uuid::new_v4().to_string(),
+                "name": "Integration Blueprint",
+                "type": "n8n-nodes-base.set",
+                "typeVersion": 2,
+                "position": [670, -220],
+                "parameters": {
+                    "keepOnlySet": false,
+                    "values": {
+                        "string": [
+                            { "name": "execution_stage", "value": "integration_pipeline" },
+                            { "name": "required_nodes", "value": "Telegram Trigger -> Normalize -> LLM -> Notion -> Telegram Send" },
+                            { "name": "status", "value": "blueprint_ready" }
+                        ]
+                    }
+                }
+            },
+            {
+                "id": uuid::Uuid::new_v4().to_string(),
+                "name": "Research Blueprint",
+                "type": "n8n-nodes-base.set",
+                "typeVersion": 2,
+                "position": [950, -20],
+                "parameters": {
+                    "keepOnlySet": false,
+                    "values": {
+                        "string": [
+                            { "name": "execution_stage", "value": "research_digest" },
+                            { "name": "required_nodes", "value": "HTTP Fetch -> Extract -> Summarize -> Publish" },
+                            { "name": "status", "value": "blueprint_ready" }
+                        ]
+                    }
+                }
+            },
+            {
+                "id": uuid::Uuid::new_v4().to_string(),
+                "name": "Local Assist Blueprint",
+                "type": "n8n-nodes-base.set",
+                "typeVersion": 2,
+                "position": [950, 180],
+                "parameters": {
+                    "keepOnlySet": false,
+                    "values": {
+                        "string": [
+                            { "name": "execution_stage", "value": "local_assist" },
+                            { "name": "required_nodes", "value": "App Trigger -> Guard -> Execute -> Verify" },
+                            { "name": "status", "value": "blueprint_ready" }
+                        ]
+                    }
+                }
+            },
+            {
+                "id": uuid::Uuid::new_v4().to_string(),
+                "name": "Execution Blueprint",
+                "type": "n8n-nodes-base.set",
+                "typeVersion": 2,
+                "position": [1220, 40],
+                "parameters": {
+                    "keepOnlySet": false,
+                    "values": {
+                        "string": [
+                            { "name": "orchestrator_decision", "value": "={{$json.execution_stage || $json.route || 'local_assist'}}" },
+                            { "name": "next_step", "value": "Replace blueprint nodes with real credentials and domain APIs" },
+                            { "name": "status", "value": "ready_for_extension" }
+                        ]
+                    }
+                }
+            }
+        ],
+        "connections": {
+            "Manual Trigger": {
+                "main": [[{ "node": "Input Envelope", "type": "main", "index": 0 }]]
+            },
+            "Program Webhook": {
+                "main": [[{ "node": "Input Envelope", "type": "main", "index": 0 }]]
+            },
+            "Input Envelope": {
+                "main": [[{ "node": "Route Planner", "type": "main", "index": 0 }]]
+            },
+            "Route Planner": {
+                "main": [[{ "node": "If Integration Route", "type": "main", "index": 0 }]]
+            },
+            "If Integration Route": {
+                "main": [
+                    [{ "node": "Integration Blueprint", "type": "main", "index": 0 }],
+                    [{ "node": "If Research Route", "type": "main", "index": 0 }]
+                ]
+            },
+            "If Research Route": {
+                "main": [
+                    [{ "node": "Research Blueprint", "type": "main", "index": 0 }],
+                    [{ "node": "Local Assist Blueprint", "type": "main", "index": 0 }]
+                ]
+            },
+            "Integration Blueprint": {
+                "main": [[{ "node": "Execution Blueprint", "type": "main", "index": 0 }]]
+            },
+            "Research Blueprint": {
+                "main": [[{ "node": "Execution Blueprint", "type": "main", "index": 0 }]]
+            },
+            "Local Assist Blueprint": {
+                "main": [[{ "node": "Execution Blueprint", "type": "main", "index": 0 }]]
+            }
+        },
+        "settings": {
+            "saveManualExecutions": true
+        },
+        "active": false,
+        "meta": {
+            "source": "steer-fallback-orchestrator"
+        }
+    })
+}
+
 fn retry_after_ms_from_status_and_body(status: StatusCode, body: &str) -> Option<u64> {
     if status != StatusCode::TOO_MANY_REQUESTS && !status.is_server_error() {
         return None;
@@ -309,6 +618,10 @@ Set STEER_N8N_ALLOW_NPX_CLI=1 (or enable npx runtime explicitly)."
         parse_f64_env_with_default("STEER_N8N_HTTP_RETRY_JITTER", 0.1, 0.0, 0.5)
     }
 
+    fn http_request_timeout_ms(&self) -> u64 {
+        parse_u64_env_with_default("STEER_N8N_HTTP_REQUEST_TIMEOUT_MS", 12_000, 1_000, 120_000)
+    }
+
     async fn send_with_retry<F>(&self, label: &str, mut build: F) -> Result<Response>
     where
         F: FnMut() -> reqwest::RequestBuilder,
@@ -319,9 +632,10 @@ Set STEER_N8N_ALLOW_NPX_CLI=1 (or enable npx runtime explicitly)."
             self.http_retry_max_backoff_ms(),
             self.http_retry_jitter(),
         );
+        let request_timeout = Duration::from_millis(self.http_request_timeout_ms());
 
         for attempt in 1..=policy.attempts {
-            match build().send().await {
+            match build().timeout(request_timeout).send().await {
                 Ok(resp) => {
                     if resp.status().is_success() {
                         return Ok(resp);
@@ -745,8 +1059,11 @@ Set STEER_N8N_ALLOW_NPX_TUNNEL_NON_TEST=1 to override."
             .unwrap_or(true);
 
         if is_empty {
-            println!("⚠️ Workflow nodes empty. Falling back to minimal workflow template.");
-            normalized = Self::build_minimal_workflow(name);
+            println!("⚠️ Workflow nodes empty. Falling back to orchestrator workflow template.");
+            normalized = build_orchestrator_fallback_workflow(name, None, "empty_nodes");
+        } else if workflow_is_too_simple(&normalized) {
+            println!("⚠️ Workflow nodes too simple. Replacing with orchestrator workflow template.");
+            normalized = build_orchestrator_fallback_workflow(name, None, "too_simple_nodes");
         }
 
         if crate::env_flag("STEER_N8N_MOCK") {
@@ -1100,40 +1417,7 @@ Set STEER_N8N_ALLOW_NAME_ID_FALLBACK=1 to allow name-based fallback.",
     }
 
     fn build_minimal_workflow(name: &str) -> Value {
-        json!({
-            "name": name,
-            "nodes": [
-                {
-                    "id": uuid::Uuid::new_v4().to_string(),
-                    "name": "Manual Trigger",
-                    "type": "n8n-nodes-base.manualTrigger",
-                    "typeVersion": 1,
-                    "position": [0, 0]
-                },
-                {
-                    "id": uuid::Uuid::new_v4().to_string(),
-                    "name": "Set",
-                    "type": "n8n-nodes-base.set",
-                    "typeVersion": 2,
-                    "position": [260, 0],
-                    "parameters": {
-                        "keepOnlySet": true,
-                        "values": {
-                            "string": [
-                                { "name": "note", "value": "Auto-generated minimal workflow" }
-                            ]
-                        }
-                    }
-                }
-            ],
-            "connections": {
-                "Manual Trigger": {
-                    "main": [[{ "node": "Set", "type": "main", "index": 0 }]]
-                }
-            },
-            "settings": { "saveManualExecutions": true },
-            "active": false
-        })
+        build_orchestrator_fallback_workflow(name, None, "legacy_minimal_template")
     }
 
     /// Activate a workflow

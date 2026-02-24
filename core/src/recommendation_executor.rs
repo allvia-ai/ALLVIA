@@ -1,6 +1,5 @@
 use crate::{db, env_flag, llm_gateway::LLMClient, n8n_api};
 use anyhow::{anyhow, Result};
-use serde_json::json;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -10,23 +9,23 @@ pub struct ApprovalExecutionOutcome {
     pub reused_existing: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreclaimedProvisioning {
+    pub claim_token: Option<String>,
+    pub provision_op_id: i64,
+    pub force_recreate: bool,
+}
+
 fn mock_workflow_json(name: &str) -> serde_json::Value {
-    json!({
-        "name": name,
-        "nodes": [{
-            "id": "manual-trigger-1",
-            "name": "Manual Trigger",
-            "type": "n8n-nodes-base.manualTrigger",
-            "typeVersion": 1,
-            "position": [240, 300],
-            "parameters": {}
-        }],
-        "connections": {},
-        "settings": {},
-        "meta": {
-            "source": "steer-approve-assumed-test"
-        }
-    })
+    n8n_api::build_orchestrator_fallback_workflow(name, None, "test_mock_template")
+}
+
+fn workflow_has_nodes(value: &serde_json::Value) -> bool {
+    value
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .map(|nodes| !nodes.is_empty())
+        .unwrap_or(false)
 }
 
 fn parse_bool_env(key: &str, default: bool) -> bool {
@@ -74,6 +73,123 @@ fn is_stale_provisioning_claim(token: &str) -> bool {
     now.saturating_sub(ts) > provisioning_claim_ttl_millis()
 }
 
+fn make_claim_token(id: i64) -> String {
+    format!(
+        "provisioning:{}:{}",
+        id,
+        chrono::Utc::now().timestamp_millis()
+    )
+}
+
+fn claim_or_get_existing(id: i64, claim_token: &str) -> Result<Option<String>> {
+    for _ in 0..2 {
+        match db::claim_recommendation_provisioning(id, claim_token)? {
+            Some(existing) => {
+                let trimmed = existing.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed == claim_token {
+                    return Ok(None);
+                }
+                if trimmed.starts_with("provisioning:") {
+                    if is_stale_provisioning_claim(trimmed) {
+                        let _ = db::release_recommendation_provisioning_claim(id, trimmed);
+                        continue;
+                    }
+                    return Err(anyhow!(
+                        "recommendation {} is already being provisioned ({})",
+                        id,
+                        trimmed
+                    ));
+                }
+                return Ok(Some(trimmed.to_string()));
+            }
+            None => return Ok(None),
+        }
+    }
+    Err(anyhow!(
+        "failed to acquire provisioning claim for recommendation {}",
+        id
+    ))
+}
+
+pub fn precreate_async_provisioning(id: i64) -> Result<PreclaimedProvisioning> {
+    let rec =
+        db::get_recommendation(id)?.ok_or_else(|| anyhow!("recommendation {} not found", id))?;
+
+    if rec.status.eq_ignore_ascii_case("rejected") {
+        return Err(anyhow!(
+            "recommendation {} is rejected and cannot be created",
+            id
+        ));
+    }
+    if !rec.status.eq_ignore_ascii_case("approved") {
+        return Err(anyhow!(
+            "recommendation {} is '{}' (approval required before creation)",
+            id,
+            rec.status
+        ));
+    }
+
+    let force_recreate = env_flag("STEER_APPROVE_FORCE_RECREATE");
+    let claim_token = if force_recreate {
+        None
+    } else {
+        Some(make_claim_token(id))
+    };
+
+    if !force_recreate {
+        if let Some(existing_id) = rec
+            .workflow_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if existing_id.starts_with("provisioning:") {
+                let our_token = claim_token
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("missing provisioning claim token"))?;
+                if existing_id != our_token {
+                    if is_stale_provisioning_claim(existing_id) {
+                        let _ = db::release_recommendation_provisioning_claim(id, existing_id);
+                    } else {
+                        return Err(anyhow!(
+                            "recommendation {} is already being provisioned ({})",
+                            id,
+                            existing_id
+                        ));
+                    }
+                }
+            } else {
+                return Err(anyhow!(
+                    "recommendation {} already provisioned ({})",
+                    id,
+                    existing_id
+                ));
+            }
+        }
+
+        let token = claim_token
+            .as_deref()
+            .ok_or_else(|| anyhow!("missing provisioning claim token"))?;
+        if let Some(existing) = claim_or_get_existing(id, token)? {
+            return Err(anyhow!(
+                "recommendation {} already provisioned ({})",
+                id,
+                existing
+            ));
+        }
+    }
+
+    let provision_op_id = db::create_workflow_provision_op(id, claim_token.as_deref())?;
+    Ok(PreclaimedProvisioning {
+        claim_token,
+        provision_op_id,
+        force_recreate,
+    })
+}
+
 pub fn maybe_assume_approved_for_test(id: i64) -> Result<()> {
     if !env_flag("STEER_TEST_ASSUME_APPROVED") {
         return Err(anyhow!(
@@ -105,6 +221,22 @@ pub async fn execute_approved_recommendation(
     id: i64,
     llm_client: Option<Arc<dyn LLMClient>>,
 ) -> Result<String> {
+    execute_approved_recommendation_internal(id, llm_client, None).await
+}
+
+pub async fn execute_approved_recommendation_with_preclaim(
+    id: i64,
+    llm_client: Option<Arc<dyn LLMClient>>,
+    preclaim: PreclaimedProvisioning,
+) -> Result<String> {
+    execute_approved_recommendation_internal(id, llm_client, Some(preclaim)).await
+}
+
+async fn execute_approved_recommendation_internal(
+    id: i64,
+    llm_client: Option<Arc<dyn LLMClient>>,
+    preclaim: Option<PreclaimedProvisioning>,
+) -> Result<String> {
     let rec =
         db::get_recommendation(id)?.ok_or_else(|| anyhow!("recommendation {} not found", id))?;
 
@@ -124,12 +256,19 @@ pub async fn execute_approved_recommendation(
 
     // Idempotency guard: if this recommendation already has a workflow id,
     // do not create another workflow unless explicitly forced.
-    let force_recreate = env_flag("STEER_APPROVE_FORCE_RECREATE");
-    let claim_token = format!(
-        "provisioning:{}:{}",
-        id,
-        chrono::Utc::now().timestamp_millis()
-    );
+    let force_recreate = preclaim
+        .as_ref()
+        .map(|p| p.force_recreate)
+        .unwrap_or_else(|| env_flag("STEER_APPROVE_FORCE_RECREATE"));
+    let claim_token = if force_recreate {
+        None
+    } else {
+        preclaim
+            .as_ref()
+            .and_then(|p| p.claim_token.clone())
+            .or_else(|| Some(make_claim_token(id)))
+    };
+
     if !force_recreate {
         if let Some(existing_id) = rec
             .workflow_id
@@ -138,17 +277,30 @@ pub async fn execute_approved_recommendation(
             .filter(|s| !s.is_empty())
         {
             if existing_id.starts_with("provisioning:") {
-                if is_stale_provisioning_claim(existing_id) {
-                    let _ = db::release_recommendation_provisioning_claim(id, existing_id);
-                } else {
-                    return Err(anyhow!(
-                        "recommendation {} is already being provisioned ({})",
-                        id,
-                        existing_id
-                    ));
+                let our_token = claim_token
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("missing provisioning claim token"))?;
+                if existing_id != our_token {
+                    if is_stale_provisioning_claim(existing_id) {
+                        let _ = db::release_recommendation_provisioning_claim(id, existing_id);
+                    } else {
+                        return Err(anyhow!(
+                            "recommendation {} is already being provisioned ({})",
+                            id,
+                            existing_id
+                        ));
+                    }
                 }
             }
             if !existing_id.starts_with("provisioning:") {
+                if let Some(pre) = preclaim.as_ref() {
+                    let _ = db::commit_workflow_provision_success(
+                        pre.provision_op_id,
+                        id,
+                        existing_id,
+                        rec.workflow_json.as_deref(),
+                    );
+                }
                 println!(
                     "ℹ️ Recommendation {} already provisioned. Reusing workflow_id={}",
                     id, existing_id
@@ -157,49 +309,30 @@ pub async fn execute_approved_recommendation(
             }
         }
 
-        let mut claim_acquired = false;
-        for _ in 0..2 {
-            match db::claim_recommendation_provisioning(id, &claim_token)? {
-                Some(existing) => {
-                    if existing.starts_with("provisioning:") {
-                        if is_stale_provisioning_claim(&existing) {
-                            let _ = db::release_recommendation_provisioning_claim(id, &existing);
-                            continue;
-                        }
-                        return Err(anyhow!(
-                            "recommendation {} is already being provisioned ({})",
-                            id,
-                            existing
-                        ));
-                    }
-                    println!(
-                        "ℹ️ Recommendation {} already provisioned. Reusing workflow_id={}",
-                        id, existing
-                    );
-                    return Ok(existing);
-                }
-                None => {
-                    claim_acquired = true;
-                    break;
-                }
+        let token = claim_token
+            .as_deref()
+            .ok_or_else(|| anyhow!("missing provisioning claim token"))?;
+        if let Some(existing) = claim_or_get_existing(id, token)? {
+            if let Some(pre) = preclaim.as_ref() {
+                let _ = db::commit_workflow_provision_success(
+                    pre.provision_op_id,
+                    id,
+                    &existing,
+                    rec.workflow_json.as_deref(),
+                );
             }
-        }
-        if !claim_acquired {
-            return Err(anyhow!(
-                "failed to acquire provisioning claim for recommendation {}",
-                id
-            ));
+            println!(
+                "ℹ️ Recommendation {} already provisioned. Reusing workflow_id={}",
+                id, existing
+            );
+            return Ok(existing);
         }
     }
 
-    let provision_op_id = db::create_workflow_provision_op(
-        id,
-        if force_recreate {
-            None
-        } else {
-            Some(claim_token.as_str())
-        },
-    )?;
+    let provision_op_id = match preclaim.as_ref() {
+        Some(p) => p.provision_op_id,
+        None => db::create_workflow_provision_op(id, claim_token.as_deref())?,
+    };
 
     let workflow_json_str_result: Result<String> = (|| async {
         if should_use_test_mock_workflow() {
@@ -231,10 +364,14 @@ pub async fn execute_approved_recommendation(
         Err(e) => {
             if parse_bool_env("STEER_N8N_MINIMAL_ON_LLM_FAILURE", true) {
                 eprintln!(
-                    "⚠️ workflow generation failed for recommendation {}: {}. Falling back to minimal template.",
+                    "⚠️ workflow generation failed for recommendation {}: {}. Falling back to orchestrator template.",
                     id, e
                 );
-                match serde_json::to_string(&mock_workflow_json(&rec.title)) {
+                match serde_json::to_string(&n8n_api::build_orchestrator_fallback_workflow(
+                    &rec.title,
+                    Some(&rec.n8n_prompt),
+                    "llm_generation_failed",
+                )) {
                     Ok(fallback) => fallback,
                     Err(serr) => {
                         let _ = db::mark_workflow_provision_failed(
@@ -245,7 +382,9 @@ pub async fn execute_approved_recommendation(
                             ),
                         );
                         if !force_recreate {
-                            let _ = db::release_recommendation_provisioning_claim(id, &claim_token);
+                            if let Some(token) = claim_token.as_deref() {
+                                let _ = db::release_recommendation_provisioning_claim(id, token);
+                            }
                         }
                         return Err(anyhow!(
                             "workflow generation failed: {}; fallback serialization failed: {}",
@@ -260,7 +399,9 @@ pub async fn execute_approved_recommendation(
                     &format!("workflow json generation failed: {}", e),
                 );
                 if !force_recreate {
-                    let _ = db::release_recommendation_provisioning_claim(id, &claim_token);
+                    if let Some(token) = claim_token.as_deref() {
+                        let _ = db::release_recommendation_provisioning_claim(id, token);
+                    }
                 }
                 return Err(e);
             }
@@ -275,7 +416,7 @@ pub async fn execute_approved_recommendation(
                 e
             )
         });
-    let workflow_val = match workflow_val_result {
+    let mut workflow_val = match workflow_val_result {
         Ok(v) => v,
         Err(e) => {
             let _ = db::mark_workflow_provision_failed(
@@ -283,11 +424,32 @@ pub async fn execute_approved_recommendation(
                 &format!("workflow json parse failed: {}", e),
             );
             if !force_recreate {
-                let _ = db::release_recommendation_provisioning_claim(id, &claim_token);
+                if let Some(token) = claim_token.as_deref() {
+                    let _ = db::release_recommendation_provisioning_claim(id, token);
+                }
             }
             return Err(e);
         }
     };
+
+    if !workflow_has_nodes(&workflow_val) {
+        eprintln!(
+            "⚠️ workflow for recommendation {} had empty/missing nodes. Replacing with orchestrator fallback.",
+            id
+        );
+        workflow_val = n8n_api::build_orchestrator_fallback_workflow(
+            &rec.title,
+            Some(&rec.n8n_prompt),
+            "invalid_or_empty_nodes",
+        );
+    }
+    let workflow_json_str = serde_json::to_string(&workflow_val).map_err(|e| {
+        anyhow!(
+            "workflow serialization failed for recommendation {}: {}",
+            id,
+            e
+        )
+    })?;
 
     let n8n = match n8n_api::N8nApi::from_env() {
         Ok(v) => v,
@@ -297,7 +459,9 @@ pub async fn execute_approved_recommendation(
                 &format!("n8n initialization failed: {}", e),
             );
             if !force_recreate {
-                let _ = db::release_recommendation_provisioning_claim(id, &claim_token);
+                if let Some(token) = claim_token.as_deref() {
+                    let _ = db::release_recommendation_provisioning_claim(id, token);
+                }
             }
             return Err(e);
         }
@@ -349,7 +513,9 @@ pub async fn execute_approved_recommendation(
                 &format!("workflow creation failed: {}", e),
             );
             if !force_recreate {
-                let _ = db::release_recommendation_provisioning_claim(id, &claim_token);
+                if let Some(token) = claim_token.as_deref() {
+                    let _ = db::release_recommendation_provisioning_claim(id, token);
+                }
             }
             let _ = db::mark_recommendation_failed(id, &e.to_string());
             Err(anyhow!("workflow creation failed: {}", e))
