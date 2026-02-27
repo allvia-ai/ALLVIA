@@ -52,7 +52,7 @@ enum N8nRuntime {
 impl N8nRuntime {
     fn from_env() -> Self {
         let raw = std::env::var("STEER_N8N_RUNTIME")
-            .unwrap_or_else(|_| "docker".to_string())
+            .unwrap_or_else(|_| "manual".to_string())
             .trim()
             .to_lowercase();
         let test_context = parse_bool_env_with_default("STEER_TEST_MODE", false)
@@ -63,7 +63,7 @@ impl N8nRuntime {
                     eprintln!(
                         "⚠️ STEER_N8N_RUNTIME=npx ignored: set STEER_N8N_ENABLE_NPX_RUNTIME=1 to opt in."
                     );
-                    return Self::Docker;
+                    return Self::Manual;
                 }
                 if !test_context
                     && !parse_bool_env_with_default("STEER_N8N_ALLOW_NPX_NON_TEST", false)
@@ -72,7 +72,7 @@ impl N8nRuntime {
                         "⚠️ STEER_N8N_RUNTIME=npx ignored outside test mode. \
 Set STEER_N8N_ALLOW_NPX_NON_TEST=1 to force npx runtime."
                     );
-                    return Self::Docker;
+                    return Self::Manual;
                 }
                 Self::Npx
             }
@@ -143,11 +143,13 @@ fn slugify_for_path(input: &str) -> String {
 }
 
 fn compact_prompt_seed(prompt: Option<&str>) -> String {
-    let mut seed = prompt.unwrap_or_default().trim().replace('\n', " ");
-    if seed.len() > 240 {
-        seed.truncate(240);
-    }
-    seed
+    prompt
+        .unwrap_or_default()
+        .trim()
+        .replace('\n', " ")
+        .chars()
+        .take(240)
+        .collect()
 }
 
 fn workflow_is_too_simple(value: &Value) -> bool {
@@ -159,32 +161,146 @@ fn workflow_is_too_simple(value: &Value) -> bool {
     let min_nodes = std::env::var("STEER_N8N_MIN_NODE_COUNT")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
-        .map(|v| v.clamp(3, 20))
-        .unwrap_or(6);
+        .map(|v| v.clamp(6, 30))
+        .unwrap_or(8);
 
     if nodes.len() < min_nodes {
         return true;
     }
 
     let mut has_trigger = false;
-    let mut has_set = false;
-    let mut has_router = false;
+    let mut has_transform = false;
+    let mut has_validation = false;
     let mut has_branch = false;
+    let mut has_error_path = false;
+    let mut has_observability = false;
+    let mut has_external_io = false;
 
     for node in nodes {
-        let Some(ty) = node.get("type").and_then(|v| v.as_str()) else {
+        let Some(raw_ty) = node.get("type").and_then(|v| v.as_str()) else {
             continue;
         };
-        match ty {
-            "n8n-nodes-base.manualTrigger" | "n8n-nodes-base.webhook" => has_trigger = true,
-            "n8n-nodes-base.set" => has_set = true,
-            "n8n-nodes-base.code" => has_router = true,
-            "n8n-nodes-base.if" | "n8n-nodes-base.switch" => has_branch = true,
+        let ty = raw_ty.to_ascii_lowercase();
+        let node_name = node
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        match ty.as_str() {
+            "n8n-nodes-base.manualtrigger" | "n8n-nodes-base.webhook" => has_trigger = true,
+            "n8n-nodes-base.set"
+            | "n8n-nodes-base.code"
+            | "n8n-nodes-base.function"
+            | "n8n-nodes-base.functionitem"
+            | "n8n-nodes-base.itemlists" => has_transform = true,
+            "n8n-nodes-base.if" | "n8n-nodes-base.switch" => {
+                has_branch = true;
+                if node_name.contains("error") || node_name.contains("fail") {
+                    has_error_path = true;
+                }
+            }
+            "n8n-nodes-base.httprequest"
+            | "n8n-nodes-base.notion"
+            | "n8n-nodes-base.telegram"
+            | "n8n-nodes-base.emailsend"
+            | "n8n-nodes-base.slack" => has_external_io = true,
             _ => {}
+        }
+
+        if node_name.contains("validat") || node_name.contains("schema") {
+            has_validation = true;
+        }
+        if node_name.contains("observability")
+            || node_name.contains("metric")
+            || node_name.contains("telemetry")
+            || node_name.contains("log")
+        {
+            has_observability = true;
+        }
+        if node_name.contains("error") || node_name.contains("fallback") {
+            has_error_path = true;
         }
     }
 
-    !(has_trigger && has_set && has_router && has_branch)
+    !(has_trigger
+        && has_transform
+        && has_validation
+        && has_branch
+        && has_error_path
+        && has_observability
+        && has_external_io)
+}
+
+pub fn normalize_workflow_for_create(name: &str, workflow_json: &Value) -> Result<Value> {
+    let mut normalized = workflow_json.clone();
+    let allow_fallback =
+        parse_bool_env_with_default("STEER_N8N_ALLOW_SIMPLE_WORKFLOW_FALLBACK", true);
+
+    let is_empty = normalized
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .map(|arr| arr.is_empty())
+        .unwrap_or(true);
+
+    if is_empty {
+        if allow_fallback {
+            println!("⚠️ Workflow nodes empty. Falling back to orchestrator workflow template.");
+            normalized = build_orchestrator_fallback_workflow(name, None, "empty_nodes");
+        } else {
+            return Err(anyhow::anyhow!(
+                "workflow validation failed: nodes are empty. \
+Set STEER_N8N_ALLOW_SIMPLE_WORKFLOW_FALLBACK=1 to allow orchestrator fallback."
+            ));
+        }
+    } else if workflow_is_too_simple(&normalized) {
+        if allow_fallback {
+            println!(
+                "⚠️ Workflow nodes too simple. Replacing with orchestrator workflow template."
+            );
+            normalized = build_orchestrator_fallback_workflow(name, None, "too_simple_nodes");
+        } else {
+            return Err(anyhow::anyhow!(
+                "workflow validation failed: nodes are too simple. \
+Set STEER_N8N_ALLOW_SIMPLE_WORKFLOW_FALLBACK=1 to allow orchestrator fallback."
+            ));
+        }
+    }
+
+    if let Some(nodes) = normalized.get_mut("nodes").and_then(|n| n.as_array_mut()) {
+        for node in nodes.iter_mut() {
+            let is_webhook = node
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(|t| t == "n8n-nodes-base.webhook")
+                .unwrap_or(false);
+            if !is_webhook {
+                continue;
+            }
+            if let Some(node_obj) = node.as_object_mut() {
+                let missing_webhook_id = node_obj
+                    .get("webhookId")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.trim().is_empty())
+                    .unwrap_or(true);
+                if missing_webhook_id {
+                    node_obj.insert(
+                        "webhookId".to_string(),
+                        Value::String(uuid::Uuid::new_v4().to_string()),
+                    );
+                }
+                if node_obj
+                    .get("disabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    node_obj.insert("disabled".to_string(), Value::Bool(false));
+                }
+            }
+        }
+    }
+
+    Ok(normalized)
 }
 
 pub fn build_orchestrator_fallback_workflow(
@@ -194,33 +310,255 @@ pub fn build_orchestrator_fallback_workflow(
 ) -> Value {
     let webhook_path = format!("steer-{}", slugify_for_path(name));
     let prompt_seed = compact_prompt_seed(prompt);
-    let js_code = r#"return items.map((item, index) => {
-  const request = String(
-    item.json.request_text ||
-    item.json.request_seed ||
-    item.json.request_title ||
-    ""
-  ).toLowerCase();
-  const keywords = ["telegram", "notion", "email", "calendar", "news", "summary", "webhook", "api"];
-  const matched = keywords.filter((k) => request.includes(k));
-  const route =
-    matched.includes("telegram") || matched.includes("notion")
-      ? "integration_pipeline"
-      : matched.includes("news") || matched.includes("summary")
-      ? "research_digest"
-      : "local_assist";
-  const priority = matched.length >= 3 ? "high" : matched.length >= 1 ? "medium" : "normal";
+    let env_or_empty = |keys: &[&str]| -> String {
+        keys.iter()
+            .filter_map(|key| std::env::var(key).ok())
+            .map(|v| v.trim().to_string())
+            .find(|v| !v.is_empty())
+            .unwrap_or_default()
+    };
+    let notion_parent_default = env_or_empty(&["NOTION_PAGE_ID"]);
+    let notion_token_default = env_or_empty(&["NOTION_TOKEN", "NOTION_API_KEY"]);
+    let telegram_chat_default = env_or_empty(&["TELEGRAM_CHAT_ID"]);
+    let telegram_bot_default = env_or_empty(&["TELEGRAM_BOT_TOKEN", "TELEGRAM_ACCESS_TOKEN"]);
+    let notion_parent_default_json =
+        serde_json::to_string(&notion_parent_default).unwrap_or_else(|_| "\"\"".to_string());
+    let notion_token_default_json =
+        serde_json::to_string(&notion_token_default).unwrap_or_else(|_| "\"\"".to_string());
+    let telegram_chat_default_json =
+        serde_json::to_string(&telegram_chat_default).unwrap_or_else(|_| "\"\"".to_string());
+    let telegram_bot_default_json =
+        serde_json::to_string(&telegram_bot_default).unwrap_or_else(|_| "\"\"".to_string());
+    let notion_parent_expr =
+        "={{$json.body && $json.body.notion_parent_page_id ? $json.body.notion_parent_page_id : ($json.notion_parent_page_id || __DEFAULT__)}}"
+            .replace("__DEFAULT__", &notion_parent_default_json);
+    let notion_token_expr =
+        "={{$json.body && $json.body.notion_token ? $json.body.notion_token : ($json.notion_token || __DEFAULT__)}}"
+            .replace("__DEFAULT__", &notion_token_default_json);
+    let telegram_chat_expr =
+        "={{$json.body && $json.body.telegram_chat_id ? $json.body.telegram_chat_id : ($json.telegram_chat_id || __DEFAULT__)}}"
+            .replace("__DEFAULT__", &telegram_chat_default_json);
+    let telegram_bot_expr =
+        "={{$json.body && $json.body.telegram_bot_token ? $json.body.telegram_bot_token : ($json.telegram_bot_token || __DEFAULT__)}}"
+            .replace("__DEFAULT__", &telegram_bot_default_json);
+    let idempotency_code = r#"return items.map((item, index) => {
+  const base = `${item.json.request_title || ""}::${item.json.request_text || ""}::${item.json.topic || ""}::${item.json.timeframe || ""}`;
+  const safeBase64 = Buffer.from(base).toString("base64").replace(/[^a-zA-Z0-9]/g, "").slice(0, 32);
   return {
     json: {
       ...item.json,
-      route,
-      priority,
-      matched_keywords: matched,
-      routing_reason: `fallback_orchestrator_${index}`,
-      orchestrator_contract: "route -> branch -> blueprint"
+      idempotency_key: `wf_${safeBase64 || "default"}_${index}`,
+      run_started_at: new Date().toISOString(),
+      pipeline_contract: "trigger -> fetch -> classify -> summarize -> validate -> publish -> observe"
     }
   };
 });"#;
+    let extract_code = r#"const fetchPayload = items[0]?.json || {};
+const envelope = ($items("Idempotency Guard", 0, 0)?.[0]?.json) || {};
+const topN = Math.max(1, Math.min(10, Number(envelope.top_n || 5)));
+const hits =
+  Array.isArray(fetchPayload.hits) ? fetchPayload.hits :
+  Array.isArray(fetchPayload.body?.hits) ? fetchPayload.body.hits :
+  [];
+const articles = hits
+  .map((hit) => ({
+    title: String(hit.title || hit.story_title || "").trim(),
+    source_url: String(hit.url || hit.story_url || "").trim(),
+    published_at: hit.created_at || "",
+    source: "hn.algolia",
+  }))
+  .filter((a) => a.title && a.source_url)
+  .slice(0, topN);
+return [{
+  json: {
+    ...envelope,
+    request_text: String(envelope.request_text || envelope.request_seed || "").trim(),
+    topic: String(envelope.topic || "AI").trim() || "AI",
+    notion_token: String(envelope.notion_token || "").trim(),
+    notion_parent_page_id: String(envelope.notion_parent_page_id || "").trim(),
+    telegram_chat_id: String(envelope.telegram_chat_id || "").trim(),
+    telegram_bot_token: String(envelope.telegram_bot_token || "").trim(),
+    has_notion_config:
+      String(envelope.notion_token || "").trim() && String(envelope.notion_parent_page_id || "").trim()
+        ? "true"
+        : "false",
+    has_telegram_config:
+      String(envelope.telegram_bot_token || "").trim() && String(envelope.telegram_chat_id || "").trim()
+        ? "true"
+        : "false",
+    fetch_ok: articles.length >= topN,
+    article_count: articles.length,
+    articles,
+    source_provider: "hn.algolia.search_by_date"
+  }
+}];"#;
+    let classify_code = r#"const root = items[0]?.json || {};
+const classifyStack = (title) => {
+  const t = String(title || "").toLowerCase();
+  const stacks = [];
+  if (/(gpu|cuda|nvidia|chip|hardware|accelerator)/.test(t)) stacks.push("GPU/Accelerator");
+  if (/(llm|model|transformer|agent)/.test(t)) stacks.push("LLM/Model Serving");
+  if (/(vector|rag|embedding|retrieval)/.test(t)) stacks.push("RAG/Retrieval");
+  if (/(api|sdk|platform|cloud)/.test(t)) stacks.push("API/Cloud Platform");
+  if (/(security|privacy|governance|policy)/.test(t)) stacks.push("Security/Governance");
+  return stacks.length ? stacks : ["General AI Application"];
+};
+const enriched = (root.articles || []).map((article) => ({
+  ...article,
+  trend_alignment: "current_trend",
+  technical_stack: classifyStack(article.title),
+}));
+return [{ json: { ...root, articles: enriched } }];"#;
+    let summarize_code = r#"const root = items[0]?.json || {};
+const summarized = (root.articles || []).map((article, idx) => {
+  const prevParadigm = "Rule-based/static automation";
+  const newParadigm = "LLM-native adaptive workflows";
+  const diff = `${article.title}: ${prevParadigm} -> ${newParadigm}`;
+  return {
+    ...article,
+    comparative_summary: {
+      previous_paradigm: prevParadigm,
+      new_paradigm: newParadigm,
+      key_difference: diff
+    },
+    importance: `Why it matters #${idx + 1}: impacts tooling, deployment, and developer workflow.`
+  };
+});
+return [{ json: { ...root, articles: summarized } }];"#;
+    let validate_code = r#"const root = items[0]?.json || {};
+const errors = [];
+if (!Array.isArray(root.articles) || root.articles.length < 5) {
+  errors.push(`expected >=5 articles, got ${Array.isArray(root.articles) ? root.articles.length : 0}`);
+}
+for (const [idx, article] of (root.articles || []).entries()) {
+  if (!article.title) errors.push(`article[${idx}] missing title`);
+  if (!article.source_url) errors.push(`article[${idx}] missing source_url`);
+  if (!Array.isArray(article.technical_stack) || article.technical_stack.length === 0) {
+    errors.push(`article[${idx}] missing technical_stack`);
+  }
+}
+return [{
+  json: {
+    ...root,
+    validation_ok: errors.length === 0 ? "true" : "false",
+    validation_errors: errors
+  }
+}];"#;
+    let markdown_code = r#"const root = items[0]?.json || {};
+const articles = Array.isArray(root.articles) ? root.articles : [];
+const lines = [];
+const notionChildren = [];
+const nowIso = new Date().toISOString();
+const digestDate = nowIso.slice(0, 10);
+const topicLabel = String(root.topic || "AI").trim() || "AI";
+const toText = (content, url = "") => {
+  const text = { content: String(content || "").slice(0, 1800) };
+  if (url) {
+    text.link = { url };
+  }
+  return { type: "text", text };
+};
+
+lines.push(`# ${root.request_title || "AllvIa AI Trend Digest"}`);
+lines.push(`Generated: ${nowIso}`);
+lines.push("");
+notionChildren.push({
+  object: "block",
+  type: "heading_1",
+  heading_1: { rich_text: [toText(`AllvIa AI Trend Digest (${digestDate})`)] }
+});
+notionChildren.push({
+  object: "block",
+  type: "paragraph",
+  paragraph: { rich_text: [toText(`주제: ${topicLabel}`)] }
+});
+
+for (const [idx, article] of articles.entries()) {
+  lines.push(`## ${idx + 1}. [${article.title}](${article.source_url})`);
+  lines.push(`- Source: ${article.source_url}`);
+  lines.push(`- Published: ${article.published_at || "n/a"}`);
+  lines.push(`- Technical Stack: ${(article.technical_stack || []).join(", ")}`);
+  lines.push(`- Previous Paradigm: ${article.comparative_summary?.previous_paradigm || "n/a"}`);
+  lines.push(`- New Paradigm: ${article.comparative_summary?.new_paradigm || "n/a"}`);
+  lines.push(`- Difference: ${article.comparative_summary?.key_difference || "n/a"}`);
+  lines.push(`- Why It Matters: ${article.importance || "n/a"}`);
+  lines.push("");
+
+  notionChildren.push({
+    object: "block",
+    type: "heading_2",
+    heading_2: { rich_text: [toText(`${idx + 1}. ${article.title || "Untitled"}`)] }
+  });
+  notionChildren.push({
+    object: "block",
+    type: "paragraph",
+    paragraph: {
+      rich_text: [
+        toText("원문 링크: "),
+        toText("기사 원문 열기", String(article.source_url || ""))
+      ]
+    }
+  });
+  notionChildren.push({
+    object: "block",
+    type: "bulleted_list_item",
+    bulleted_list_item: {
+      rich_text: [toText(`핵심: ${article.importance || "n/a"}`)]
+    }
+  });
+  notionChildren.push({
+    object: "block",
+    type: "bulleted_list_item",
+    bulleted_list_item: {
+      rich_text: [toText(`차이점: ${article.comparative_summary?.key_difference || "n/a"}`)]
+    }
+  });
+  if (idx < articles.length - 1) {
+    notionChildren.push({ object: "block", type: "divider", divider: {} });
+  }
+}
+
+const markdown = lines.join("\n");
+const topHeadlinesText = articles
+  .slice(0, 5)
+  .map((a, idx) => `${idx + 1}. ${a.title}`)
+  .join("\n");
+
+return [{
+  json: {
+    ...root,
+    notion_title: `AllvIa AI Trend Digest ${digestDate}`,
+    markdown_report: markdown,
+    notion_excerpt: markdown.slice(0, 1800),
+    notion_children: notionChildren.slice(0, 95),
+    telegram_summary: topHeadlinesText,
+    top_headlines_text: topHeadlinesText
+  }
+}];"#;
+    let notion_result_code = r#"const base = ($items("Build Markdown Report", 0, 0)?.[0]?.json) || {};
+const current = items[0]?.json || {};
+const notionError = current?.error?.message ? String(current.error.message) : "";
+return [{
+  json: {
+    ...base,
+    notion_status: notionError ? "failed" : "completed",
+    notion_error: notionError,
+    notion_page_id: String(current.id || current.page_id || ""),
+    notion_page_url: String(current.url || "")
+  }
+}];"#;
+    let telegram_result_code = r#"const base = ($items("If Has Telegram Config", 0, 0)?.[0]?.json) || {};
+const current = items[0]?.json || {};
+const telegramError = current?.error?.message ? String(current.error.message) : "";
+const messageId = current?.result?.message_id || current?.message_id || "";
+return [{
+  json: {
+    ...base,
+    telegram_status: telegramError ? "failed" : "completed",
+    telegram_error: telegramError,
+    telegram_message_id: String(messageId || "")
+  }
+}];"#;
 
     json!({
         "name": name,
@@ -235,7 +573,7 @@ pub fn build_orchestrator_fallback_workflow(
             },
             {
                 "id": uuid::Uuid::new_v4().to_string(),
-                "name": "Program Webhook",
+                "name": "ProgramWebhook",
                 "type": "n8n-nodes-base.webhook",
                 "typeVersion": 2,
                 "position": [-420, 120],
@@ -257,9 +595,17 @@ pub fn build_orchestrator_fallback_workflow(
                         "string": [
                             { "name": "request_title", "value": name },
                             { "name": "request_seed", "value": prompt_seed },
-                            { "name": "request_text", "value": "={{$json.body && $json.body.prompt ? $json.body.prompt : ($json.request_text || $json.request_seed || '')}}" },
+                            { "name": "request_text", "value": "={{$json.body && $json.body.prompt ? $json.body.prompt : ($json.body && $json.body.request_text ? $json.body.request_text : ($json.body && $json.body.text ? $json.body.text : ($json.body && $json.body.query ? $json.body.query : ($json.request_text || $json.request_seed || ''))))}}" },
+                            { "name": "topic", "value": "={{$json.body && $json.body.topic ? $json.body.topic : ($json.topic || 'AI')}}" },
+                            { "name": "timeframe", "value": "={{$json.body && $json.body.timeframe ? $json.body.timeframe : ($json.timeframe || '7d')}}" },
+                            { "name": "language", "value": "={{$json.body && $json.body.language ? $json.body.language : ($json.language || 'en')}}" },
+                            { "name": "top_n", "value": "={{$json.body && $json.body.top_n ? String($json.body.top_n) : ($json.body && $json.body.limit ? String($json.body.limit) : ($json.top_n || '5'))}}" },
+                            { "name": "notion_parent_page_id", "value": notion_parent_expr },
+                            { "name": "notion_token", "value": notion_token_expr },
+                            { "name": "telegram_chat_id", "value": telegram_chat_expr },
+                            { "name": "telegram_bot_token", "value": telegram_bot_expr },
                             { "name": "source_trigger", "value": "={{$json.headers ? 'webhook' : 'manual'}}" },
-                            { "name": "orchestrator_version", "value": "steer_fallback_v2" },
+                            { "name": "orchestrator_version", "value": "steer_fallback_v4" },
                             { "name": "fallback_reason", "value": reason },
                             { "name": "started_at", "value": "={{$now}}" }
                         ]
@@ -268,28 +614,91 @@ pub fn build_orchestrator_fallback_workflow(
             },
             {
                 "id": uuid::Uuid::new_v4().to_string(),
-                "name": "Route Planner",
+                "name": "Idempotency Guard",
                 "type": "n8n-nodes-base.code",
                 "typeVersion": 2,
                 "position": [130, 0],
                 "parameters": {
                     "mode": "runOnceForAllItems",
-                    "jsCode": js_code
+                    "jsCode": idempotency_code
                 }
             },
             {
                 "id": uuid::Uuid::new_v4().to_string(),
-                "name": "If Integration Route",
+                "name": "Fetch Trend Feed",
+                "type": "n8n-nodes-base.httpRequest",
+                "typeVersion": 4.2,
+                "position": [390, 0],
+                "continueOnFail": true,
+                "parameters": {
+                    "method": "GET",
+                    "url": "={{'https://hn.algolia.com/api/v1/search_by_date?tags=story&query=' + encodeURIComponent($json.topic || 'AI')}}",
+                    "options": {
+                        "timeout": 12000,
+                        "retry": {
+                            "maxTries": 3,
+                            "waitBetweenTries": 1000
+                        }
+                    }
+                }
+            },
+            {
+                "id": uuid::Uuid::new_v4().to_string(),
+                "name": "Extract Top 5 Articles",
+                "type": "n8n-nodes-base.code",
+                "typeVersion": 2,
+                "position": [650, 0],
+                "parameters": {
+                    "mode": "runOnceForAllItems",
+                    "jsCode": extract_code
+                }
+            },
+            {
+                "id": uuid::Uuid::new_v4().to_string(),
+                "name": "Classify Trend Alignment",
+                "type": "n8n-nodes-base.code",
+                "typeVersion": 2,
+                "position": [910, 0],
+                "parameters": {
+                    "mode": "runOnceForAllItems",
+                    "jsCode": classify_code
+                }
+            },
+            {
+                "id": uuid::Uuid::new_v4().to_string(),
+                "name": "Build Comparative Summary",
+                "type": "n8n-nodes-base.code",
+                "typeVersion": 2,
+                "position": [1170, 0],
+                "parameters": {
+                    "mode": "runOnceForAllItems",
+                    "jsCode": summarize_code
+                }
+            },
+            {
+                "id": uuid::Uuid::new_v4().to_string(),
+                "name": "Validate Output Schema",
+                "type": "n8n-nodes-base.code",
+                "typeVersion": 2,
+                "position": [1430, 0],
+                "parameters": {
+                    "mode": "runOnceForAllItems",
+                    "jsCode": validate_code
+                }
+            },
+            {
+                "id": uuid::Uuid::new_v4().to_string(),
+                "name": "If Validation OK",
                 "type": "n8n-nodes-base.if",
                 "typeVersion": 2,
-                "position": [390, -140],
+                "position": [1680, 0],
                 "parameters": {
                     "conditions": {
                         "string": [
                             {
-                                "value1": "={{$json.route}}",
+                                "value1": "={{$json.validation_ok}}",
                                 "operation": "equal",
-                                "value2": "integration_pipeline"
+                                "value2": "true"
                             }
                         ]
                     }
@@ -297,17 +706,28 @@ pub fn build_orchestrator_fallback_workflow(
             },
             {
                 "id": uuid::Uuid::new_v4().to_string(),
-                "name": "If Research Route",
+                "name": "Build Markdown Report",
+                "type": "n8n-nodes-base.code",
+                "typeVersion": 2,
+                "position": [1930, -120],
+                "parameters": {
+                    "mode": "runOnceForAllItems",
+                    "jsCode": markdown_code
+                }
+            },
+            {
+                "id": uuid::Uuid::new_v4().to_string(),
+                "name": "If Has Notion Config",
                 "type": "n8n-nodes-base.if",
                 "typeVersion": 2,
-                "position": [670, 40],
+                "position": [2180, -120],
                 "parameters": {
                     "conditions": {
                         "string": [
                             {
-                                "value1": "={{$json.route}}",
+                                "value1": "={{$json.has_notion_config || 'false'}}",
                                 "operation": "equal",
-                                "value2": "research_digest"
+                                "value2": "true"
                             }
                         ]
                     }
@@ -315,68 +735,133 @@ pub fn build_orchestrator_fallback_workflow(
             },
             {
                 "id": uuid::Uuid::new_v4().to_string(),
-                "name": "Integration Blueprint",
-                "type": "n8n-nodes-base.set",
-                "typeVersion": 2,
-                "position": [670, -220],
+                "name": "Notion Create Page",
+                "type": "n8n-nodes-base.httpRequest",
+                "typeVersion": 4.2,
+                "position": [2430, -240],
+                "continueOnFail": true,
                 "parameters": {
-                    "keepOnlySet": false,
-                    "values": {
+                    "method": "POST",
+                    "url": "https://api.notion.com/v1/pages",
+                    "sendHeaders": true,
+                    "headerParameters": {
+                        "parameters": [
+                            { "name": "Authorization", "value": "={{'Bearer ' + ($json.notion_token || '')}}" },
+                            { "name": "Notion-Version", "value": "2022-06-28" },
+                            { "name": "Content-Type", "value": "application/json" }
+                        ]
+                    },
+                    "sendBody": true,
+                    "specifyBody": "json",
+                    "jsonBody": "={{ { \"parent\": { \"type\": \"page_id\", \"page_id\": $json.notion_parent_page_id }, \"properties\": { \"title\": { \"title\": [ { \"text\": { \"content\": $json.notion_title || 'AllvIa AI Trend Digest' } } ] } }, \"children\": ((Array.isArray($json.notion_children) && $json.notion_children.length > 0) ? $json.notion_children.slice(0, 95) : [ { \"object\": \"block\", \"type\": \"paragraph\", \"paragraph\": { \"rich_text\": [ { \"type\": \"text\", \"text\": { \"content\": $json.notion_excerpt || '' } } ] } } ]) } }}",
+                    "options": {
+                        "timeout": 15000,
+                        "retry": {
+                            "maxTries": 3,
+                            "waitBetweenTries": 1500
+                        }
+                    }
+                }
+            },
+            {
+                "id": uuid::Uuid::new_v4().to_string(),
+                "name": "Normalize Notion Result",
+                "type": "n8n-nodes-base.code",
+                "typeVersion": 2,
+                "position": [2670, -240],
+                "parameters": {
+                    "mode": "runOnceForAllItems",
+                    "jsCode": notion_result_code
+                }
+            },
+            {
+                "id": uuid::Uuid::new_v4().to_string(),
+                "name": "If Has Telegram Config",
+                "type": "n8n-nodes-base.if",
+                "typeVersion": 2,
+                "position": [2920, -120],
+                "parameters": {
+                    "conditions": {
                         "string": [
-                            { "name": "execution_stage", "value": "integration_pipeline" },
-                            { "name": "required_nodes", "value": "Telegram Trigger -> Normalize -> LLM -> Notion -> Telegram Send" },
-                            { "name": "status", "value": "blueprint_ready" }
+                            {
+                                "value1": "={{$json.has_telegram_config || 'false'}}",
+                                "operation": "equal",
+                                "value2": "true"
+                            }
                         ]
                     }
                 }
             },
             {
                 "id": uuid::Uuid::new_v4().to_string(),
-                "name": "Research Blueprint",
+                "name": "Telegram Notify",
+                "type": "n8n-nodes-base.httpRequest",
+                "typeVersion": 4.2,
+                "position": [3160, -240],
+                "continueOnFail": true,
+                "parameters": {
+                    "method": "POST",
+                    "url": "={{'https://api.telegram.org/bot' + ($json.telegram_bot_token || '') + '/sendMessage'}}",
+                    "sendBody": true,
+                    "specifyBody": "json",
+                    "jsonBody": "={{ { \"chat_id\": $json.telegram_chat_id, \"text\": ($json.telegram_summary || 'Workflow completed'), \"disable_web_page_preview\": true } }}",
+                    "options": {
+                        "timeout": 12000,
+                        "retry": {
+                            "maxTries": 3,
+                            "waitBetweenTries": 1200
+                        }
+                    }
+                }
+            },
+            {
+                "id": uuid::Uuid::new_v4().to_string(),
+                "name": "Normalize Telegram Result",
+                "type": "n8n-nodes-base.code",
+                "typeVersion": 2,
+                "position": [3400, -240],
+                "parameters": {
+                    "mode": "runOnceForAllItems",
+                    "jsCode": telegram_result_code
+                }
+            },
+            {
+                "id": uuid::Uuid::new_v4().to_string(),
+                "name": "Validation Error Payload",
                 "type": "n8n-nodes-base.set",
                 "typeVersion": 2,
-                "position": [950, -20],
+                "position": [1930, 120],
                 "parameters": {
                     "keepOnlySet": false,
                     "values": {
                         "string": [
-                            { "name": "execution_stage", "value": "research_digest" },
-                            { "name": "required_nodes", "value": "HTTP Fetch -> Extract -> Summarize -> Publish" },
-                            { "name": "status", "value": "blueprint_ready" }
+                            { "name": "status", "value": "failed_validation" },
+                            { "name": "error_summary", "value": "={{Array.isArray($json.validation_errors) ? $json.validation_errors.join('; ') : 'validation failed'}}" }
                         ]
                     }
                 }
             },
             {
                 "id": uuid::Uuid::new_v4().to_string(),
-                "name": "Local Assist Blueprint",
+                "name": "Observability Log",
                 "type": "n8n-nodes-base.set",
                 "typeVersion": 2,
-                "position": [950, 180],
+                "position": [3640, -120],
                 "parameters": {
                     "keepOnlySet": false,
                     "values": {
                         "string": [
-                            { "name": "execution_stage", "value": "local_assist" },
-                            { "name": "required_nodes", "value": "App Trigger -> Guard -> Execute -> Verify" },
-                            { "name": "status", "value": "blueprint_ready" }
-                        ]
-                    }
-                }
-            },
-            {
-                "id": uuid::Uuid::new_v4().to_string(),
-                "name": "Execution Blueprint",
-                "type": "n8n-nodes-base.set",
-                "typeVersion": 2,
-                "position": [1220, 40],
-                "parameters": {
-                    "keepOnlySet": false,
-                    "values": {
-                        "string": [
-                            { "name": "orchestrator_decision", "value": "={{$json.execution_stage || $json.route || 'local_assist'}}" },
-                            { "name": "next_step", "value": "Replace blueprint nodes with real credentials and domain APIs" },
-                            { "name": "status", "value": "ready_for_extension" }
+                            { "name": "status", "value": "={{$json.validation_ok === 'true' ? (($json.notion_status === 'failed' || $json.telegram_status === 'failed') ? 'completed_with_warnings' : 'completed') : ($json.status || 'failed')}}" },
+                            { "name": "pipeline", "value": "allvia_fallback_orchestrator_v4" },
+                            { "name": "idempotency_key", "value": "={{$json.idempotency_key || ''}}" },
+                            { "name": "article_count", "value": "={{String($json.article_count || 0)}}" },
+                            { "name": "fetch_ok", "value": "={{String($json.fetch_ok === true)}}" },
+                            { "name": "notion_status", "value": "={{$json.notion_status || ($json.has_notion_config === 'true' ? 'unknown' : 'skipped')}}" },
+                            { "name": "telegram_status", "value": "={{$json.telegram_status || ($json.has_telegram_config === 'true' ? 'unknown' : 'skipped')}}" },
+                            { "name": "notion_error", "value": "={{$json.notion_error || ''}}" },
+                            { "name": "telegram_error", "value": "={{$json.telegram_error || ''}}" },
+                            { "name": "fallback_reason", "value": "={{$json.fallback_reason || ''}}" },
+                            { "name": "completed_at", "value": "={{$now}}" }
                         ]
                     }
                 }
@@ -386,43 +871,74 @@ pub fn build_orchestrator_fallback_workflow(
             "Manual Trigger": {
                 "main": [[{ "node": "Input Envelope", "type": "main", "index": 0 }]]
             },
-            "Program Webhook": {
+            "ProgramWebhook": {
                 "main": [[{ "node": "Input Envelope", "type": "main", "index": 0 }]]
             },
             "Input Envelope": {
-                "main": [[{ "node": "Route Planner", "type": "main", "index": 0 }]]
+                "main": [[{ "node": "Idempotency Guard", "type": "main", "index": 0 }]]
             },
-            "Route Planner": {
-                "main": [[{ "node": "If Integration Route", "type": "main", "index": 0 }]]
+            "Idempotency Guard": {
+                "main": [[{ "node": "Fetch Trend Feed", "type": "main", "index": 0 }]]
             },
-            "If Integration Route": {
+            "Fetch Trend Feed": {
+                "main": [[{ "node": "Extract Top 5 Articles", "type": "main", "index": 0 }]]
+            },
+            "Extract Top 5 Articles": {
+                "main": [[{ "node": "Classify Trend Alignment", "type": "main", "index": 0 }]]
+            },
+            "Classify Trend Alignment": {
+                "main": [[{ "node": "Build Comparative Summary", "type": "main", "index": 0 }]]
+            },
+            "Build Comparative Summary": {
+                "main": [[{ "node": "Validate Output Schema", "type": "main", "index": 0 }]]
+            },
+            "Validate Output Schema": {
+                "main": [[{ "node": "If Validation OK", "type": "main", "index": 0 }]]
+            },
+            "If Validation OK": {
                 "main": [
-                    [{ "node": "Integration Blueprint", "type": "main", "index": 0 }],
-                    [{ "node": "If Research Route", "type": "main", "index": 0 }]
+                    [{ "node": "Build Markdown Report", "type": "main", "index": 0 }],
+                    [{ "node": "Validation Error Payload", "type": "main", "index": 0 }]
                 ]
             },
-            "If Research Route": {
+            "Build Markdown Report": {
+                "main": [[{ "node": "If Has Notion Config", "type": "main", "index": 0 }]]
+            },
+            "If Has Notion Config": {
                 "main": [
-                    [{ "node": "Research Blueprint", "type": "main", "index": 0 }],
-                    [{ "node": "Local Assist Blueprint", "type": "main", "index": 0 }]
+                    [{ "node": "Notion Create Page", "type": "main", "index": 0 }],
+                    [{ "node": "If Has Telegram Config", "type": "main", "index": 0 }]
                 ]
             },
-            "Integration Blueprint": {
-                "main": [[{ "node": "Execution Blueprint", "type": "main", "index": 0 }]]
+            "Notion Create Page": {
+                "main": [[{ "node": "Normalize Notion Result", "type": "main", "index": 0 }]]
             },
-            "Research Blueprint": {
-                "main": [[{ "node": "Execution Blueprint", "type": "main", "index": 0 }]]
+            "Normalize Notion Result": {
+                "main": [[{ "node": "If Has Telegram Config", "type": "main", "index": 0 }]]
             },
-            "Local Assist Blueprint": {
-                "main": [[{ "node": "Execution Blueprint", "type": "main", "index": 0 }]]
+            "If Has Telegram Config": {
+                "main": [
+                    [{ "node": "Telegram Notify", "type": "main", "index": 0 }],
+                    [{ "node": "Observability Log", "type": "main", "index": 0 }]
+                ]
+            },
+            "Telegram Notify": {
+                "main": [[{ "node": "Normalize Telegram Result", "type": "main", "index": 0 }]]
+            },
+            "Normalize Telegram Result": {
+                "main": [[{ "node": "Observability Log", "type": "main", "index": 0 }]]
+            },
+            "Validation Error Payload": {
+                "main": [[{ "node": "Observability Log", "type": "main", "index": 0 }]]
             }
         },
         "settings": {
-            "saveManualExecutions": true
+            "saveManualExecutions": true,
+            "executionTimeout": 300
         },
         "active": false,
         "meta": {
-            "source": "steer-fallback-orchestrator"
+            "source": "steer-fallback-orchestrator-v4"
         }
     })
 }
@@ -448,35 +964,51 @@ fn n8n_test_context() -> bool {
 }
 
 impl N8nApi {
-    fn local_latest_api_key_from_db() -> Option<String> {
-        let db_path = if let Ok(custom) = std::env::var("STEER_N8N_DB_PATH") {
+    fn local_db_candidates() -> Vec<PathBuf> {
+        if let Ok(custom) = std::env::var("STEER_N8N_DB_PATH") {
             let trimmed = custom.trim();
-            if trimmed.is_empty() {
-                return None;
+            if !trimmed.is_empty() {
+                return vec![PathBuf::from(trimmed)];
             }
-            PathBuf::from(trimmed)
-        } else {
-            let home = std::env::var("HOME").ok()?;
-            PathBuf::from(home).join(".n8n").join("database.sqlite")
-        };
-
-        if !db_path.exists() {
-            return None;
         }
 
-        let conn = Connection::open(db_path).ok()?;
-        let key: String = conn
-            .query_row(
+        let home = match std::env::var("HOME") {
+            Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
+            _ => return Vec::new(),
+        };
+
+        vec![
+            home.join(".steer").join("n8n").join("database.sqlite"),
+            home.join(".n8n").join("database.sqlite"),
+        ]
+    }
+
+    fn local_latest_api_key_from_db() -> Option<String> {
+        for db_path in Self::local_db_candidates() {
+            if !db_path.exists() {
+                continue;
+            }
+
+            let conn = match Connection::open(&db_path) {
+                Ok(conn) => conn,
+                Err(_) => continue,
+            };
+            let key: String = match conn.query_row(
                 "SELECT apiKey FROM user_api_keys ORDER BY createdAt DESC LIMIT 1",
                 [],
                 |row| row.get::<_, String>(0),
-            )
-            .ok()?;
-        let trimmed = key.trim();
-        if trimmed.is_empty() {
-            return None;
+            ) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let trimmed = key.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            return Some(trimmed.to_string());
         }
-        Some(trimmed.to_string())
+
+        None
     }
 
     fn n8n_cli_binary_available() -> bool {
@@ -558,10 +1090,13 @@ Set STEER_N8N_ALLOW_NPX_CLI=1 (or enable npx runtime explicitly)."
     }
 
     pub fn from_env() -> anyhow::Result<Self> {
-        let base_url = std::env::var("N8N_API_URL")
+        let base_url = std::env::var("STEER_N8N_API_URL")
+            .or_else(|_| std::env::var("N8N_API_URL"))
             .unwrap_or_else(|_| "http://localhost:5678/api/v1".to_string());
         // Allow missing key only when CLI fallback is explicitly enabled.
-        let mut api_key = std::env::var("N8N_API_KEY").unwrap_or_default();
+        let mut api_key = std::env::var("STEER_N8N_API_KEY")
+            .or_else(|_| std::env::var("N8N_API_KEY"))
+            .unwrap_or_default();
         let prefer_db_key = parse_bool_env_with_default("STEER_N8N_PREFER_LOCAL_DB_KEY", true);
         let local_target = base_url.contains("localhost") || base_url.contains("127.0.0.1");
         if prefer_db_key && local_target {
@@ -589,7 +1124,16 @@ Set STEER_N8N_ALLOW_NPX_CLI=1 (or enable npx runtime explicitly)."
     }
 
     fn local_target(&self) -> bool {
-        self.base_url.contains("localhost") || self.base_url.contains("127.0.0.1")
+        self.base_url.contains("localhost")
+            || self.base_url.contains("127.0.0.1")
+            || self.base_url.contains("0.0.0.0")
+            || self.base_url.contains("::1")
+    }
+
+    fn reserve_ephemeral_local_port() -> Option<u16> {
+        std::net::TcpListener::bind(("127.0.0.1", 0))
+            .ok()
+            .and_then(|listener| listener.local_addr().ok().map(|addr| addr.port()))
     }
 
     fn health_urls(&self) -> (String, String) {
@@ -1048,24 +1592,6 @@ Set STEER_N8N_ALLOW_NPX_TUNNEL_NON_TEST=1 to override."
         workflow_json: &Value,
         active: bool,
     ) -> Result<String> {
-        // 1. Validate JSON (repair to minimal workflow if empty)
-        let mut normalized = workflow_json.clone();
-
-        // Check if nodes are empty or missing
-        let is_empty = normalized
-            .get("nodes")
-            .and_then(|n| n.as_array())
-            .map(|arr| arr.is_empty())
-            .unwrap_or(true);
-
-        if is_empty {
-            println!("⚠️ Workflow nodes empty. Falling back to orchestrator workflow template.");
-            normalized = build_orchestrator_fallback_workflow(name, None, "empty_nodes");
-        } else if workflow_is_too_simple(&normalized) {
-            println!("⚠️ Workflow nodes too simple. Replacing with orchestrator workflow template.");
-            normalized = build_orchestrator_fallback_workflow(name, None, "too_simple_nodes");
-        }
-
         if crate::env_flag("STEER_N8N_MOCK") {
             let mock_id = format!("mock-wf-{}", chrono::Utc::now().timestamp_millis());
             println!(
@@ -1074,6 +1600,9 @@ Set STEER_N8N_ALLOW_NPX_TUNNEL_NON_TEST=1 to override."
             );
             return Ok(mock_id);
         }
+
+        // 1. Validate JSON and normalize once for consistent downstream behavior.
+        let normalized = normalize_workflow_for_create(name, workflow_json)?;
 
         // 2. Validate Credentials (Prevent broken workflows)
         // Only if API key is present (we need API to list creds)
@@ -1129,7 +1658,7 @@ Set STEER_N8N_ALLOW_NPX_TUNNEL_NON_TEST=1 to override."
         }
 
         // 4. Fallback to CLI (Strict Local Check)
-        if !self.base_url.contains("localhost") && !self.base_url.contains("127.0.0.1") {
+        if !self.local_target() {
             return Err(anyhow::anyhow!(
                 "❌ CLI Fallback aborted: n8n is remote ({}). CLI only works for local instances.",
                 self.base_url
@@ -1185,6 +1714,12 @@ Set STEER_N8N_ALLOW_NPX_TUNNEL_NON_TEST=1 to override."
 
         let resp_json: Value = resp.json().await?;
         let id = resp_json["id"].as_str().unwrap_or("unknown").to_string();
+        if let Err(webhook_fix_err) = self.enable_disabled_webhook_nodes(&id).await {
+            eprintln!(
+                "⚠️ failed to normalize webhook trigger state for workflow {}: {}",
+                id, webhook_fix_err
+            );
+        }
         if active {
             if let Err(activate_err) = self.activate_workflow(&id).await {
                 // Some n8n versions expose activation differently; attempt generic update fallback.
@@ -1201,20 +1736,104 @@ Set STEER_N8N_ALLOW_NPX_TUNNEL_NON_TEST=1 to override."
         Ok(id)
     }
 
-    async fn update_workflow_active(&self, id: &str, active: bool) -> Result<()> {
+    async fn enable_disabled_webhook_nodes(&self, id: &str) -> Result<bool> {
         let url = format!("{}/workflows/{}", self.base_url, id);
-        let active_body = json!({ "active": active });
-        let resp = self
-            .send_with_retry("n8n update_workflow_active", || {
-                self.client
-                    .patch(&url)
-                    .header("X-N8N-API-KEY", &self.api_key)
-                    .json(&active_body)
+        let workflow_resp = self
+            .send_with_retry("n8n get_workflow_for_webhook_fix", || {
+                self.client.get(&url).header("X-N8N-API-KEY", &self.api_key)
             })
             .await?;
-        if !resp.status().is_success() {
-            let error_text = resp.text().await?;
-            return Err(anyhow::anyhow!("n8n workflow update error: {}", error_text));
+        let workflow: Value = workflow_resp.json().await?;
+
+        let nodes = workflow
+            .get("nodes")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow::anyhow!("workflow {} has invalid nodes payload", id))?;
+
+        let mut has_webhook = false;
+        let mut changed = false;
+        let mut normalized_nodes: Vec<Value> = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let mut node_value = node.clone();
+            if node
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                == "n8n-nodes-base.webhook"
+            {
+                has_webhook = true;
+                if let Some(obj) = node_value.as_object_mut() {
+                    let is_disabled = obj
+                        .get("disabled")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if is_disabled {
+                        obj.insert("disabled".to_string(), Value::Bool(false));
+                        changed = true;
+                    }
+                    let missing_webhook_id = obj
+                        .get("webhookId")
+                        .and_then(|v| v.as_str())
+                        .map(|v| v.trim().is_empty())
+                        .unwrap_or(true);
+                    if missing_webhook_id {
+                        obj.insert(
+                            "webhookId".to_string(),
+                            Value::String(uuid::Uuid::new_v4().to_string()),
+                        );
+                        changed = true;
+                    }
+                }
+            }
+            normalized_nodes.push(node_value);
+        }
+
+        if !has_webhook || !changed {
+            return Ok(false);
+        }
+
+        let update_body = json!({
+            "name": workflow.get("name").cloned().unwrap_or_else(|| json!("workflow")),
+            "nodes": normalized_nodes,
+            "connections": workflow.get("connections").cloned().unwrap_or_else(|| json!({})),
+            "settings": workflow.get("settings").cloned().unwrap_or_else(|| json!({}))
+        });
+        let _ = self
+            .send_with_retry("n8n fix_disabled_webhook_nodes", || {
+                self.client
+                    .put(&url)
+                    .header("X-N8N-API-KEY", &self.api_key)
+                    .json(&update_body)
+            })
+            .await?;
+        Ok(true)
+    }
+
+    async fn update_workflow_active(&self, id: &str, active: bool) -> Result<()> {
+        let url = format!("{}/workflows/{}", self.base_url, id);
+        let workflow_resp = self
+            .send_with_retry("n8n get_workflow_for_active_update", || {
+                self.client.get(&url).header("X-N8N-API-KEY", &self.api_key)
+            })
+            .await?;
+        let workflow: Value = workflow_resp.json().await?;
+        let update_body = json!({
+            "name": workflow.get("name").cloned().unwrap_or_else(|| json!("workflow")),
+            "nodes": workflow.get("nodes").cloned().unwrap_or_else(|| json!([])),
+            "connections": workflow.get("connections").cloned().unwrap_or_else(|| json!({})),
+            "settings": workflow.get("settings").cloned().unwrap_or_else(|| json!({})),
+            "active": active
+        });
+        let _ = self
+            .send_with_retry("n8n update_workflow_active", || {
+                self.client
+                    .put(&url)
+                    .header("X-N8N-API-KEY", &self.api_key)
+                    .json(&update_body)
+            })
+            .await?;
+        if active {
+            let _ = self.enable_disabled_webhook_nodes(id).await;
         }
         Ok(())
     }
@@ -1420,40 +2039,178 @@ Set STEER_N8N_ALLOW_NAME_ID_FALLBACK=1 to allow name-based fallback.",
         build_orchestrator_fallback_workflow(name, None, "legacy_minimal_template")
     }
 
+    async fn activate_workflow_cli(&self, id: &str, active: bool) -> Result<()> {
+        let (cli_bin, cli_prefix) = self.resolve_cli_invocation()?;
+        let mut cmd = tokio::process::Command::new(&cli_bin);
+        cmd.args(&cli_prefix);
+        cmd.args([
+            "update:workflow",
+            "--id",
+            id,
+            "--active",
+            if active { "true" } else { "false" },
+        ]);
+        let output = cmd.output().await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let detail = if !stderr.is_empty() { stderr } else { stdout };
+            return Err(anyhow::anyhow!(
+                "n8n CLI update:workflow failed for id={} active={}: {}",
+                id,
+                active,
+                detail
+            ));
+        }
+        Ok(())
+    }
+
+    async fn execute_workflow_cli(&self, id: &str) -> Result<ExecutionResult> {
+        let (cli_bin, cli_prefix) = self.resolve_cli_invocation()?;
+        let mut cmd = tokio::process::Command::new(&cli_bin);
+        cmd.args(&cli_prefix);
+        let broker_port = std::env::var("N8N_RUNNERS_BROKER_PORT")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .or_else(|| Self::reserve_ephemeral_local_port().map(|port| port.to_string()));
+        if let Some(port) = broker_port {
+            cmd.env("N8N_RUNNERS_BROKER_PORT", port);
+        }
+        cmd.args(["execute", "--id", id, "--rawOutput"]);
+        let output = cmd.output().await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let detail = if !stderr.is_empty() { stderr } else { stdout };
+            return Err(anyhow::anyhow!(
+                "n8n CLI execute failed for id={}: {}",
+                id,
+                detail
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let parsed = serde_json::from_str::<Value>(&stdout).ok();
+        let now = chrono::Utc::now().to_rfc3339();
+        Ok(ExecutionResult {
+            id: parsed
+                .as_ref()
+                .and_then(|v| v.get("id").and_then(|x| x.as_str()))
+                .unwrap_or("")
+                .to_string(),
+            finished: parsed
+                .as_ref()
+                .and_then(|v| v.get("finished").and_then(|x| x.as_bool()))
+                .unwrap_or(true),
+            status: parsed
+                .as_ref()
+                .and_then(|v| v.get("status").and_then(|x| x.as_str()))
+                .unwrap_or("success")
+                .to_string(),
+            started_at: parsed
+                .as_ref()
+                .and_then(|v| v.get("startedAt").and_then(|x| x.as_str()))
+                .unwrap_or(&now)
+                .to_string(),
+            stopped_at: parsed
+                .as_ref()
+                .and_then(|v| v.get("stoppedAt").and_then(|x| x.as_str()))
+                .map(|s| s.to_string()),
+        })
+    }
+
     /// Activate a workflow
     pub async fn activate_workflow(&self, id: &str) -> Result<()> {
         let url = format!("{}/workflows/{}/activate", self.base_url, id);
-        let resp = self
+        match self
             .send_with_retry("n8n activate_workflow", || {
                 self.client
                     .post(&url)
                     .header("X-N8N-API-KEY", &self.api_key)
             })
-            .await?;
-
-        if !resp.status().is_success() {
-            let error_text = resp.text().await?;
-            return Err(anyhow::anyhow!("n8n activate error: {}", error_text));
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(api_err) => {
+                if self.local_target() {
+                    if let Ok(true) = self.enable_disabled_webhook_nodes(id).await {
+                        match self
+                            .send_with_retry(
+                                "n8n activate_workflow_retry_after_webhook_fix",
+                                || {
+                                    self.client
+                                        .post(&url)
+                                        .header("X-N8N-API-KEY", &self.api_key)
+                                },
+                            )
+                            .await
+                        {
+                            Ok(_) => return Ok(()),
+                            Err(retry_err) => {
+                                eprintln!(
+                                    "⚠️ activate retry after webhook-fix failed: {}",
+                                    retry_err
+                                );
+                            }
+                        }
+                    }
+                    match self.activate_workflow_cli(id, true).await {
+                        Ok(_) => {
+                            println!(
+                                "⚠️ n8n API activate failed ({}), recovered with CLI update:workflow",
+                                api_err
+                            );
+                            return Ok(());
+                        }
+                        Err(cli_err) => {
+                            return Err(anyhow::anyhow!(
+                                "n8n activate error: {} | CLI fallback failed: {}",
+                                api_err,
+                                cli_err
+                            ));
+                        }
+                    }
+                }
+                Err(anyhow::anyhow!("n8n activate error: {}", api_err))
+            }
         }
-        Ok(())
     }
 
     /// Deactivate a workflow
     pub async fn deactivate_workflow(&self, id: &str) -> Result<()> {
         let url = format!("{}/workflows/{}/deactivate", self.base_url, id);
-        let resp = self
+        match self
             .send_with_retry("n8n deactivate_workflow", || {
                 self.client
                     .post(&url)
                     .header("X-N8N-API-KEY", &self.api_key)
             })
-            .await?;
-
-        if !resp.status().is_success() {
-            let error_text = resp.text().await?;
-            return Err(anyhow::anyhow!("n8n deactivate error: {}", error_text));
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(api_err) => {
+                if self.local_target() {
+                    match self.activate_workflow_cli(id, false).await {
+                        Ok(_) => {
+                            println!(
+                                "⚠️ n8n API deactivate failed ({}), recovered with CLI update:workflow",
+                                api_err
+                            );
+                            return Ok(());
+                        }
+                        Err(cli_err) => {
+                            return Err(anyhow::anyhow!(
+                                "n8n deactivate error: {} | CLI fallback failed: {}",
+                                api_err,
+                                cli_err
+                            ));
+                        }
+                    }
+                }
+                Err(anyhow::anyhow!("n8n deactivate error: {}", api_err))
+            }
         }
-        Ok(())
     }
 
     /// Get workflow status
@@ -1517,28 +2274,74 @@ Set STEER_N8N_ALLOW_NAME_ID_FALLBACK=1 to allow name-based fallback.",
     pub async fn execute_workflow(&self, id: &str) -> Result<ExecutionResult> {
         let url = format!("{}/workflows/{}/run", self.base_url, id);
         let run_body = json!({});
-        let resp = self
+        let resp = match self
             .send_with_retry("n8n execute_workflow", || {
                 self.client
                     .post(&url)
                     .header("X-N8N-API-KEY", &self.api_key)
                     .json(&run_body)
             })
-            .await?;
+            .await
+        {
+            Ok(resp) => resp,
+            Err(api_err) => {
+                if self.local_target() {
+                    match self.execute_workflow_cli(id).await {
+                        Ok(execution) => {
+                            println!(
+                                "⚠️ n8n API execute failed ({}), recovered with CLI execute",
+                                api_err
+                            );
+                            let _ = self.enable_disabled_webhook_nodes(id).await;
+                            return Ok(execution);
+                        }
+                        Err(cli_err) => {
+                            return Err(anyhow::anyhow!(
+                                "n8n execute error: {} | CLI fallback failed: {}",
+                                api_err,
+                                cli_err
+                            ));
+                        }
+                    }
+                }
+                return Err(anyhow::anyhow!("n8n execute error: {}", api_err));
+            }
+        };
 
         if !resp.status().is_success() {
             let error_text = resp.text().await?;
+            if self.local_target() {
+                match self.execute_workflow_cli(id).await {
+                    Ok(execution) => {
+                        println!(
+                            "⚠️ n8n API execute failed ({}), recovered with CLI execute",
+                            error_text
+                        );
+                        let _ = self.enable_disabled_webhook_nodes(id).await;
+                        return Ok(execution);
+                    }
+                    Err(cli_err) => {
+                        return Err(anyhow::anyhow!(
+                            "n8n execute error: {} | CLI fallback failed: {}",
+                            error_text,
+                            cli_err
+                        ));
+                    }
+                }
+            }
             return Err(anyhow::anyhow!("n8n execute error: {}", error_text));
         }
 
         let data: Value = resp.json().await?;
-        Ok(ExecutionResult {
+        let result = ExecutionResult {
             id: data["id"].as_str().unwrap_or("").to_string(),
             finished: data["finished"].as_bool().unwrap_or(false),
             status: data["status"].as_str().unwrap_or("unknown").to_string(),
             started_at: data["startedAt"].as_str().unwrap_or("").to_string(),
             stopped_at: data["stoppedAt"].as_str().map(|s| s.to_string()),
-        })
+        };
+        let _ = self.enable_disabled_webhook_nodes(id).await;
+        Ok(result)
     }
 
     /// List executions for a workflow

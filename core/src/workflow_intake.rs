@@ -162,7 +162,7 @@ fn parse_handoff_major(payload: &Value) -> Option<u64> {
     if raw.is_empty() {
         return None;
     }
-    let normalized = raw.trim_start_matches(|c: char| c == 'v' || c == 'V');
+    let normalized = raw.trim_start_matches(['v', 'V']);
     let major = normalized.split('.').next()?.trim();
     major.parse::<u64>().ok()
 }

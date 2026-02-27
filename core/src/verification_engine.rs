@@ -34,26 +34,23 @@ pub fn verify_plan(plan: &Plan) -> VerificationResult {
     if matches!(
         plan.intent,
         crate::nl_automation::IntentType::ShoppingCompare
-    ) {
-        if plan
-            .slots
-            .get("product_name")
-            .map(|v| v.is_empty())
-            .unwrap_or(true)
-        {
-            issues.push("Missing product name".to_string());
-        }
+    ) && plan
+        .slots
+        .get("product_name")
+        .map(|v| v.is_empty())
+        .unwrap_or(true)
+    {
+        issues.push("Missing product name".to_string());
     }
 
-    if matches!(plan.intent, crate::nl_automation::IntentType::FormFill) {
-        if plan
+    if matches!(plan.intent, crate::nl_automation::IntentType::FormFill)
+        && plan
             .slots
             .get("form_purpose")
             .map(|v| v.is_empty())
             .unwrap_or(true)
-        {
-            issues.push("Missing form purpose".to_string());
-        }
+    {
+        issues.push("Missing form purpose".to_string());
     }
 
     VerificationResult {

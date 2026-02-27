@@ -270,8 +270,7 @@ fn extract_url_path(url: &str) -> Option<String> {
         let path = parts.next().unwrap_or("");
         return Some(format!("/{}", path));
     }
-    if url.starts_with("//") {
-        let stripped = &url[2..];
+    if let Some(stripped) = url.strip_prefix("//") {
         let mut parts = stripped.splitn(2, '/');
         let _host = parts.next()?;
         let path = parts.next().unwrap_or("");

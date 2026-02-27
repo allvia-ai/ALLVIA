@@ -59,11 +59,9 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
             return false;
         }
     };
-    for name in rows {
-        if let Ok(name) = name {
-            if name == column {
-                return true;
-            }
+    for name in rows.flatten() {
+        if name == column {
+            return true;
         }
     }
     false
@@ -1311,7 +1309,7 @@ pub fn find_valid_exec_approval(command: &str, cwd: Option<&str>) -> Result<Opti
         return match row {
             Ok(found) => Ok(Some(found)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e),
         };
     }
     Ok(None)
@@ -3201,16 +3199,16 @@ pub fn update_recommendation_review_status(id: i64, status: &str) -> Result<()> 
     })?;
     let current = rec.status.trim().to_lowercase();
 
-    let allowed = match (current.as_str(), normalized.as_str()) {
-        ("pending", "pending") => true,
-        ("pending", "approved") => true,
-        ("pending", "rejected") => true,
-        ("approved", "approved") => true,
-        ("approved", "rejected") => true,
-        ("rejected", "rejected") => true,
-        ("rejected", "pending") => true,
-        _ => false,
-    };
+    let allowed = matches!(
+        (current.as_str(), normalized.as_str()),
+        ("pending", "pending")
+            | ("pending", "approved")
+            | ("pending", "rejected")
+            | ("approved", "approved")
+            | ("approved", "rejected")
+            | ("rejected", "rejected")
+            | ("rejected", "pending")
+    );
 
     if !allowed {
         return Err(rusqlite::Error::InvalidParameterName(format!(
@@ -3437,6 +3435,14 @@ pub fn mark_workflow_provision_created(
     Ok(())
 }
 
+pub fn mark_workflow_provision_in_progress(op_id: i64, detail: Option<&str>) -> Result<()> {
+    let mut lock = get_db_lock();
+    if let Some(conn) = lock.as_mut() {
+        update_workflow_provision_op_status_with_conn(conn, op_id, "provisioning", detail)?;
+    }
+    Ok(())
+}
+
 pub fn mark_workflow_provision_failed(op_id: i64, error: &str) -> Result<()> {
     let mut lock = get_db_lock();
     if let Some(conn) = lock.as_mut() {
@@ -3487,13 +3493,19 @@ pub fn reconcile_workflow_provision_ops(limit: i64) -> Result<Vec<String>> {
         .and_then(|v| v.trim().parse::<i64>().ok())
         .map(|v| v.clamp(15, 86_400))
         .unwrap_or(180);
+    let provisioning_timeout_secs =
+        std::env::var("STEER_WORKFLOW_PROVISION_IN_PROGRESS_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .map(|v| v.clamp(30, 172_800))
+            .unwrap_or(900);
     let mut lock = get_db_lock();
     let mut outcomes = Vec::new();
     if let Some(conn) = lock.as_mut() {
         let mut stale_stmt = conn.prepare(
-            "SELECT id, recommendation_id, claim_token, updated_at
+            "SELECT id, recommendation_id, claim_token, status, updated_at
              FROM workflow_provision_ops
-             WHERE status = 'requested'
+             WHERE status IN ('requested', 'provisioning')
              ORDER BY updated_at ASC
              LIMIT ?1",
         )?;
@@ -3503,11 +3515,12 @@ pub fn reconcile_workflow_provision_ops(limit: i64) -> Result<Vec<String>> {
                 row.get::<_, i64>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })?;
 
         for stale in stale_rows {
-            let (op_id, recommendation_id, claim_token, updated_at) = stale?;
+            let (op_id, recommendation_id, claim_token, status, updated_at) = stale?;
             let updated = match chrono::DateTime::parse_from_rfc3339(&updated_at) {
                 Ok(ts) => ts.with_timezone(&chrono::Utc),
                 Err(_) => continue,
@@ -3515,12 +3528,17 @@ pub fn reconcile_workflow_provision_ops(limit: i64) -> Result<Vec<String>> {
             let age_secs = chrono::Utc::now()
                 .signed_duration_since(updated)
                 .num_seconds();
-            if age_secs < requested_timeout_secs {
+            let timeout_secs = if status.eq_ignore_ascii_case("provisioning") {
+                provisioning_timeout_secs
+            } else {
+                requested_timeout_secs
+            };
+            if age_secs < timeout_secs {
                 continue;
             }
             let msg = format!(
-                "workflow provisioning request timed out after {}s (age={}s)",
-                requested_timeout_secs, age_secs
+                "workflow provisioning {} timed out after {}s (age={}s)",
+                status, timeout_secs, age_secs
             );
             let _ =
                 update_workflow_provision_op_status_with_conn(conn, op_id, "failed", Some(&msg));
@@ -3546,8 +3564,8 @@ pub fn reconcile_workflow_provision_ops(limit: i64) -> Result<Vec<String>> {
                 );
             }
             outcomes.push(format!(
-                "op {} timed out from requested -> failed (recommendation {})",
-                op_id, recommendation_id
+                "op {} timed out from {} -> failed (recommendation {})",
+                op_id, status, recommendation_id
             ));
         }
         drop(stale_stmt);
@@ -3948,10 +3966,8 @@ pub fn get_recent_events(cutoff_hours: i64) -> anyhow::Result<Vec<String>> {
         )?;
 
         let rows = stmt.query_map(params![&cutoff], |row| row.get::<_, String>(0))?;
-        for event in rows {
-            if let Ok(json) = event {
-                events.push(json);
-            }
+        for json in rows.flatten() {
+            events.push(json);
         }
 
         // Sort merged events by timestamp to be safe (though usually appended logic works if legacy is old)
@@ -3964,7 +3980,7 @@ pub fn get_recent_events(cutoff_hours: i64) -> anyhow::Result<Vec<String>> {
 
         return Ok(events);
     }
-    Err(anyhow::anyhow!("DB not initialized").into())
+    Err(anyhow::anyhow!("DB not initialized"))
 }
 
 // Memory System: Chat History
@@ -4110,14 +4126,13 @@ pub fn get_dashboard_stats() -> Result<DashboardStats> {
     if let Some(conn) = lock.as_mut() {
         // 1. Session Stats
         // Check if sessions_v2 exists first, otherwise mock
-        let (total_sessions, total_time_mins): (i64, i64) = match conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(duration_sec)/60, 0) FROM sessions_v2",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ) {
-            Ok(res) => res,
-            Err(_) => (0, 0), // sessions_v2 might not exist yet
-        };
+        let (total_sessions, total_time_mins): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(duration_sec)/60, 0) FROM sessions_v2",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or_default(); // sessions_v2 might not exist yet
 
         // 2. Pending Recs
         let rec_pending: i64 = conn
@@ -4135,9 +4150,7 @@ pub fn get_dashboard_stats() -> Result<DashboardStats> {
                  Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             });
             if let Ok(iter) = rows {
-                for r in iter {
-                    if let Ok(val) = r { top_apps.push(val); }
-                }
+                for val in iter.flatten() { top_apps.push(val); }
             }
         }
 
@@ -4348,8 +4361,7 @@ mod tests {
         let stages = list_task_stage_runs(&run_id).expect("list stages");
         let latest = stages
             .into_iter()
-            .filter(|s| s.stage_name == "execution")
-            .last()
+            .rfind(|s| s.stage_name == "execution")
             .expect("latest execution stage");
         assert_eq!(latest.status, "retrying");
         assert!(latest.retry_count >= 1);

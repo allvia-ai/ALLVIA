@@ -130,7 +130,7 @@ fn ensure_core_running() -> Result<(), String> {
         .env("STEER_API_ALLOW_NO_KEY", "1")
         .env("STEER_DISABLE_EVENT_TAP", "1")
         .env("STEER_DISABLE_ANALYZER", "1")
-        .env("STEER_PREFLIGHT_SCREEN_CAPTURE", "0")
+        .env("STEER_PREFLIGHT_SCREEN_CAPTURE", "1")
         .env("STEER_PREFLIGHT_AX_SNAPSHOT", "0")
         .env("RUST_LOG", "info")
         .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")

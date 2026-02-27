@@ -33,8 +33,8 @@ impl ContextPruneConfig {
 
 pub fn history_fetch_limit() -> i64 {
     let cfg = ContextPruneConfig::from_env();
-    let min_fetch = std::cmp::max(10, cfg.max_messages * 2) as i64;
-    min_fetch
+
+    std::cmp::max(10, cfg.max_messages * 2) as i64
 }
 
 pub fn prune_chat_history(history: &[ChatMessage]) -> Vec<ChatMessage> {
@@ -42,32 +42,26 @@ pub fn prune_chat_history(history: &[ChatMessage]) -> Vec<ChatMessage> {
     let mut filtered: Vec<ChatMessage> = history.to_vec();
 
     if let Some(cutoff) = cfg.session_reset.cutoff_utc() {
-        filtered = filtered
-            .into_iter()
-            .filter(|msg| {
-                DateTime::parse_from_rfc3339(&msg.created_at)
-                    .ok()
-                    .map(|ts| ts.with_timezone(&Utc) >= cutoff)
-                    .unwrap_or(true)
-            })
-            .collect();
+        filtered.retain(|msg| {
+            DateTime::parse_from_rfc3339(&msg.created_at)
+                .ok()
+                .map(|ts| ts.with_timezone(&Utc) >= cutoff)
+                .unwrap_or(true)
+        });
     }
 
     if let Some(ttl) = cfg.ttl_seconds {
         let now = Utc::now();
-        filtered = filtered
-            .into_iter()
-            .filter(|msg| {
-                DateTime::parse_from_rfc3339(&msg.created_at)
-                    .ok()
-                    .map(|ts| {
-                        now.signed_duration_since(ts.with_timezone(&Utc))
-                            .num_seconds()
-                            <= ttl
-                    })
-                    .unwrap_or(true)
-            })
-            .collect();
+        filtered.retain(|msg| {
+            DateTime::parse_from_rfc3339(&msg.created_at)
+                .ok()
+                .map(|ts| {
+                    now.signed_duration_since(ts.with_timezone(&Utc))
+                        .num_seconds()
+                        <= ttl
+                })
+                .unwrap_or(true)
+        });
     }
 
     if cfg.max_messages > 0 && filtered.len() > cfg.max_messages {
@@ -152,7 +146,7 @@ impl SessionResetConfig {
         };
         let mut boundary = boundary_local;
         if now < boundary {
-            boundary = boundary - chrono::Duration::days(1);
+            boundary -= chrono::Duration::days(1);
         }
 
         let mut cutoff = boundary.with_timezone(&Utc);

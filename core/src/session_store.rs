@@ -224,6 +224,14 @@ impl SessionStore {
         self.sessions.values().find(|s| s.key == key)
     }
 
+    /// Get the most recently updated session for a key.
+    pub fn get_latest_by_key(&self, key: &str) -> Option<&Session> {
+        self.sessions
+            .values()
+            .filter(|s| s.key == key)
+            .max_by_key(|s| s.updated_at)
+    }
+
     /// Save session to disk
     pub fn save(&self, session: &Session) -> Result<()> {
         let path = self.session_path(&session.id);

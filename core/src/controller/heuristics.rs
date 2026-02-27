@@ -37,9 +37,16 @@ pub fn preflight_permissions() -> Result<()> {
 
 pub fn verify_screen_capture() -> Result<()> {
     // Keep execution-path behavior aligned with API preflight toggle.
-    // If disabled, do not hard-fail planner execution on screen-capture precheck.
     if !env_truthy_default("STEER_PREFLIGHT_SCREEN_CAPTURE", true) {
-        return Ok(());
+        let skip_allowed = env_truthy_default("STEER_TEST_MODE", false)
+            || env_truthy_default("STEER_ALLOW_SCREEN_CAPTURE_SKIP", false);
+        if skip_allowed {
+            return Ok(());
+        }
+        return Err(anyhow::anyhow!(
+            "Screen capture preflight disabled by env (STEER_PREFLIGHT_SCREEN_CAPTURE=0) in non-test mode. {}",
+            permission_help()
+        ));
     }
 
     // 1) First, rely on the native macOS permission check.
@@ -517,7 +524,7 @@ pub fn prefer_lucky_only(goal: &str) -> bool {
 }
 
 pub fn extract_query_param(url: &str, key: &str) -> Option<String> {
-    let qs = url.splitn(2, '?').nth(1)?;
+    let qs = url.split_once('?')?.1;
     for pair in qs.split('&') {
         let mut it = pair.splitn(2, '=');
         let k = it.next().unwrap_or("");
@@ -580,7 +587,13 @@ pub fn try_close_front_dialog() -> bool {
                     try
                         set wName to name of w as text
                     end try
-                    if wName contains "Open" or wName contains "open" or wName contains "열기" or wName contains "Save" or wName contains "save" or wName contains "저장" then
+                    -- Guard: avoid treating normal browser/content windows (e.g. "OpenClaw ...")
+                    -- as file dialogs. Only match strict dialog-like titles.
+                    set isDialogTitle to false
+                    if wName is "Open" or wName is "Open…" or wName is "Save" or wName is "Save…" or wName is "Save As" or wName is "열기" or wName is "저장" then
+                        set isDialogTitle to true
+                    end if
+                    if isDialogTitle then
                         if exists button "Cancel" of w then
                             click button "Cancel" of w
                             return "cancel-window"
@@ -650,7 +663,7 @@ pub async fn ensure_app_focus(target_app: &str, retries: usize) -> bool {
     let effective_retries = std::env::var("STEER_FOCUS_RETRIES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or_else(|| retries.min(2).max(1));
+        .unwrap_or_else(|| retries.clamp(1, 2));
 
     if let Ok(front) = crate::tool_chaining::CrossAppBridge::get_frontmost_app() {
         if front.eq_ignore_ascii_case(target_app) {

@@ -3,6 +3,8 @@ services:
     image: ${N8N_IMAGE:-n8nio/n8n:1}
     container_name: steer-n8n
     restart: unless-stopped
+    env_file:
+      - ./core/.env
     ports:
       - "5678:5678"
     environment:
@@ -13,4 +15,4 @@ services:
       - N8N_DIAGNOSTICS_ENABLED=false
       - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
     volumes:
-      - ${HOME}/.steer/n8n:/home/node/.n8n
+      - ${HOME}/.n8n:/home/node/.n8n

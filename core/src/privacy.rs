@@ -122,7 +122,7 @@ impl PrivacyGuard {
         let url_str = url.to_string();
 
         // Find split point (first of '?' or '#')
-        let split_idx = url_str.find(|c| c == '?' || c == '#');
+        let split_idx = url_str.find(['?', '#']);
 
         if let Some(idx) = split_idx {
             url_str[..idx].to_string()

@@ -224,12 +224,12 @@ impl ApprovalGate {
     fn command_words(cmd: &str) -> Vec<String> {
         let mut words = Vec::new();
         let mut current = String::new();
-        let mut chars = cmd.chars().peekable();
+        let chars = cmd.chars().peekable();
         let mut in_single = false;
         let mut in_double = false;
         let mut escaped = false;
 
-        while let Some(ch) = chars.next() {
+        for ch in chars {
             if escaped {
                 current.push(ch);
                 escaped = false;

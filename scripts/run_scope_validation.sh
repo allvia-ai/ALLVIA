@@ -231,8 +231,16 @@ PORT=15680
 if lsof -tiTCP:${PORT} -sTCP:LISTEN >/dev/null 2>&1; then
   lsof -tiTCP:${PORT} -sTCP:LISTEN | xargs kill -9 || true
 fi
+N8N_DB_PATH="${STEER_N8N_DB_PATH:-}"
+if [[ -z "${N8N_DB_PATH}" ]]; then
+  if [[ -f "${HOME}/.steer/n8n/database.sqlite" ]]; then
+    N8N_DB_PATH="${HOME}/.steer/n8n/database.sqlite"
+  else
+    N8N_DB_PATH="${HOME}/.n8n/database.sqlite"
+  fi
+fi
 N8N_KEY="$(
-  sqlite3 "${HOME}/.n8n/database.sqlite" \
+  sqlite3 "${N8N_DB_PATH}" \
     "SELECT apiKey FROM user_api_keys ORDER BY createdAt DESC LIMIT 1;" \
     | tr -d '\r\n'
 )"
@@ -271,16 +279,28 @@ fi
 AP="$(curl -sS --max-time 180 -X POST "http://127.0.0.1:${PORT}/api/recommendations/${RID}/approve" || true)"
 WFID="$(echo "${AP}" | jq -r '.workflow_id // .id // empty' 2>/dev/null || true)"
 WF="none"
+WF_EXEC='{}'
+WF_EXEC_OK=0
 if [[ -n "${WFID}" ]]; then
   WF="$(
     curl -sS --max-time 20 -H "X-N8N-API-KEY: ${N8N_KEY}" \
       "http://localhost:5678/api/v1/workflows/${WFID}" \
       | jq -c '{id,name,createdAt,updatedAt,active,isArchived}'
   )"
+  WF_EXEC="$(
+    curl -sS --max-time 20 -H "X-N8N-API-KEY: ${N8N_KEY}" \
+      "http://localhost:5678/api/v1/executions?workflowId=${WFID}&limit=5" \
+      | jq -c '.data[0] // {} | {id,finished,status,startedAt,stoppedAt}'
+  )"
+  if echo "${WF_EXEC}" | jq -e '(.finished == true) and (((.status // "") | ascii_downcase) == "success" or ((.status // "") | ascii_downcase) == "completed")' >/dev/null 2>&1; then
+    WF_EXEC_OK=1
+  fi
 fi
 echo "${AP}" | jq . > "${OUT_DIR}/step3_approve_response.json" 2>/dev/null || printf '%s\n' "${AP}" > "${OUT_DIR}/step3_approve_response.json"
 printf '%s\n' "${WF}" > "${OUT_DIR}/step3_workflow_check.json"
+printf '%s\n' "${WF_EXEC}" > "${OUT_DIR}/step3_execution_check.json"
 capture_text_file_proof "${OUT_DIR}/step3_workflow_check.json" "${OUT_DIR}/step3_workflow_check.png"
+capture_text_file_proof "${OUT_DIR}/step3_execution_check.json" "${OUT_DIR}/step3_execution_check.png"
 kill "${API_PID}" >/dev/null 2>&1 || true
 
 echo "STEP1_PASS=${STEP1_PASS}"
@@ -293,4 +313,6 @@ echo "STEP3_RUNID=${STEP3_RUNID}"
 echo "STEP3_MARKER=${STEP3_MARKER}"
 echo "STEP3_APPROVE=$(echo "${AP}" | jq -c . 2>/dev/null || echo '{}')"
 echo "STEP3_WORKFLOW=${WF}"
+echo "STEP3_EXECUTION=${WF_EXEC}"
+echo "STEP3_EXECUTION_OK=${WF_EXEC_OK}"
 echo "OUT_DIR=${OUT_DIR}"

@@ -46,7 +46,7 @@ pub async fn run_runtime_verification(options: RuntimeVerifyOptions) -> RuntimeV
     let workdir = options
         .workdir
         .as_ref()
-        .map(|s| PathBuf::from(s))
+        .map(PathBuf::from)
         .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     let run_backend = options.run_backend.unwrap_or(true);
@@ -319,7 +319,10 @@ async fn run_backend_build_check(target: &BackendTarget, logs: &mut Vec<String>)
                 logs.push("python main file not found for build check".to_string());
                 return false;
             }
-            let file_path = target_file.unwrap();
+            let Some(file_path) = target_file else {
+                logs.push("python main file not found for build check".to_string());
+                return false;
+            };
             let file_arg = file_path.to_string_lossy().to_string();
             let output = run_command(
                 "python",

@@ -265,7 +265,7 @@ fn execute_background(cmd: &str, config: &BashExecConfig) -> Result<BashExecResu
         .context(format!("Failed to spawn background command: {}", cmd))?;
 
     let pid = child.id();
-    let process_id = format!("bg_{}", uuid::Uuid::new_v4().to_string()[..8].to_string());
+    let process_id = format!("bg_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
     register_process(&process_id, pid, cmd);
 
@@ -352,7 +352,7 @@ impl InteractiveSession {
             .spawn()
             .context("Failed to start interactive bash session")?;
 
-        let session_id = format!("pty_{}", uuid::Uuid::new_v4().to_string()[..8].to_string());
+        let session_id = format!("pty_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
         println!("🖥️ [PTY] Started interactive session: {}", session_id);
 

@@ -184,7 +184,7 @@ Return JSON with fields:
 Be concise. Use evidence from runtime/code review. Output JSON only.
 "#;
 
-    let response = llm.score_quality(&system_prompt, &payload).await?;
+    let response = llm.score_quality(system_prompt, &payload).await?;
     let parsed: QualityScore = serde_json::from_str(&response)?;
     Ok(parsed)
 }

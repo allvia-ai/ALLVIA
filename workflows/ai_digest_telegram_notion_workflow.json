@@ -245,6 +245,7 @@
       "name": "Telegram Send Message",
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.2,
+      "continueOnFail": true,
       "position": [
         2740,
         300
@@ -289,6 +290,11 @@
             {
               "operation": "isNotEmpty",
               "value1": "={{$json.telegram_chat_id}}"
+            },
+            {
+              "operation": "regex",
+              "value1": "={{String($json.telegram_chat_id || \"\").trim()}}",
+              "value2": "^-?[0-9]{6,}$"
             }
           ]
         }

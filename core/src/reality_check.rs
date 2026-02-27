@@ -30,7 +30,7 @@ pub fn scan_app_inventory() -> Result<()> {
 
     for line in stdout.lines() {
         // Line is full path: /System/Applications/Calendar.app
-        if let Some(name) = line.split('/').last() {
+        if let Some(name) = line.split('/').next_back() {
             // Remove .app extension
             let clean_name = name.trim_end_matches(".app").to_string();
             apps.insert(clean_name.to_lowercase()); // Store as lowercase for fuzzy matching

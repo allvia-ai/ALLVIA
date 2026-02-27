@@ -6,6 +6,12 @@ pub struct ConfigManager {
     env_path: PathBuf,
 }
 
+impl Default for ConfigManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConfigManager {
     pub fn new() -> Self {
         // Safe location strategy

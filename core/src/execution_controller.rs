@@ -297,7 +297,7 @@ async fn wait_until_user_idle_if_active(
         if idle_secs >= resume_secs {
             break;
         }
-        if wait_loops % 10 == 0 {
+        if wait_loops.is_multiple_of(10) {
             logs.push(format!(
                 "USER_ACTIVITY_WAITING: step={} idle={:.1}s target={}s",
                 step_idx + 1,

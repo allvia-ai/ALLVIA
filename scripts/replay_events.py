@@ -16,7 +16,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--file", required=True, help="path to jsonl file")
     parser.add_argument(
         "--endpoint",
-        default="http://127.0.0.1:8080/events",
+        default="http://127.0.0.1:9100/events",
         help="collector /events endpoint",
     )
     parser.add_argument(

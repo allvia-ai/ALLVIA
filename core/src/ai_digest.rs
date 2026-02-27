@@ -49,9 +49,13 @@ pub fn looks_like_news_digest_request(message: &str) -> bool {
     let lower = message.to_lowercase();
     let has_news = lower.contains("news")
         || lower.contains("headline")
+        || lower.contains("trend")
+        || lower.contains("digest")
         || message.contains("뉴스")
         || message.contains("기사")
-        || message.contains("헤드라인");
+        || message.contains("헤드라인")
+        || message.contains("트렌드")
+        || message.contains("브리핑");
     let has_notion = lower.contains("notion") || message.contains("노션");
     let has_digest = lower.contains("digest")
         || lower.contains("summary")
@@ -205,21 +209,185 @@ fn maybe_string(value: Option<&Value>) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+fn dedupe_push(vec: &mut Vec<String>, value: &str) {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if vec.iter().any(|v| v.eq_ignore_ascii_case(trimmed)) {
+        return;
+    }
+    vec.push(trimmed.to_string());
+}
+
+fn collect_string_fields_by_keys(payload: &Value, keys: &[&str], max: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![payload];
+    while let Some(node) = stack.pop() {
+        match node {
+            Value::Object(map) => {
+                for key in keys {
+                    if let Some(value) = maybe_string(map.get(*key)) {
+                        dedupe_push(&mut out, &value);
+                        if out.len() >= max {
+                            return out;
+                        }
+                    }
+                }
+                for value in map.values() {
+                    stack.push(value);
+                }
+            }
+            Value::Array(items) => {
+                for item in items.iter().rev() {
+                    stack.push(item);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn extract_headline_lines(text: &str, out: &mut Vec<String>) {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized = trimmed
+            .trim_start_matches("- ")
+            .trim_start_matches("* ")
+            .trim();
+        let candidate = if let Some((num, rest)) = normalized.split_once('.') {
+            if num.chars().all(|ch| ch.is_ascii_digit()) && !rest.trim().is_empty() {
+                rest.trim()
+            } else {
+                normalized
+            }
+        } else {
+            normalized
+        };
+        if candidate.is_empty() {
+            continue;
+        }
+        if candidate.starts_with("http://") || candidate.starts_with("https://") {
+            continue;
+        }
+        dedupe_push(out, candidate);
+        if out.len() >= 5 {
+            return;
+        }
+    }
+}
+
+fn extract_headlines(payload: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+
+    for value in collect_string_fields_by_keys(payload, &["top_headlines_text"], 4) {
+        extract_headline_lines(&value, &mut out);
+        if out.len() >= 5 {
+            return out;
+        }
+    }
+
+    for value in collect_string_fields_by_keys(payload, &["telegram_summary"], 4) {
+        extract_headline_lines(&value, &mut out);
+        if out.len() >= 5 {
+            return out;
+        }
+    }
+
+    let mut stack = vec![payload];
+    while let Some(node) = stack.pop() {
+        match node {
+            Value::Object(map) => {
+                if let Some(Value::Array(items)) = map.get("top_headlines") {
+                    for item in items {
+                        if let Some(title) = item.as_str() {
+                            dedupe_push(&mut out, title);
+                            if out.len() >= 5 {
+                                return out;
+                            }
+                        }
+                    }
+                }
+                if let Some(title) = maybe_string(map.get("title")) {
+                    let has_news_link = map
+                        .get("source_url")
+                        .and_then(|v| v.as_str())
+                        .is_some()
+                        || map.get("link").and_then(|v| v.as_str()).is_some();
+                    if has_news_link {
+                        dedupe_push(&mut out, &title);
+                        if out.len() >= 5 {
+                            return out;
+                        }
+                    }
+                }
+                for value in map.values() {
+                    stack.push(value);
+                }
+            }
+            Value::Array(items) => {
+                for item in items.iter().rev() {
+                    stack.push(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
+
 fn extract_notion_url(payload: &Value) -> Option<String> {
-    maybe_string(payload.get("notion_url"))
-        .or_else(|| maybe_string(payload.pointer("/notion/url")))
-        .or_else(|| maybe_string(payload.pointer("/result/notion_url")))
-        .or_else(|| maybe_string(payload.pointer("/data/notion_url")))
+    let mut candidates = Vec::new();
+    for key in ["notion_url", "notion_page_url", "page_url", "url"] {
+        for value in collect_string_fields_by_keys(payload, &[key], 24) {
+            dedupe_push(&mut candidates, &value);
+        }
+    }
+    if let Some(value) = maybe_string(payload.pointer("/notion/url")) {
+        dedupe_push(&mut candidates, &value);
+    }
+    if let Some(value) = maybe_string(payload.pointer("/result/notion_url")) {
+        dedupe_push(&mut candidates, &value);
+    }
+    if let Some(value) = maybe_string(payload.pointer("/data/notion_url")) {
+        dedupe_push(&mut candidates, &value);
+    }
+
+    for candidate in candidates {
+        let trimmed = candidate
+            .trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
+            .trim();
+        if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+            continue;
+        }
+        if trimmed.to_ascii_lowercase().contains("notion.so") {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    let raw = payload.to_string();
+    let re = Regex::new(r#"https?://[^\s"\\]+notion\.so[^\s"\\]*"#).ok()?;
+    let found = re.find(&raw)?.as_str().trim();
+    Some(found.to_string())
 }
 
 fn extract_scope_marker(payload: &Value) -> Option<String> {
-    maybe_string(payload.get("scope_marker"))
+    collect_string_fields_by_keys(payload, &["scope_marker"], 4)
+        .into_iter()
+        .next()
         .or_else(|| maybe_string(payload.pointer("/result/scope_marker")))
         .or_else(|| maybe_string(payload.pointer("/data/scope_marker")))
 }
 
 fn extract_status(payload: &Value) -> Option<String> {
-    maybe_string(payload.get("status"))
+    collect_string_fields_by_keys(payload, &["status"], 4)
+        .into_iter()
+        .next()
         .or_else(|| maybe_string(payload.pointer("/result/status")))
         .or_else(|| maybe_string(payload.pointer("/data/status")))
         .map(|s| s.to_lowercase())
@@ -306,14 +474,34 @@ pub async fn trigger_program_webhook(
 }
 
 pub fn format_human_summary(result: &AiDigestTriggerResult) -> String {
-    let notion = result
-        .notion_url
-        .clone()
-        .unwrap_or_else(|| "(웹훅 응답에 notion_url 없음)".to_string());
-    format!(
-        "✅ News Digest 프로그램 트리거 전송 완료\n- scope_marker: {}\n- notion_url: {}\n- webhook: {}\n- status_code: {}",
-        result.scope_marker, notion, result.webhook_url, result.status_code
-    )
+    let extracted_notion_url = result
+        .response_json
+        .as_ref()
+        .and_then(extract_notion_url)
+        .or_else(|| result.notion_url.clone());
+    let highlights = result
+        .response_json
+        .as_ref()
+        .map(extract_headlines)
+        .unwrap_or_default();
+
+    let mut lines = Vec::new();
+    lines.push("상태: ✅ 완료".to_string());
+    lines.push("결과: AI 트렌드 요약/노션 정리 실행됨".to_string());
+    if let Some(url) = extracted_notion_url {
+        lines.push(format!("노션 링크: {}", url));
+    } else {
+        lines.push("노션 링크: (응답에서 확인되지 않음)".to_string());
+    }
+    if !highlights.is_empty() {
+        lines.push("핵심 뉴스:".to_string());
+        for (idx, title) in highlights.iter().take(5).enumerate() {
+            lines.push(format!("{}. {}", idx + 1, title));
+        }
+    }
+    lines.push(format!("run marker: {}", result.scope_marker));
+    lines.push(format!("webhook 응답: HTTP {}", result.status_code));
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -371,6 +559,42 @@ mod tests {
             strip_local_execution_prefix("그냥 일반 요청"),
             "그냥 일반 요청"
         );
+    }
+
+    #[test]
+    fn extracts_notion_url_from_nested_payload() {
+        let payload = json!({
+            "status": "completed",
+            "result": {
+                "notion_page_url": "https://www.notion.so/abc123def456"
+            }
+        });
+        assert_eq!(
+            extract_notion_url(&payload),
+            Some("https://www.notion.so/abc123def456".to_string())
+        );
+    }
+
+    #[test]
+    fn format_human_summary_contains_headlines_and_notion_link() {
+        let payload = json!({
+            "status": "completed",
+            "notion_page_url": "https://www.notion.so/page123",
+            "top_headlines_text": "1. 헤드라인 A\n2. 헤드라인 B\n3. 헤드라인 C"
+        });
+        let result = AiDigestTriggerResult {
+            ok: true,
+            status_code: 200,
+            webhook_url: "http://localhost:5678/webhook/test".to_string(),
+            scope_marker: "RUN_SCOPE_TEST".to_string(),
+            notion_url: None,
+            response_json: Some(payload),
+            response_text: None,
+        };
+        let summary = format_human_summary(&result);
+        assert!(summary.contains("노션 링크: https://www.notion.so/page123"));
+        assert!(summary.contains("핵심 뉴스:"));
+        assert!(summary.contains("1. 헤드라인 A"));
     }
 
     #[test]

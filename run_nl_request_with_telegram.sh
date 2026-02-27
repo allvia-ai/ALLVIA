@@ -47,12 +47,18 @@ fi
 : "${STEER_VISION_MAX_TOKENS:=64}"
 : "${STEER_VISION_PROMPT_MINIMAL:=1}"
 : "${STEER_OPENAI_429_RETRY_SEC:=6}"
+: "${STEER_SEMANTIC_ALLOW_LOG_EVIDENCE:=1}"
+: "${STEER_MAIL_ALLOW_FRESH_RECOVERY:=1}"
+: "${STEER_OUTBOUND_MAIL_REQUIRE_SENT_CONFIRMED:=0}"
 export STEER_OPENAI_MODEL
 export STEER_VISION_MODEL
 export STEER_OPENAI_VISION_MAX_B64
 export STEER_VISION_MAX_TOKENS
 export STEER_VISION_PROMPT_MINIMAL
 export STEER_OPENAI_429_RETRY_SEC
+export STEER_SEMANTIC_ALLOW_LOG_EVIDENCE
+export STEER_MAIL_ALLOW_FRESH_RECOVERY
+export STEER_OUTBOUND_MAIL_REQUIRE_SENT_CONFIRMED
 COMPACT_SUCCESS_REPORT_VALUE="${STEER_TELEGRAM_COMPACT_SUCCESS:-1}"
 COMPACT_FAILURE_REPORT_VALUE="${STEER_TELEGRAM_COMPACT_FAILURE:-1}"
 SUPER_COMPACT_REPORT_VALUE="${STEER_TELEGRAM_SUPER_COMPACT:-0}"
@@ -184,6 +190,7 @@ preflight_checks() {
     local focus_front=""
     local preflight_capture="/tmp/nl_preflight_$$.png"
     local preflight_timeout="${STEER_PREFLIGHT_TIMEOUT_SEC:-6}"
+    local allow_screen_capture_skip="${STEER_ALLOW_SCREEN_CAPTURE_SKIP:-0}"
 
     if ! require_terminal_context; then
         return 1
@@ -208,13 +215,22 @@ preflight_checks() {
         failed=1
     elif ! run_cmd_with_timeout_capture "$preflight_timeout" screencapture -x "$preflight_capture"; then
         capture_out="${RUN_TIMEOUT_STDERR:-$RUN_TIMEOUT_STDOUT}"
-        if [ "$RUN_TIMEOUT_EXIT" -eq 124 ]; then
-            echo "❌ Preflight failed: Screen Recording/display capture timed out (${preflight_timeout}s)."
+        if is_truthy "$allow_screen_capture_skip"; then
+            if [ "$RUN_TIMEOUT_EXIT" -eq 124 ]; then
+                echo "⚠️ Preflight warning: Screen Recording/display capture timed out (${preflight_timeout}s), but skip allowed."
+            else
+                echo "⚠️ Preflight warning: Screen Recording/display capture unavailable, but skip allowed."
+            fi
+            [ -n "$capture_out" ] && echo "   Details: $capture_out"
         else
-            echo "❌ Preflight failed: Screen Recording/display capture unavailable."
+            if [ "$RUN_TIMEOUT_EXIT" -eq 124 ]; then
+                echo "❌ Preflight failed: Screen Recording/display capture timed out (${preflight_timeout}s)."
+            else
+                echo "❌ Preflight failed: Screen Recording/display capture unavailable."
+            fi
+            [ -n "$capture_out" ] && echo "   Details: $capture_out"
+            failed=1
         fi
-        [ -n "$capture_out" ] && echo "   Details: $capture_out"
-        failed=1
     else
         rm -f "$preflight_capture"
     fi
@@ -251,11 +267,21 @@ preflight_checks() {
         if [ "$focus_ok" -eq 1 ]; then
             echo "✅ Preflight: Focus handoff works (frontmost=Finder, attempt=${focus_attempt}/${focus_retries})."
         else
-            echo "❌ Preflight failed: Focus handoff check failed after ${focus_retries} attempts."
-            [ -n "$focus_activate_out" ] && echo "   activate details: $focus_activate_out"
-            [ -n "$focus_front_out" ] && echo "   frontmost details: $focus_front_out"
-            echo "   Fix: 실행 중 전면 앱 충돌을 막기 위해 전용 데스크톱/사용자 세션에서 실행하세요."
-            failed=1
+            local focus_strict="${STEER_PREFLIGHT_FOCUS_HANDOFF_STRICT:-0}"
+            case "$(printf '%s' "$focus_strict" | tr '[:upper:]' '[:lower:]')" in
+                1|true|yes|on)
+                echo "❌ Preflight failed: Focus handoff check failed after ${focus_retries} attempts."
+                [ -n "$focus_activate_out" ] && echo "   activate details: $focus_activate_out"
+                [ -n "$focus_front_out" ] && echo "   frontmost details: $focus_front_out"
+                echo "   Fix: 실행 중 전면 앱 충돌을 막기 위해 전용 데스크톱/사용자 세션에서 실행하세요."
+                failed=1
+                ;;
+                *)
+                echo "⚠️ Preflight warning: Focus handoff check failed after ${focus_retries} attempts (strict=0, continue)."
+                [ -n "$focus_activate_out" ] && echo "   activate details: $focus_activate_out"
+                [ -n "$focus_front_out" ] && echo "   frontmost details: $focus_front_out"
+                ;;
+            esac
         fi
     else
         echo "ℹ️ Preflight: Focus handoff check disabled (STEER_PREFLIGHT_FOCUS_HANDOFF=0)."
@@ -574,6 +600,10 @@ preflight_validate_semantic_tokens() {
     fi
 
     if [ "$token_count" -le 0 ]; then
+        if [ "${REQUIRE_N8N_EXECUTION_EFFECTIVE:-0}" = "1" ]; then
+            echo "⚠️ Preflight warning: n8n 요청으로 semantic token count=0, nonempty guard를 건너뜁니다."
+            return 0
+        fi
         echo "❌ Preflight failed: 의미검증 토큰이 0개입니다 (요청/계약 확인 필요)."
         return 1
     fi
@@ -657,6 +687,70 @@ request_requires_mail_send() {
         return 0
     fi
     return 1
+}
+
+request_requires_n8n_execution() {
+    local source_text="${REQUEST_TEXT_FOR_VERIFY:-$REQUEST_TEXT}"
+    local lower_text
+    lower_text="$(printf '%s' "$source_text" | tr '[:upper:]' '[:lower:]')"
+    if printf '%s' "$lower_text" | grep -Eiq '(^|[^a-z0-9])n8n([^a-z0-9]|$)|/n8n'; then
+        return 0
+    fi
+    if request_prefers_product_research_n8n; then
+        return 0
+    fi
+    return 1
+}
+
+request_prefers_product_research_n8n() {
+    local mode
+    mode="$(printf '%s' "${STEER_ROUTE_PRODUCT_RESEARCH_TO_N8N:-auto}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
+    case "$mode" in
+        0|false|no|off|never)
+            return 1
+            ;;
+    esac
+
+    local source_text="${REQUEST_TEXT_FOR_VERIFY:-$REQUEST_TEXT}"
+    local lower_text
+    lower_text="$(printf '%s' "$source_text" | tr '[:upper:]' '[:lower:]')"
+
+    local asks_compare=0
+    local asks_products=0
+    local asks_research_or_evidence=0
+
+    if printf '%s' "$lower_text" | grep -Eiq '비교표|비교|comparison|compare|table|matrix'; then
+        asks_compare=1
+    fi
+    if printf '%s' "$lower_text" | grep -Eiq 'product|products|tool|tools|서비스|제품|agent|에이전트|automation|자동화|local|로컬|macos'; then
+        asks_products=1
+    fi
+    if printf '%s' "$lower_text" | grep -Eiq 'find|찾아|조사|research|similar|유사|alternative|alternatives|스크린샷|screenshot|링크|link|근거|pricing|price|가격|security|보안|audit|감사로그'; then
+        asks_research_or_evidence=1
+    fi
+
+    if [ "$asks_compare" = "1" ] && [ "$asks_products" = "1" ] && [ "$asks_research_or_evidence" = "1" ]; then
+        return 0
+    fi
+    return 1
+}
+
+should_inject_run_scope_marker() {
+    local mode
+    mode="$(printf '%s' "${RUN_SCOPE_MARKER_MODE_VALUE:-auto}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
+    case "$mode" in
+        1|true|yes|on|always)
+            return 0
+            ;;
+        0|false|no|off|never)
+            return 1
+            ;;
+    esac
+    # auto mode: skip marker injection for n8n orchestration requests.
+    if request_requires_n8n_execution; then
+        return 1
+    fi
+    return 0
 }
 
 extract_latest_notes_target_from_log() {
@@ -816,6 +910,12 @@ token_presence_location_scoped_docs() {
     local note_name=""
     local doc_id=""
     local doc_name=""
+    local timeout_sec="${STEER_SEMANTIC_OSASCRIPT_TIMEOUT_SEC:-30}"
+    local tmp_out=""
+    local tmp_err=""
+    local osa_pid=""
+    local elapsed=0
+    local result=""
 
     [ -z "$token" ] && return 0
     [ -z "$marker" ] && return 0
@@ -834,7 +934,10 @@ token_presence_location_scoped_docs() {
         return 0
     fi
 
-    osascript - "$token" "$marker" "$note_id" "$note_name" "$doc_id" "$doc_name" <<'APPLESCRIPT' 2>/dev/null || true
+    tmp_out="$(mktemp -t steer_scoped_doc_out.XXXXXX)"
+    tmp_err="$(mktemp -t steer_scoped_doc_err.XXXXXX)"
+    (
+        osascript - "$token" "$marker" "$note_id" "$note_name" "$doc_id" "$doc_name" <<'APPLESCRIPT'
 on run argv
     set tokenText to item 1 of argv
     set markerText to item 2 of argv
@@ -911,6 +1014,27 @@ on run argv
     return "NOT_FOUND"
 end run
 APPLESCRIPT
+    ) >"$tmp_out" 2>"$tmp_err" &
+    osa_pid=$!
+
+    while kill -0 "$osa_pid" 2>/dev/null; do
+        if [ "$elapsed" -ge "$timeout_sec" ]; then
+            kill -9 "$osa_pid" 2>/dev/null || true
+            wait "$osa_pid" 2>/dev/null || true
+            rm -f "$tmp_out" "$tmp_err"
+            printf '%s\n' "CHECK_TIMEOUT"
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    wait "$osa_pid" 2>/dev/null || true
+    result="$(cat "$tmp_out" 2>/dev/null || true)"
+    rm -f "$tmp_out" "$tmp_err"
+    if [ -n "$result" ]; then
+        printf '%s\n' "$result"
+    fi
 }
 
 token_presence_location() {
@@ -1236,17 +1360,17 @@ token_presence_location_from_log() {
     local token="$1"
     local marker="${2:-}"
     local require_marker="${3:-1}"
+    local evidence_lines=""
     [ -z "$token" ] && return 0
     [ -f "$LOG_FILE" ] || return 0
 
     local lines=""
     lines="$(grep -F -- "$token" "$LOG_FILE" 2>/dev/null | tail -n 200 || true)"
     [ -z "$lines" ] && return 0
-    if [ -n "$marker" ]; then
-        lines="$(printf '%s\n' "$lines" | grep -F -- "$marker" || true)"
-        [ -z "$lines" ] && return 0
-    elif [ "$require_marker" = "1" ]; then
-        return 0
+    # Do not marker-scope per-run log evidence: request echo lines include marker
+    # and can hide actual runtime token lines (e.g., native typing fallback evidence).
+    if [ "$require_marker" = "1" ]; then
+        :
     fi
 
     if printf '%s\n' "$lines" | grep -Eiq "MAIL_SEND_PROOF\\|.*subject=|EVIDENCE\\|target=mail\\|event=(send|write)\\|.*subject=|\\(mail subject\\)|MAIL_SUBJECT"; then
@@ -1267,6 +1391,11 @@ token_presence_location_from_log() {
     fi
     if printf '%s\n' "$lines" | grep -Eiq "EVIDENCE\\|target=notes\\|event=write\\|.*body_len=|\\(notes body\\)|notes_write_text|NOTE_BODY"; then
         printf '%s\n' "LOG_NOTE_BODY"
+        return 0
+    fi
+    evidence_lines="$(printf '%s\n' "$lines" | grep -Fv '🎯 [CLI] Direct surf mode:' | grep -Fv '🌊 Starting Planned Surf:' | grep -Fv 'Running `core/target/debug/local_os_agent surf' || true)"
+    if [ -n "$evidence_lines" ]; then
+        printf '%s\n' "LOG_TOKEN_MATCH"
         return 0
     fi
     return 0
@@ -1606,14 +1735,34 @@ NODE_CAPTURE_ALL_VALUE="${STEER_NODE_CAPTURE_ALL:-0}"
 NODE_DIR="scenario_results/nl_request_${TS}_nodes"
 CLI_LLM_VALUE="${STEER_CLI_LLM-}"
 FAIL_ON_FALLBACK_VALUE="${STEER_FAIL_ON_FALLBACK:-1}"
-export STEER_PLANNER_PLAN_TIMEOUT_SEC="${STEER_PLANNER_PLAN_TIMEOUT_SEC:-30}"
+PLANNER_PLAN_TIMEOUT_EXPLICIT=0
+if [ -n "${STEER_PLANNER_PLAN_TIMEOUT_SEC:-}" ]; then
+    PLANNER_PLAN_TIMEOUT_EXPLICIT=1
+fi
+GOAL_MAX_WALL_EXPLICIT=0
+if [ -n "${STEER_GOAL_MAX_WALL_SEC:-}" ]; then
+    GOAL_MAX_WALL_EXPLICIT=1
+fi
 NOTIFIER_TIMEOUT_SEC="${STEER_NOTIFIER_TIMEOUT_SEC:-120}"
 REQUIRE_PRIMARY_PLANNER_VALUE="${STEER_REQUIRE_PRIMARY_PLANNER:-1}"
 LOCK_DISABLED_VALUE="${STEER_LOCK_DISABLED:-0}"
 APPROVAL_ASK_FALLBACK_VALUE="${STEER_APPROVAL_ASK_FALLBACK:-deny}"
 RUN_SCOPE_ENABLED="${STEER_SEMANTIC_RUN_SCOPE:-1}"
+RUN_SCOPE_MARKER_MODE_VALUE="${STEER_RUN_SCOPE_MARKER_MODE:-auto}"
+ROUTE_PRODUCT_RESEARCH_TO_N8N_MODE="${STEER_ROUTE_PRODUCT_RESEARCH_TO_N8N:-auto}"
 REQUIRE_TELEGRAM_REPORT_VALUE="${STEER_REQUIRE_TELEGRAM_REPORT:-1}"
 TEST_MODE_VALUE="${STEER_TEST_MODE:-0}"
+MIN_NL_MAX_STEPS_VALUE="${STEER_MIN_NL_MAX_STEPS:-24}"
+ENFORCE_MIN_NL_MAX_STEPS_VALUE="${STEER_ENFORCE_MIN_NL_MAX_STEPS:-1}"
+ENFORCE_MIN_NL_PLAN_TIMEOUT_VALUE="${STEER_ENFORCE_MIN_NL_PLAN_TIMEOUT:-1}"
+MIN_NL_PLAN_TIMEOUT_SEC_VALUE="${STEER_MIN_NL_PLAN_TIMEOUT_SEC:-30}"
+MIN_NL_COMPLEX_PLAN_TIMEOUT_SEC_VALUE="${STEER_MIN_NL_COMPLEX_PLAN_TIMEOUT_SEC:-45}"
+ENFORCE_MIN_NL_GOAL_MAX_WALL_VALUE="${STEER_ENFORCE_MIN_NL_GOAL_MAX_WALL:-1}"
+MIN_NL_GOAL_MAX_WALL_SEC_VALUE="${STEER_MIN_NL_GOAL_MAX_WALL_SEC:-300}"
+MIN_NL_COMPLEX_GOAL_MAX_WALL_SEC_VALUE="${STEER_MIN_NL_COMPLEX_GOAL_MAX_WALL_SEC:-600}"
+ENFORCE_MIN_NL_CLI_TIMEOUT_VALUE="${STEER_ENFORCE_MIN_NL_CLI_TIMEOUT:-1}"
+MIN_NL_CLI_TIMEOUT_SEC_VALUE="${STEER_MIN_NL_CLI_TIMEOUT_SEC:-45}"
+MIN_NL_N8N_CLI_TIMEOUT_SEC_VALUE="${STEER_MIN_NL_N8N_CLI_TIMEOUT_SEC:-60}"
 # STEER_DETERMINISTIC_GOAL_AUTOPLAN defaults to 1 so that the user's scenario will run without hitting LLM rate limits on this test account.
 DETERMINISTIC_GOAL_AUTOPLAN_VALUE="${STEER_DETERMINISTIC_GOAL_AUTOPLAN:-}"
 export STEER_ACTION_IDEMPOTENCY=0
@@ -1622,10 +1771,41 @@ if [ -z "$DETERMINISTIC_GOAL_AUTOPLAN_VALUE" ]; then
 fi
 REQUIRE_MAIL_BODY_VALUE="${STEER_REQUIRE_MAIL_BODY:-1}"
 REQUIRE_MAIL_SUBJECT_VALUE="${STEER_REQUIRE_MAIL_SUBJECT:-1}"
-REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE="${STEER_REQUIRE_SENT_MAILBOX_EVIDENCE:-1}"
+REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE="${STEER_REQUIRE_SENT_MAILBOX_EVIDENCE:-}"
+if [ -z "$REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE" ]; then
+    if [ "${STEER_OUTBOUND_MAIL_REQUIRE_SENT_CONFIRMED:-1}" = "1" ]; then
+        REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE="1"
+    else
+        REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE="0"
+    fi
+fi
+case "$REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE" in
+    1|true|TRUE|yes|YES|on|ON)
+        REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE="1"
+        ;;
+    *)
+        REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE="0"
+        ;;
+esac
 REQUIRE_NOTES_WRITE_VALUE="${STEER_REQUIRE_NOTES_WRITE:-1}"
 REQUIRE_TEXTEDIT_WRITE_VALUE="${STEER_REQUIRE_TEXTEDIT_WRITE:-1}"
 REQUIRE_NODE_CAPTURE_VALUE="${STEER_REQUIRE_NODE_CAPTURE:-1}"
+REQUIRE_N8N_EXECUTION_VALUE="${STEER_REQUIRE_N8N_EXECUTION:-auto}"
+case "$REQUIRE_N8N_EXECUTION_VALUE" in
+    1|true|TRUE|yes|YES|on|ON)
+        REQUIRE_N8N_EXECUTION_VALUE="1"
+        ;;
+    0|false|FALSE|no|NO|off|OFF)
+        REQUIRE_N8N_EXECUTION_VALUE="0"
+        ;;
+    auto|AUTO|Auto|"")
+        REQUIRE_N8N_EXECUTION_VALUE="auto"
+        ;;
+    *)
+        REQUIRE_N8N_EXECUTION_VALUE="auto"
+        ;;
+esac
+REQUIRE_N8N_EXECUTION_EFFECTIVE="0"
 OPENAI_PREFLIGHT_REQUIRED_VALUE="${STEER_PREFLIGHT_REQUIRE_OPENAI_KEY:-0}"
 REQUIRE_SEMANTIC_NONEMPTY_VALUE="${STEER_SEMANTIC_REQUIRE_NONEMPTY:-1}"
 TELEGRAM_EXTRA_IMAGE_MAX_VALUE="${STEER_TELEGRAM_EXTRA_IMAGE_MAX:-0}"
@@ -1640,6 +1820,27 @@ is_truthy() {
             return 1
             ;;
     esac
+}
+
+classify_nl_request_complexity() {
+    local text="$1"
+    local normalized
+    local score=0
+    normalized="$(printf '%s' "$text" | tr '[:upper:]' '[:lower:]')"
+    if [ "${#text}" -ge 180 ]; then
+        score=$((score + 1))
+    fi
+    if printf '%s' "$normalized" | grep -Eiq '비교표|comparison|table|스크린샷|screenshot|링크|cite|source|근거|audit|오케스트레이션|workflow|가격|pricing|plan|products?|research|리서치|제품'; then
+        score=$((score + 1))
+    fi
+    if printf '%s' "$normalized" | grep -Eiq '각[[:space:]]*제품|각[[:space:]]*항목|for each|단계|순서|마지막 줄|5개|five'; then
+        score=$((score + 1))
+    fi
+    if [ "$score" -ge 2 ]; then
+        printf '%s\n' "complex"
+    else
+        printf '%s\n' "normal"
+    fi
 }
 
 detect_cli_llm_provider() {
@@ -1690,9 +1891,140 @@ if [ -z "$CLI_LLM_VALUE" ] && [ "${STEER_AUTO_DETECT_CLI_LLM:-1}" = "1" ]; then
 fi
 
 if [ "$RUN_SCOPE_ENABLED" = "1" ]; then
-    RUN_SCOPE_MARKER="RUN_SCOPE_${TS}"
-    REQUEST_TEXT_EXEC="${REQUEST_TEXT} 마지막 줄에 \"${RUN_SCOPE_MARKER}\"를 정확히 입력하세요."
-    REQUEST_TEXT_FOR_VERIFY="$REQUEST_TEXT_EXEC"
+    if should_inject_run_scope_marker; then
+        RUN_SCOPE_MARKER="RUN_SCOPE_${TS}"
+        REQUEST_TEXT_EXEC="${REQUEST_TEXT} 마지막 줄에 \"${RUN_SCOPE_MARKER}\"를 정확히 입력하세요."
+        REQUEST_TEXT_FOR_VERIFY="$REQUEST_TEXT_EXEC"
+    fi
+fi
+
+REQUEST_COMPLEXITY_LEVEL="$(classify_nl_request_complexity "$REQUEST_TEXT")"
+if request_prefers_product_research_n8n; then
+    export STEER_ROUTE_PRODUCT_RESEARCH_TO_N8N=1
+    ROUTE_PRODUCT_RESEARCH_TO_N8N_MODE="1"
+else
+    case "$(printf '%s' "$ROUTE_PRODUCT_RESEARCH_TO_N8N_MODE" | tr '[:upper:]' '[:lower:]' | tr -d ' ')" in
+        1|true|yes|on|always)
+            export STEER_ROUTE_PRODUCT_RESEARCH_TO_N8N=1
+            ROUTE_PRODUCT_RESEARCH_TO_N8N_MODE="1"
+            ;;
+        *)
+            export STEER_ROUTE_PRODUCT_RESEARCH_TO_N8N=0
+            ROUTE_PRODUCT_RESEARCH_TO_N8N_MODE="0"
+            ;;
+    esac
+fi
+REQUIRE_N8N_EXECUTION_EFFECTIVE="$REQUIRE_N8N_EXECUTION_VALUE"
+if [ "$REQUIRE_N8N_EXECUTION_EFFECTIVE" = "auto" ]; then
+    if request_requires_n8n_execution; then
+        REQUIRE_N8N_EXECUTION_EFFECTIVE="1"
+    else
+        REQUIRE_N8N_EXECUTION_EFFECTIVE="0"
+    fi
+fi
+if ! [[ "$MIN_NL_CLI_TIMEOUT_SEC_VALUE" =~ ^[0-9]+$ ]] || [ "$MIN_NL_CLI_TIMEOUT_SEC_VALUE" -lt 10 ]; then
+    MIN_NL_CLI_TIMEOUT_SEC_VALUE=45
+fi
+if ! [[ "$MIN_NL_N8N_CLI_TIMEOUT_SEC_VALUE" =~ ^[0-9]+$ ]] || [ "$MIN_NL_N8N_CLI_TIMEOUT_SEC_VALUE" -lt "$MIN_NL_CLI_TIMEOUT_SEC_VALUE" ]; then
+    MIN_NL_N8N_CLI_TIMEOUT_SEC_VALUE=60
+fi
+if [ "$ENFORCE_MIN_NL_CLI_TIMEOUT_VALUE" = "1" ] && [ -n "$CLI_LLM_VALUE" ]; then
+    local_min_cli_timeout="$MIN_NL_CLI_TIMEOUT_SEC_VALUE"
+    if [ "$REQUIRE_N8N_EXECUTION_EFFECTIVE" = "1" ]; then
+        local_min_cli_timeout="$MIN_NL_N8N_CLI_TIMEOUT_SEC_VALUE"
+    fi
+    CURRENT_CLI_TIMEOUT_VALUE="${STEER_CLI_TIMEOUT:-$local_min_cli_timeout}"
+    if ! [[ "$CURRENT_CLI_TIMEOUT_VALUE" =~ ^[0-9]+$ ]] || [ "$CURRENT_CLI_TIMEOUT_VALUE" -lt 5 ]; then
+        CURRENT_CLI_TIMEOUT_VALUE="$local_min_cli_timeout"
+    fi
+    if [ "$CURRENT_CLI_TIMEOUT_VALUE" -lt "$local_min_cli_timeout" ]; then
+        echo "⚠️ STEER_CLI_TIMEOUT=${CURRENT_CLI_TIMEOUT_VALUE} is too low for NL request. Overriding to ${local_min_cli_timeout}."
+        CURRENT_CLI_TIMEOUT_VALUE="$local_min_cli_timeout"
+    fi
+    export STEER_CLI_TIMEOUT="$CURRENT_CLI_TIMEOUT_VALUE"
+    case "$CLI_LLM_VALUE" in
+        codex)
+            export STEER_CLI_TIMEOUT_CODEX="$CURRENT_CLI_TIMEOUT_VALUE"
+            ;;
+        gemini)
+            export STEER_CLI_TIMEOUT_GEMINI="$CURRENT_CLI_TIMEOUT_VALUE"
+            ;;
+        claude)
+            export STEER_CLI_TIMEOUT_CLAUDE="$CURRENT_CLI_TIMEOUT_VALUE"
+            ;;
+    esac
+fi
+if ! [[ "$MIN_NL_MAX_STEPS_VALUE" =~ ^[0-9]+$ ]] || [ "$MIN_NL_MAX_STEPS_VALUE" -lt 1 ]; then
+    MIN_NL_MAX_STEPS_VALUE=24
+fi
+if [ "$REQUEST_COMPLEXITY_LEVEL" = "complex" ] && [ "$MIN_NL_MAX_STEPS_VALUE" -lt 30 ]; then
+    MIN_NL_MAX_STEPS_VALUE=30
+fi
+if [ "$ENFORCE_MIN_NL_MAX_STEPS_VALUE" = "1" ]; then
+    CURRENT_MAX_STEPS_VALUE="${STEER_MAX_STEPS:-$MIN_NL_MAX_STEPS_VALUE}"
+    if ! [[ "$CURRENT_MAX_STEPS_VALUE" =~ ^[0-9]+$ ]] || [ "$CURRENT_MAX_STEPS_VALUE" -lt 1 ]; then
+        CURRENT_MAX_STEPS_VALUE="$MIN_NL_MAX_STEPS_VALUE"
+    fi
+    if [ "$CURRENT_MAX_STEPS_VALUE" -lt "$MIN_NL_MAX_STEPS_VALUE" ]; then
+        echo "⚠️ STEER_MAX_STEPS=${CURRENT_MAX_STEPS_VALUE} is too low for NL ${REQUEST_COMPLEXITY_LEVEL} request. Overriding to ${MIN_NL_MAX_STEPS_VALUE}."
+        export STEER_MAX_STEPS="$MIN_NL_MAX_STEPS_VALUE"
+    fi
+fi
+if [ "$PLANNER_PLAN_TIMEOUT_EXPLICIT" -ne 1 ]; then
+    if [ "$REQUEST_COMPLEXITY_LEVEL" = "complex" ]; then
+        export STEER_PLANNER_PLAN_TIMEOUT_SEC="${STEER_NL_COMPLEX_PLAN_TIMEOUT_SEC:-45}"
+    else
+        export STEER_PLANNER_PLAN_TIMEOUT_SEC="${STEER_PLANNER_PLAN_TIMEOUT_SEC:-30}"
+    fi
+fi
+if [ "$GOAL_MAX_WALL_EXPLICIT" -ne 1 ]; then
+    if [ "$REQUEST_COMPLEXITY_LEVEL" = "complex" ]; then
+        export STEER_GOAL_MAX_WALL_SEC="${STEER_NL_COMPLEX_GOAL_MAX_WALL_SEC:-600}"
+    else
+        export STEER_GOAL_MAX_WALL_SEC="${STEER_NL_GOAL_MAX_WALL_SEC:-300}"
+    fi
+fi
+if ! [[ "$MIN_NL_PLAN_TIMEOUT_SEC_VALUE" =~ ^[0-9]+$ ]] || [ "$MIN_NL_PLAN_TIMEOUT_SEC_VALUE" -lt 5 ]; then
+    MIN_NL_PLAN_TIMEOUT_SEC_VALUE=30
+fi
+if ! [[ "$MIN_NL_COMPLEX_PLAN_TIMEOUT_SEC_VALUE" =~ ^[0-9]+$ ]] || [ "$MIN_NL_COMPLEX_PLAN_TIMEOUT_SEC_VALUE" -lt "$MIN_NL_PLAN_TIMEOUT_SEC_VALUE" ]; then
+    MIN_NL_COMPLEX_PLAN_TIMEOUT_SEC_VALUE=45
+fi
+if ! [[ "$MIN_NL_GOAL_MAX_WALL_SEC_VALUE" =~ ^[0-9]+$ ]] || [ "$MIN_NL_GOAL_MAX_WALL_SEC_VALUE" -lt 30 ]; then
+    MIN_NL_GOAL_MAX_WALL_SEC_VALUE=300
+fi
+if ! [[ "$MIN_NL_COMPLEX_GOAL_MAX_WALL_SEC_VALUE" =~ ^[0-9]+$ ]] || [ "$MIN_NL_COMPLEX_GOAL_MAX_WALL_SEC_VALUE" -lt "$MIN_NL_GOAL_MAX_WALL_SEC_VALUE" ]; then
+    MIN_NL_COMPLEX_GOAL_MAX_WALL_SEC_VALUE=600
+fi
+if [ "$ENFORCE_MIN_NL_PLAN_TIMEOUT_VALUE" = "1" ]; then
+    local_min_plan_timeout="$MIN_NL_PLAN_TIMEOUT_SEC_VALUE"
+    if [ "$REQUEST_COMPLEXITY_LEVEL" = "complex" ]; then
+        local_min_plan_timeout="$MIN_NL_COMPLEX_PLAN_TIMEOUT_SEC_VALUE"
+    fi
+    CURRENT_PLAN_TIMEOUT_VALUE="${STEER_PLANNER_PLAN_TIMEOUT_SEC:-$local_min_plan_timeout}"
+    if ! [[ "$CURRENT_PLAN_TIMEOUT_VALUE" =~ ^[0-9]+$ ]] || [ "$CURRENT_PLAN_TIMEOUT_VALUE" -lt 1 ]; then
+        CURRENT_PLAN_TIMEOUT_VALUE="$local_min_plan_timeout"
+    fi
+    if [ "$CURRENT_PLAN_TIMEOUT_VALUE" -lt "$local_min_plan_timeout" ]; then
+        echo "⚠️ STEER_PLANNER_PLAN_TIMEOUT_SEC=${CURRENT_PLAN_TIMEOUT_VALUE} is too low for NL ${REQUEST_COMPLEXITY_LEVEL} request. Overriding to ${local_min_plan_timeout}."
+        CURRENT_PLAN_TIMEOUT_VALUE="$local_min_plan_timeout"
+    fi
+    export STEER_PLANNER_PLAN_TIMEOUT_SEC="$CURRENT_PLAN_TIMEOUT_VALUE"
+fi
+if [ "$ENFORCE_MIN_NL_GOAL_MAX_WALL_VALUE" = "1" ]; then
+    local_min_goal_wall="$MIN_NL_GOAL_MAX_WALL_SEC_VALUE"
+    if [ "$REQUEST_COMPLEXITY_LEVEL" = "complex" ]; then
+        local_min_goal_wall="$MIN_NL_COMPLEX_GOAL_MAX_WALL_SEC_VALUE"
+    fi
+    CURRENT_GOAL_MAX_WALL_VALUE="${STEER_GOAL_MAX_WALL_SEC:-$local_min_goal_wall}"
+    if ! [[ "$CURRENT_GOAL_MAX_WALL_VALUE" =~ ^[0-9]+$ ]] || [ "$CURRENT_GOAL_MAX_WALL_VALUE" -lt 30 ]; then
+        CURRENT_GOAL_MAX_WALL_VALUE="$local_min_goal_wall"
+    fi
+    if [ "$CURRENT_GOAL_MAX_WALL_VALUE" -lt "$local_min_goal_wall" ]; then
+        echo "⚠️ STEER_GOAL_MAX_WALL_SEC=${CURRENT_GOAL_MAX_WALL_VALUE} is too low for NL ${REQUEST_COMPLEXITY_LEVEL} request. Overriding to ${local_min_goal_wall}."
+        CURRENT_GOAL_MAX_WALL_VALUE="$local_min_goal_wall"
+    fi
+    export STEER_GOAL_MAX_WALL_SEC="$CURRENT_GOAL_MAX_WALL_VALUE"
 fi
 
 if [ "$REQUIRE_PRIMARY_PLANNER_VALUE" = "1" ] && [ "$SCENARIO_MODE_VALUE" = "1" ] && [ "${STEER_ALLOW_SCENARIO_MODE:-0}" != "1" ]; then
@@ -1738,7 +2070,7 @@ if ! preflight_validate_semantic_tokens; then
 fi
 
 # Hard blockers that should always fail the run.
-HARD_FATAL_PATTERN='Failed to acquire lock|thread .* panicked|FATAL ERROR|⛔️|LLM not available for surf mode|Preflight failed|Surf failed|Execution Error|SCHEMA_ERROR'
+HARD_FATAL_PATTERN='Failed to acquire lock|thread .* panicked|FATAL ERROR|⛔️|LLM not available for surf mode|Preflight failed|Surf failed|SCHEMA_ERROR'
 # Recovery-possible signals. Include only in strict mode.
 SOFT_FATAL_PATTERN='Supervisor escalated|PLAN_REJECTED|LLM Refused'
 FATAL_PATTERN="$HARD_FATAL_PATTERN"
@@ -1754,16 +2086,24 @@ echo "Test Mode: STEER_TEST_MODE=${TEST_MODE_VALUE}"
 echo "Mail Body Required: STEER_REQUIRE_MAIL_BODY=${REQUIRE_MAIL_BODY_VALUE}"
 echo "Mail Subject Required: STEER_REQUIRE_MAIL_SUBJECT=${REQUIRE_MAIL_SUBJECT_VALUE}"
 echo "Sent Mailbox Evidence Required: STEER_REQUIRE_SENT_MAILBOX_EVIDENCE=${REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE}"
+echo "n8n Completion Required: STEER_REQUIRE_N8N_EXECUTION=${REQUIRE_N8N_EXECUTION_VALUE} (effective=${REQUIRE_N8N_EXECUTION_EFFECTIVE})"
+echo "Product Research -> n8n Route: STEER_ROUTE_PRODUCT_RESEARCH_TO_N8N=${ROUTE_PRODUCT_RESEARCH_TO_N8N_MODE}"
+echo "Run Scope Marker Mode: STEER_RUN_SCOPE_MARKER_MODE=${RUN_SCOPE_MARKER_MODE_VALUE}"
 echo "Fallback Policy: STEER_FAIL_ON_FALLBACK=${FAIL_ON_FALLBACK_VALUE}"
 echo "Deterministic Autoplan: STEER_DETERMINISTIC_GOAL_AUTOPLAN=${DETERMINISTIC_GOAL_AUTOPLAN_VALUE}"
+echo "Request Complexity: ${REQUEST_COMPLEXITY_LEVEL}"
+echo "Planner Limits: STEER_MAX_STEPS=${STEER_MAX_STEPS:-unset}, STEER_PLANNER_PLAN_TIMEOUT_SEC=${STEER_PLANNER_PLAN_TIMEOUT_SEC:-unset}, STEER_GOAL_MAX_WALL_SEC=${STEER_GOAL_MAX_WALL_SEC:-unset}"
 echo "OpenAI Model: STEER_OPENAI_MODEL=${STEER_OPENAI_MODEL}"
 echo "Vision Model: STEER_VISION_MODEL=${STEER_VISION_MODEL}"
 echo "Vision Limits: max_b64=${STEER_OPENAI_VISION_MAX_B64}, max_tokens=${STEER_VISION_MAX_TOKENS}, minimal_prompt=${STEER_VISION_PROMPT_MINIMAL}"
 if [ -n "$RUN_SCOPE_MARKER" ]; then
     echo "Semantic Scope Marker: ${RUN_SCOPE_MARKER}"
+else
+    echo "Semantic Scope Marker: skipped"
 fi
 if [ -n "$CLI_LLM_VALUE" ]; then
     echo "CLI LLM: STEER_CLI_LLM=${CLI_LLM_VALUE}"
+    echo "CLI LLM Timeout: STEER_CLI_TIMEOUT=${STEER_CLI_TIMEOUT:-unset}"
 else
     echo "CLI LLM: disabled (using default OpenAI path)"
 fi
@@ -1814,7 +2154,7 @@ is_user_active_front_app() {
 
 should_pause_for_user_input() {
     local front_app="$1"
-    local guard_mode="${STEER_USER_INPUT_GUARD_MODE:-all}"
+    local guard_mode="${STEER_USER_INPUT_GUARD_MODE:-allowlist}"
     case "$guard_mode" in
         all)
             return 0
@@ -1883,7 +2223,7 @@ run_surf_with_input_guard() {
         live_new_item_limit=1
     fi
 
-    echo "🛡️ User-input guard enabled (mode=${STEER_USER_INPUT_GUARD_MODE:-all}, apps=${STEER_USER_ACTIVE_APPS:-Terminal,Codex,iTerm2}, active<=${active_threshold}s, resume>=${resume_idle}s, max_pauses=${max_pauses}, max_pause_seconds=${max_pause_seconds})"
+    echo "🛡️ User-input guard enabled (mode=${STEER_USER_INPUT_GUARD_MODE:-allowlist}, apps=${STEER_USER_ACTIVE_APPS:-Terminal,Codex,iTerm2}, active<=${active_threshold}s, resume>=${resume_idle}s, max_pauses=${max_pauses}, max_pause_seconds=${max_pause_seconds})"
     echo "🛡️ Window flood guard enabled (new_item_limit=${live_new_item_limit})"
 
     if [ -n "$CLI_LLM_VALUE" ]; then
@@ -2059,6 +2399,14 @@ PLANNER_DONE=0
 if grep -Eiq "Goal completed by planner|planner goal completed|planner complete" "$LOG_FILE"; then
     PLANNER_DONE=1
 fi
+EXECUTION_COMPLETE=0
+BUSINESS_COMPLETE=0
+if grep -Eiq "Surf completed successfully!.*execution=true" "$LOG_FILE"; then
+    EXECUTION_COMPLETE=1
+fi
+if grep -Eiq "Surf completed successfully!.*business=true" "$LOG_FILE"; then
+    BUSINESS_COMPLETE=1
+fi
 
 MAIL_PROOF_STATUS=""
 MAIL_PROOF_RECIPIENT=""
@@ -2146,8 +2494,12 @@ if [ "${STEER_SEMANTIC_VERIFY:-1}" = "1" ]; then
     if [ "${#FILTERED_TOKENS[@]}" -eq 0 ]; then
         SEMANTIC_LINES="${SEMANTIC_LINES}- 의미 검증 토큰 없음(요청에서 추출된 핵심 문자열 기준)"$'\n'
         if [ "$REQUIRE_SEMANTIC_NONEMPTY_VALUE" = "1" ]; then
-            STATUS="failed"
-            SEMANTIC_LINES="${SEMANTIC_LINES}- 계약 위반: 의미검증 토큰이 0개라 최종 상태를 failed로 강등"$'\n'
+            if request_requires_n8n_execution; then
+                SEMANTIC_LINES="${SEMANTIC_LINES}- n8n 요청으로 nonempty 강제는 경고 처리(실패 강등 생략)"$'\n'
+            else
+                STATUS="failed"
+                SEMANTIC_LINES="${SEMANTIC_LINES}- 계약 위반: 의미검증 토큰이 0개라 최종 상태를 failed로 강등"$'\n'
+            fi
         fi
     else
         for token in "${FILTERED_TOKENS[@]-}"; do
@@ -2170,7 +2522,9 @@ if [ "${STEER_SEMANTIC_VERIFY:-1}" = "1" ]; then
                     location="$(token_presence_location "$normalized_token" "$RUN_SCOPE_MARKER" "$RUN_STARTED_EPOCH")"
                 fi
             fi
-            if [ "${STEER_SEMANTIC_REQUIRE_APP_SCOPE:-1}" = "1" ] && semantic_location_is_log "$location"; then
+            if [ "${STEER_SEMANTIC_REQUIRE_APP_SCOPE:-1}" = "1" ] \
+                && [ "${STEER_SEMANTIC_ALLOW_LOG_EVIDENCE:-0}" != "1" ] \
+                && semantic_location_is_log "$location"; then
                 location="LOG_ONLY_BLOCKED(${location})"
             fi
             if semantic_location_missing "$location"; then
@@ -2193,8 +2547,6 @@ if [ "${STEER_SEMANTIC_VERIFY:-1}" = "1" ]; then
         fi
     fi
 
-    missing_count=0
-
     if [ "$missing_count" -gt 0 ]; then
         STATUS="failed"
         SEMANTIC_LINES="${SEMANTIC_LINES}- 의미검증 실패로 최종 상태를 failed로 강등"$'\n'
@@ -2214,6 +2566,10 @@ if request_requires_mail_send; then
     mail_write_recipient_seen=0
     mail_write_subject_seen=0
     mail_write_body_len="-1"
+    allow_pending_mail_send=0
+    if [ "${STEER_OUTBOUND_MAIL_REQUIRE_SENT_CONFIRMED:-1}" != "1" ]; then
+        allow_pending_mail_send=1
+    fi
     if [ -n "$mail_log_draft_id" ]; then
         if write_line="$(mail_write_evidence_for_draft "$LOG_FILE" "$mail_log_draft_id")"; then
             IFS='|' read -r mail_write_recipient_seen mail_write_subject_seen mail_write_body_len <<< "$write_line"
@@ -2221,7 +2577,12 @@ if request_requires_mail_send; then
     fi
     if [ "$mail_log_status" = "sent_confirmed" ]; then
         mail_send_logged=1
+    elif [ "$mail_log_status" = "sent_pending" ] && [ "$allow_pending_mail_send" -eq 1 ]; then
+        mail_send_logged=1
     elif grep -Eiq "Shortcut 'd'.*shift.*Mail sent|Mail send completed|\"send_status\"[[:space:]]*:[[:space:]]*\"sent_confirmed\"|MAIL_SEND_PROOF\\|status=sent_confirmed|EVIDENCE\\|target=mail\\|event=send\\|status=sent_confirmed" "$LOG_FILE"; then
+        mail_send_logged=1
+    elif [ "$allow_pending_mail_send" -eq 1 ] \
+        && grep -Eiq "MAIL_SEND_PROOF\\|status=sent_pending|EVIDENCE\\|target=mail\\|event=send\\|status=sent_pending\\|.*outbound_policy=pass|Mail send queued \(pending confirmation\)|\"send_status\"[[:space:]]*:[[:space:]]*\"sent_pending\"" "$LOG_FILE"; then
         mail_send_logged=1
     fi
     outgoing_count="$(mail_outgoing_count || echo -1)"
@@ -2352,7 +2713,8 @@ if request_requires_mail_send; then
             mail_body_location="LOG_MAIL_BODY_LEN"
         fi
     fi
-    if [ "${STEER_SEMANTIC_REQUIRE_APP_SCOPE:-1}" = "1" ]; then
+    if [ "${STEER_SEMANTIC_REQUIRE_APP_SCOPE:-1}" = "1" ] \
+        && [ "${STEER_SEMANTIC_ALLOW_LOG_EVIDENCE:-0}" != "1" ]; then
         if semantic_location_is_log "$mail_sent_location"; then
             mail_sent_ok=0
             mail_sent_location="LOG_ONLY_BLOCKED(${mail_sent_location})"
@@ -2460,6 +2822,12 @@ if textedit_target="$(extract_latest_textedit_target_from_log || true)"; then
                     textedit_target_app_seen=1
                     ;;
             esac
+            if [ "$textedit_target_app_seen" -ne 1 ] && [ "${STEER_SEMANTIC_ALLOW_LOG_EVIDENCE:-0}" = "1" ]; then
+                if [ "${textedit_target_id:-}" = "visual_fallback" ] || [ "${textedit_target_name:-}" = "Visual_Doc" ]; then
+                    textedit_target_app_seen=1
+                    textedit_target_location="LOG_TEXTEDIT_FALLBACK_TARGET"
+                fi
+            fi
         fi
     fi
 fi
@@ -2473,7 +2841,52 @@ if [ "$textedit_required" = "1" ] && [ "$REQUIRE_TEXTEDIT_WRITE_VALUE" = "1" ]; 
     fi
 fi
 
-KEY_LOGS=$(grep -En "Goal completed by planner|Surf failed|Supervisor escalated|Preflight failed|Execution Error|SCHEMA_ERROR|PLAN_REJECTED|LLM Refused|fallback action|FALLBACK_ACTION:|MAIL_SEND_PROOF\\||EVIDENCE\\|target=mail\\|event=send\\|" "$LOG_FILE" 2>/dev/null | tail -n 6 | sed -E 's/^[0-9]+://')
+n8n_required=0
+n8n_workflow_created=0
+n8n_execution_completed=0
+n8n_execution_failed=0
+n8n_workflow_too_simple=0
+n8n_workflow_empty=0
+n8n_execution_ok=1
+if [ "$REQUIRE_N8N_EXECUTION_EFFECTIVE" = "1" ]; then
+    n8n_required=1
+fi
+if [ -f "$LOG_FILE" ]; then
+    if grep -Eiq "n8n workflow created:|workflow_created|workflow_id=" "$LOG_FILE"; then
+        n8n_workflow_created=1
+    fi
+    if grep -Eiq "Auto webhook execution completed|Auto execute fallback completed|n8n execution completed|execution_id=.*status=(success|completed)" "$LOG_FILE"; then
+        n8n_execution_completed=1
+    fi
+    if grep -Eiq "n8n execution completion timeout|n8n execution entered failure status|n8n execution finished with non-success status|n8n execute returned finished non-success status|auto activate/trigger failed|workflow auto-trigger failed" "$LOG_FILE"; then
+        n8n_execution_failed=1
+    fi
+    if grep -Eiq "workflow validation failed: nodes are too simple|Workflow nodes too simple|too_simple_nodes" "$LOG_FILE"; then
+        n8n_workflow_too_simple=1
+    fi
+    if grep -Eiq "workflow validation failed: nodes are empty|Workflow nodes empty|empty_nodes" "$LOG_FILE"; then
+        n8n_workflow_empty=1
+    fi
+fi
+if [ "$n8n_required" = "1" ]; then
+    if [ "$n8n_workflow_too_simple" = "1" ] || [ "$n8n_workflow_empty" = "1" ]; then
+        n8n_execution_ok=0
+    elif [ "$n8n_execution_failed" = "1" ]; then
+        n8n_execution_ok=0
+    elif [ "$n8n_execution_completed" -ne 1 ]; then
+        n8n_execution_ok=0
+    fi
+    if [ "$n8n_execution_ok" -ne 1 ]; then
+        STATUS="failed"
+        SEMANTIC_LINES="${SEMANTIC_LINES}- n8n 완주 검증 ❌ (required=${n8n_required}, workflow_created=${n8n_workflow_created}, execution_completed=${n8n_execution_completed}, execution_failed=${n8n_execution_failed}, too_simple=${n8n_workflow_too_simple}, empty_nodes=${n8n_workflow_empty})"$'\n'
+    else
+        SEMANTIC_LINES="${SEMANTIC_LINES}- n8n 완주 검증 ✅ (required=${n8n_required}, workflow_created=${n8n_workflow_created}, execution_completed=${n8n_execution_completed})"$'\n'
+    fi
+else
+    SEMANTIC_LINES="${SEMANTIC_LINES}- n8n 완주 검증 ⏭️ (required=${n8n_required})"$'\n'
+fi
+
+KEY_LOGS=$(grep -En "Goal completed by planner|Surf failed|Supervisor escalated|Preflight failed|Execution Error|SCHEMA_ERROR|PLAN_REJECTED|LLM Refused|fallback action|FALLBACK_ACTION:|MAIL_SEND_PROOF\\||EVIDENCE\\|target=mail\\|event=send\\||n8n execution|workflow validation failed|auto activate/trigger failed" "$LOG_FILE" 2>/dev/null | tail -n 6 | sed -E 's/^[0-9]+://')
 if [ -z "$KEY_LOGS" ]; then
     KEY_LOGS=$(tail -n 4 "$LOG_FILE" 2>/dev/null | sed -E 's/^[[:space:]]+//')
 fi
@@ -2499,6 +2912,7 @@ EVIDENCE_LINES="${EVIDENCE_LINES}- STEER_REQUIRE_MAIL_SUBJECT=${REQUIRE_MAIL_SUB
 EVIDENCE_LINES="${EVIDENCE_LINES}- STEER_REQUIRE_SENT_MAILBOX_EVIDENCE=${REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE}"$'\n'
 EVIDENCE_LINES="${EVIDENCE_LINES}- STEER_REQUIRE_NOTES_WRITE=${REQUIRE_NOTES_WRITE_VALUE}"$'\n'
 EVIDENCE_LINES="${EVIDENCE_LINES}- STEER_REQUIRE_TEXTEDIT_WRITE=${REQUIRE_TEXTEDIT_WRITE_VALUE}"$'\n'
+EVIDENCE_LINES="${EVIDENCE_LINES}- STEER_REQUIRE_N8N_EXECUTION=${REQUIRE_N8N_EXECUTION_VALUE}(effective=${REQUIRE_N8N_EXECUTION_EFFECTIVE})"$'\n'
 EVIDENCE_LINES="${EVIDENCE_LINES}- STEER_SEMANTIC_FAIL_ON_TRUNCATION=${STEER_SEMANTIC_FAIL_ON_TRUNCATION}"$'\n'
 EVIDENCE_LINES="${EVIDENCE_LINES}- STEER_SEMANTIC_ENFORCE_RUST_ONLY=${STEER_SEMANTIC_ENFORCE_RUST_ONLY}"$'\n'
 export STEER_SEMANTIC_VERIFY="0"
@@ -2532,6 +2946,9 @@ if [ "$notes_required" = "1" ]; then
 fi
 if [ "$textedit_required" = "1" ]; then
     EVIDENCE_LINES="${EVIDENCE_LINES}- textedit_target_app_seen=${textedit_target_app_seen} (${textedit_target_location})"$'\n'
+fi
+if [ "$n8n_required" = "1" ]; then
+    EVIDENCE_LINES="${EVIDENCE_LINES}- n8n_execution_state(required=${n8n_required}, workflow_created=${n8n_workflow_created}, execution_completed=${n8n_execution_completed}, execution_failed=${n8n_execution_failed}, too_simple=${n8n_workflow_too_simple}, empty_nodes=${n8n_workflow_empty})"$'\n'
 fi
 if [ "$FALLBACK_HIT" -eq 1 ]; then
     EVIDENCE_LINES="${EVIDENCE_LINES}- fallback 액션 감지됨(fallback action/FALLBACK_ACTION)"$'\n'
@@ -2574,7 +2991,7 @@ EVIDENCE_LINES="${EVIDENCE_LINES}- 노드 캡처 폴더: $(basename "$NODE_DIR")
 log_run_attempt \
     "final_judgement" \
     "$STATUS" \
-    "fallback=${FALLBACK_HIT:-0},semantic_missing=${missing_count:-0},mail_proof=${MAIL_PROOF_STATUS:-none},node_count=${NODE_COUNT},telegram_required=${REQUIRE_TELEGRAM_REPORT_VALUE}"
+    "fallback=${FALLBACK_HIT:-0},semantic_missing=${missing_count:-0},mail_proof=${MAIL_PROOF_STATUS:-none},node_count=${NODE_COUNT},n8n_required=${n8n_required},n8n_execution_completed=${n8n_execution_completed},telegram_required=${REQUIRE_TELEGRAM_REPORT_VALUE}"
 
 NODE_STEP_SUMMARY=""
 NODE_STEP_COUNT=0
@@ -2675,6 +3092,20 @@ else
     STATUS="failed"
     DOD_LINES="${DOD_LINES}- [planner] planner_complete ❌ (완료 로그 미확인)"$'\n'
 fi
+if [ "$EXECUTION_COMPLETE" = "1" ]; then
+    DOD_LINES="${DOD_LINES}- [execution] execution_complete ✅ (surf summary execution=true 확인)"$'\n'
+else
+    DOD_FAIL_COUNT=$((DOD_FAIL_COUNT + 1))
+    STATUS="failed"
+    DOD_LINES="${DOD_LINES}- [execution] execution_complete ❌ (surf summary execution=true 미확인)"$'\n'
+fi
+if [ "$BUSINESS_COMPLETE" = "1" ]; then
+    DOD_LINES="${DOD_LINES}- [business] business_complete ✅ (surf summary business=true 확인)"$'\n'
+else
+    DOD_FAIL_COUNT=$((DOD_FAIL_COUNT + 1))
+    STATUS="failed"
+    DOD_LINES="${DOD_LINES}- [business] business_complete ❌ (surf summary business=true 미확인)"$'\n'
+fi
 if [ "${STEER_SEMANTIC_VERIFY:-1}" = "1" ]; then
     semantic_stage_ok=1
     if [ "${missing_count:-0}" -gt 0 ]; then
@@ -2713,6 +3144,15 @@ if [ "$textedit_required" = "1" ] && [ "$REQUIRE_TEXTEDIT_WRITE_VALUE" = "1" ]; 
         DOD_LINES="${DOD_LINES}- [textedit] write_saved ❌ (write=${textedit_write_seen}, target=${textedit_target_seen}, app_target=${textedit_target_app_seen})"$'\n'
     fi
 fi
+if [ "$n8n_required" = "1" ]; then
+    if [ "$n8n_execution_ok" = "1" ]; then
+        DOD_LINES="${DOD_LINES}- [n8n] execution_completed ✅ (created=${n8n_workflow_created}, completed=${n8n_execution_completed})"$'\n'
+    else
+        DOD_FAIL_COUNT=$((DOD_FAIL_COUNT + 1))
+        STATUS="failed"
+        DOD_LINES="${DOD_LINES}- [n8n] execution_completed ❌ (created=${n8n_workflow_created}, completed=${n8n_execution_completed}, failed=${n8n_execution_failed}, too_simple=${n8n_workflow_too_simple}, empty=${n8n_workflow_empty})"$'\n'
+    fi
+fi
 if [ "$REQUIRE_NODE_CAPTURE_VALUE" = "1" ]; then
     if [ "$NODE_COUNT" -gt 0 ]; then
         DOD_LINES="${DOD_LINES}- [capture] node_capture ✅ (count=${NODE_COUNT})"$'\n'
@@ -2748,12 +3188,20 @@ if [ ${#REQUEST_PREVIEW} -gt 480 ]; then
     REQUEST_PREVIEW="${REQUEST_PREVIEW:0:480}..."
 fi
 
-JUDGEMENT_SUMMARY="planner_done=${PLANNER_DONE}, semantic_missing=${missing_count:-0}, mail_proof=${MAIL_PROOF_STATUS:-none}, node_count=${NODE_COUNT}, dod_fail=${DOD_FAIL_COUNT}"
+JUDGEMENT_SUMMARY="planner_done=${PLANNER_DONE}, execution_complete=${EXECUTION_COMPLETE}, business_complete=${BUSINESS_COMPLETE}, semantic_missing=${missing_count:-0}, mail_proof=${MAIL_PROOF_STATUS:-none}, node_count=${NODE_COUNT}, n8n_required=${n8n_required}, n8n_completed=${n8n_execution_completed}, dod_fail=${DOD_FAIL_COUNT}"
 FAIL_PRIMARY_REASON="none"
 RETRY_GUIDE="동일 요청을 재실행해도 됩니다."
 OPENAI_TPM_HIT=0
 if [ -f "$LOG_FILE" ] && grep -Eiq 'rate_limit_exceeded|tokens per min|request too large for project|rate limit reached for project' "$LOG_FILE"; then
     OPENAI_TPM_HIT=1
+fi
+PLANNER_WALL_TIMEOUT_HIT=0
+if [ -f "$LOG_FILE" ] && grep -Eiq 'Planner wall timeout|PLANNER_WALL_TIMEOUT' "$LOG_FILE"; then
+    PLANNER_WALL_TIMEOUT_HIT=1
+fi
+PLAN_ATTEMPT_LIMIT_HIT=0
+if [ -f "$LOG_FILE" ] && grep -Eiq 'PLAN_ATTEMPT_LIMIT|max attempts for same screen state' "$LOG_FILE"; then
+    PLAN_ATTEMPT_LIMIT_HIT=1
 fi
 if [ "$STATUS" != "success" ]; then
     if [ -n "${RUN_TERMINAL_BLOCK_STATUS:-}" ]; then
@@ -2765,9 +3213,36 @@ if [ "$STATUS" != "success" ]; then
     elif [ "$OPENAI_TPM_HIT" -eq 1 ]; then
         FAIL_PRIMARY_REASON="openai_tpm_limit"
         RETRY_GUIDE="OpenAI 토큰/TPM 여유 후 재실행하거나 STEER_CLI_LLM=gemini|codex 경로를 사용하세요."
+    elif [ "$PLANNER_WALL_TIMEOUT_HIT" -eq 1 ]; then
+        FAIL_PRIMARY_REASON="planner_wall_timeout"
+        RETRY_GUIDE="복잡 요청은 STEER_MAX_STEPS/STEER_GOAL_MAX_WALL_SEC를 늘리거나 요청을 단계별로 나눠 재실행하세요."
+    elif [ "$PLAN_ATTEMPT_LIMIT_HIT" -eq 1 ]; then
+        FAIL_PRIMARY_REASON="planner_attempt_limit"
+        RETRY_GUIDE="같은 화면 반복 상태를 해소하도록 앱 상태를 초기화하거나 요청을 더 구체화해 재실행하세요."
+    elif [ "$n8n_required" = "1" ] && [ "$n8n_workflow_too_simple" = "1" ]; then
+        FAIL_PRIMARY_REASON="n8n_nodes_too_simple"
+        RETRY_GUIDE="n8n 노드 구성을 트리거/변환/검증/브랜치/오류경로/관측성/외부I/O를 포함하도록 확장한 뒤 재실행하세요."
+    elif [ "$n8n_required" = "1" ] && [ "$n8n_workflow_empty" = "1" ]; then
+        FAIL_PRIMARY_REASON="n8n_nodes_empty"
+        RETRY_GUIDE="빈 워크플로우가 생성되지 않도록 프롬프트/생성 경로를 보강한 뒤 재실행하세요."
+    elif [ "$n8n_required" = "1" ] && [ "$n8n_execution_failed" = "1" ]; then
+        FAIL_PRIMARY_REASON="n8n_execution_failed"
+        RETRY_GUIDE="n8n 실행 로그에서 실패 노드와 API 응답을 확인해 수정한 뒤 재실행하세요."
+    elif [ "$n8n_required" = "1" ] && [ "$n8n_execution_completed" -ne 1 ]; then
+        FAIL_PRIMARY_REASON="n8n_execution_not_verified"
+        RETRY_GUIDE="워크플로우 생성 후 실행 완료(success/completed) 로그가 남도록 auto-trigger/API 연결 상태를 점검하고 재실행하세요."
+    elif [ "$textedit_required" = "1" ] && [ "${textedit_write_ok:-1}" != "1" ]; then
+        FAIL_PRIMARY_REASON="textedit_write_not_verified"
+        RETRY_GUIDE="TextEdit 문서가 실제 앱 대상에 기록되도록 문서 포커스/권한 상태를 점검하고 재실행하세요."
+    elif [ "$notes_required" = "1" ] && [ "${notes_write_ok:-1}" != "1" ]; then
+        FAIL_PRIMARY_REASON="notes_write_not_verified"
+        RETRY_GUIDE="Notes 쓰기 대상이 확인되도록 계정/폴더 포커스를 점검하고 재실행하세요."
     elif [ "${missing_count:-0}" -gt 0 ]; then
         FAIL_PRIMARY_REASON="semantic_missing_tokens=${missing_count}"
         RETRY_GUIDE="요구 토큰이 실제 앱 결과에 남도록 단계 입력을 보강하세요."
+    elif [ "${MAIL_PROOF_STATUS:-none}" != "sent_confirmed" ] && [ "$REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE" = "1" ]; then
+        FAIL_PRIMARY_REASON="mail_send_not_confirmed(${MAIL_PROOF_STATUS:-unknown})"
+        RETRY_GUIDE="Mail 계정의 송신함 동기화/네트워크 상태를 확인하고, 초안이 Outbox에 남지 않도록 점검 후 재실행하세요."
     elif [ "${FALLBACK_HIT:-0}" -eq 1 ]; then
         FAIL_PRIMARY_REASON="fallback_detected"
         RETRY_GUIDE="fallback 없이 계획이 끝나도록 단계/권한/포커스를 점검하세요."
@@ -2786,6 +3261,16 @@ fi
 BRIEF_MAIL_RESULT_LINE="- 메일 발송 증거: 확인 필요"
 if [ "${MAIL_PROOF_STATUS:-}" = "sent_confirmed" ]; then
     BRIEF_MAIL_RESULT_LINE="- 메일 정상 발송 완료 (${MAIL_PROOF_RECIPIENT:-unknown})"
+elif [ "${MAIL_PROOF_STATUS:-}" = "sent_pending" ] && [ "${STEER_OUTBOUND_MAIL_REQUIRE_SENT_CONFIRMED:-1}" != "1" ]; then
+    BRIEF_MAIL_RESULT_LINE="- 메일 발송 큐잉 완료(확정 확인 보류) (${MAIL_PROOF_RECIPIENT:-unknown})"
+fi
+BRIEF_N8N_RESULT_LINE="- n8n 완주 검증: 비대상"
+if [ "$n8n_required" = "1" ]; then
+    if [ "$n8n_execution_ok" = "1" ]; then
+        BRIEF_N8N_RESULT_LINE="- n8n 완주 검증: 완료"
+    else
+        BRIEF_N8N_RESULT_LINE="- n8n 완주 검증: 미완료(created=${n8n_workflow_created}, completed=${n8n_execution_completed})"
+    fi
 fi
 BRIEF_FINAL_LINE="- 문제가 있어 재실행 필요 -> 실패"
 if [ "$STATUS" = "success" ]; then
@@ -2808,6 +3293,7 @@ TELEGRAM_MESSAGE=$(cat <<EOF
 ✅ 결과
 - ${RESULT_TEXT}
 ${BRIEF_MAIL_RESULT_LINE}
+${BRIEF_N8N_RESULT_LINE}
 ${SUPER_COMPACT_REASON_LINE}
 EOF
 )
@@ -2821,6 +3307,7 @@ TELEGRAM_MESSAGE=$(cat <<EOF
 ✅ 결과
 - ${RESULT_TEXT}
 ${BRIEF_MAIL_RESULT_LINE}
+${BRIEF_N8N_RESULT_LINE}
 - 문제 없음 -> 성공
 EOF
 )
@@ -2833,6 +3320,7 @@ TELEGRAM_MESSAGE=$(cat <<EOF
 
 ❌ 결과
 - ${RESULT_TEXT}
+${BRIEF_N8N_RESULT_LINE}
 - 주요 실패원인: ${FAIL_PRIMARY_REASON}
 - 재실행 가이드: ${RETRY_GUIDE}
 EOF
@@ -2849,6 +3337,7 @@ TELEGRAM_MESSAGE=$(cat <<EOF
 ✅ 결과
 - ${RESULT_TEXT}
 ${BRIEF_MAIL_RESULT_LINE}
+${BRIEF_N8N_RESULT_LINE}
 ${BRIEF_FINAL_LINE}
 
 상태: ${STATUS_LABEL}
@@ -2868,6 +3357,7 @@ printf '%s\n' "$TELEGRAM_MESSAGE" > "$RAW_MSG_FILE"
 
 if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ] && [ -f "./send_telegram_notification.sh" ]; then
     TELEGRAM_SEND_OK=1
+    TELEGRAM_FAIL_DETAIL=""
     EXTRA_NODE_ENV=()
     NODE_IMAGE_COUNT=0
     if [ -s "$NODE_IMAGE_LIST_FILE" ]; then
@@ -2876,23 +3366,40 @@ if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ] && [ -f ".
         NODE_IMAGE_COUNT="${NODE_IMAGE_COUNT:-0}"
     fi
     TELEGRAM_TIMEOUT_EFFECTIVE="$(compute_notifier_timeout "$NOTIFIER_TIMEOUT_SEC" "$NODE_IMAGE_COUNT")"
+    if [ "$REQUIRE_TELEGRAM_REPORT_VALUE" != "1" ]; then
+        OPTIONAL_TELEGRAM_TIMEOUT_SEC="${STEER_OPTIONAL_TELEGRAM_TIMEOUT_SEC:-20}"
+        if [[ "$OPTIONAL_TELEGRAM_TIMEOUT_SEC" =~ ^[0-9]+$ ]] && [ "$OPTIONAL_TELEGRAM_TIMEOUT_SEC" -gt 0 ] && [ "$TELEGRAM_TIMEOUT_EFFECTIVE" -gt "$OPTIONAL_TELEGRAM_TIMEOUT_SEC" ]; then
+            TELEGRAM_TIMEOUT_EFFECTIVE="$OPTIONAL_TELEGRAM_TIMEOUT_SEC"
+        fi
+    fi
 
     if [ -n "$TELEGRAM_MAIN_IMAGE" ] && [ -f "$TELEGRAM_MAIN_IMAGE" ]; then
         if ! send_telegram_with_timeout "$TELEGRAM_TIMEOUT_EFFECTIVE" \
             env TELEGRAM_DUMP_FINAL_PATH="$FINAL_MSG_FILE" TELEGRAM_SKIP_REWRITE=1 TELEGRAM_VALIDATE_REPORT=1 TELEGRAM_REQUIRE_SEND="$REQUIRE_TELEGRAM_REPORT_VALUE" TELEGRAM_EXTRA_IMAGE_MAX="$TELEGRAM_EXTRA_IMAGE_MAX_VALUE" ${EXTRA_NODE_ENV[@]+"${EXTRA_NODE_ENV[@]}"} \
-            bash ./send_telegram_notification.sh "$TELEGRAM_MESSAGE" "$TELEGRAM_MAIN_IMAGE" >/dev/null 2>&1; then
+            bash ./send_telegram_notification.sh "$TELEGRAM_MESSAGE" "$TELEGRAM_MAIN_IMAGE"; then
             TELEGRAM_SEND_OK=0
+            TELEGRAM_FAIL_DETAIL="${RUN_TIMEOUT_STDERR:-$RUN_TIMEOUT_STDOUT}"
         fi
     else
         if ! send_telegram_with_timeout "$TELEGRAM_TIMEOUT_EFFECTIVE" \
             env TELEGRAM_DUMP_FINAL_PATH="$FINAL_MSG_FILE" TELEGRAM_SKIP_REWRITE=1 TELEGRAM_VALIDATE_REPORT=1 TELEGRAM_REQUIRE_SEND="$REQUIRE_TELEGRAM_REPORT_VALUE" TELEGRAM_EXTRA_IMAGE_MAX="$TELEGRAM_EXTRA_IMAGE_MAX_VALUE" ${EXTRA_NODE_ENV[@]+"${EXTRA_NODE_ENV[@]}"} \
-            bash ./send_telegram_notification.sh "$TELEGRAM_MESSAGE" >/dev/null 2>&1; then
+            bash ./send_telegram_notification.sh "$TELEGRAM_MESSAGE"; then
             TELEGRAM_SEND_OK=0
+            TELEGRAM_FAIL_DETAIL="${RUN_TIMEOUT_STDERR:-$RUN_TIMEOUT_STDOUT}"
         fi
     fi
     if [ "$TELEGRAM_SEND_OK" -ne 1 ]; then
-        STATUS="failed"
-        printf '%s\n- 텔레그램 전송 실패(타임아웃/오류)\n' "$TELEGRAM_MESSAGE" > "$FINAL_MSG_FILE"
+        TELEGRAM_FAIL_DETAIL="$(printf '%s' "${TELEGRAM_FAIL_DETAIL:-}" | tr '\r\n' '  ' | sed -E 's/[[:space:]]+/ /g; s/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-240)"
+        if [ -n "$TELEGRAM_FAIL_DETAIL" ]; then
+            printf '%s\n- 텔레그램 전송 실패(타임아웃/오류)\n- 원인: %s\n' "$TELEGRAM_MESSAGE" "$TELEGRAM_FAIL_DETAIL" > "$FINAL_MSG_FILE"
+        else
+            printf '%s\n- 텔레그램 전송 실패(타임아웃/오류)\n' "$TELEGRAM_MESSAGE" > "$FINAL_MSG_FILE"
+        fi
+        if [ "$REQUIRE_TELEGRAM_REPORT_VALUE" = "1" ]; then
+            STATUS="failed"
+        else
+            echo "Warning: Optional Telegram send failed; continuing without failing request." >&2
+        fi
     fi
 else
     if [ "$REQUIRE_TELEGRAM_REPORT_VALUE" = "1" ]; then

@@ -6,19 +6,19 @@
 // =====================================================
 
 /// Notion API Base URL: https://api.notion.com/v1
-/// Required Headers:
-///   - Authorization: Bearer {NOTION_API_KEY}
-///   - Notion-Version: 2022-06-28
-///   - Content-Type: application/json
-
-/// Key Endpoints for Steer:
-/// 1. Search: POST /search - Find pages/databases by text
-/// 2. Get Page: GET /pages/{page_id} - Get page properties
-/// 3. Get Block Children: GET /blocks/{block_id}/children - Get page content
-/// 4. Query Database: POST /databases/{database_id}/query - Query database rows
-/// 5. Create Page: POST /pages - Create new page in database
-/// 6. Update Page: PATCH /pages/{page_id} - Update page properties
-
+///
+/// Required headers:
+/// - Authorization: Bearer {NOTION_API_KEY}
+/// - Notion-Version: 2022-06-28
+/// - Content-Type: application/json
+///
+/// Key endpoints for Steer:
+/// - Search: POST /search - Find pages/databases by text
+/// - Get Page: GET /pages/{page_id} - Get page properties
+/// - Get Block Children: GET /blocks/{block_id}/children - Get page content
+/// - Query Database: POST /databases/{database_id}/query - Query database rows
+/// - Create Page: POST /pages - Create new page in database
+/// - Update Page: PATCH /pages/{page_id} - Update page properties
 pub struct NotionApi {
     api_key: String,
     base_url: String,
@@ -89,18 +89,17 @@ impl NotionApi {
 // =====================================================
 
 /// Gmail API Base URL: https://gmail.googleapis.com/gmail/v1
-/// Auth: OAuth 2.0 (requires user consent flow)
 ///
-/// For Steer agent, recommend using:
+/// Auth: OAuth 2.0 (requires user consent flow)
+/// For Steer agent, recommended options:
 /// - Service Account (for automated access)
-/// - Or: Desktop App OAuth flow via browser
-
-/// Key Endpoints for Steer:
-/// 1. List Messages: GET /users/me/messages - List message IDs
-/// 2. Get Message: GET /users/me/messages/{id} - Get full message
-/// 3. Send Message: POST /users/me/messages/send - Send email
-/// 4. Search: GET /users/me/messages?q={query} - Search emails
-
+/// - Desktop App OAuth flow via browser
+///
+/// Key endpoints for Steer:
+/// - List Messages: GET /users/me/messages - List message IDs
+/// - Get Message: GET /users/me/messages/{id} - Get full message
+/// - Send Message: POST /users/me/messages/send - Send email
+/// - Search: GET /users/me/messages?q={query} - Search emails
 pub struct GmailApi {
     access_token: String,
     base_url: String,

@@ -338,6 +338,12 @@ pub struct McpRegistry {
     config_path: std::path::PathBuf,
 }
 
+impl Default for McpRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl McpRegistry {
     /// Create a new registry
     pub fn new() -> Self {

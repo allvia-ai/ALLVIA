@@ -621,6 +621,9 @@ export default function Launcher() {
     const runPollTokenRef = useRef(0);
     const approvalMonitorIdsRef = useRef<Set<number>>(new Set());
     const lastDispatchRef = useRef<{ promptKey: string; ts: number } | null>(null);
+    const dispatchPromptRef = useRef<
+        ((rawPrompt: string, bypassSafeCountdown?: boolean) => Promise<void>) | null
+    >(null);
     const prevComposerModeRef = useRef<ComposerMode>("nl");
     const sendThrottleRef = useRef<number>(0);
     const inputRef = useRef<HTMLInputElement>(null);
@@ -713,15 +716,15 @@ export default function Launcher() {
     }, [dispatchBlockedUntilMs, dispatchNowMs]);
 
     // [Phase 5.1] Visual Triggers
-    const triggerSuccess = () => {
+    const triggerSuccess = useCallback(() => {
         setSuccessPulse(true);
         setTimeout(() => setSuccessPulse(false), 1000);
-    };
+    }, []);
 
-    const triggerError = () => {
+    const triggerError = useCallback(() => {
         setShake(true);
         setTimeout(() => setShake(false), 500);
-    };
+    }, []);
 
     // [Phase 5.2] Handle Pin
     const handlePin = async (content: string, title?: string) => {
@@ -1205,7 +1208,7 @@ export default function Launcher() {
         return "자연어 요청 또는 프로그램 버튼으로 실행을 시작하세요.";
     })();
 
-    const updateExecutionState = (snapshot: ExecutionSnapshot) => {
+    const updateExecutionState = useCallback((snapshot: ExecutionSnapshot) => {
         setRunSnapshot(snapshot);
         const statusLower = snapshot.status.toLowerCase();
         if (statusLower === "approval_required") {
@@ -1237,7 +1240,7 @@ export default function Launcher() {
             return;
         }
         setRunPhase("failed");
-    };
+    }, []);
 
     const hudMeta: Record<RunPhase, { label: string; chip: string; dot: string }> = {
         idle: {
@@ -1434,7 +1437,7 @@ export default function Launcher() {
         });
     }, []);
 
-    const loadRunDiagnostics = async (runId?: string | null) => {
+    const loadRunDiagnostics = useCallback(async (runId?: string | null) => {
         if (!runId) {
             setStageRuns([]);
             setStageAssertions([]);
@@ -1456,7 +1459,7 @@ export default function Launcher() {
             setStageAssertions([]);
             setTaskRunArtifacts([]);
         }
-    };
+    }, []);
 
     const loadLockMetrics = useCallback(async () => {
         try {
@@ -1955,6 +1958,8 @@ export default function Launcher() {
                                         : "",
                                     `- n8n 편집기: ${workflowUrl}`,
                                     "- 워크플로를 자동으로 열었습니다.",
+                                    "- 백엔드가 활성화 + 자동 실행(webhook/execute)을 시도합니다.",
+                                    "- 실행 기록은 n8n의 Executions 탭에서 확인하세요.",
                                 ]
                                     .filter(Boolean)
                                     .join("\n"),
@@ -1967,7 +1972,9 @@ export default function Launcher() {
                     }
 
                     if (
-                        (opStatus === "requested" || opStatus === "created") &&
+                        (opStatus === "requested" ||
+                            opStatus === "provisioning" ||
+                            opStatus === "created") &&
                         attempt >= APPROVAL_MONITOR_PENDING_NOTICE_ATTEMPT &&
                         !pendingNoticeShown
                     ) {
@@ -1987,12 +1994,17 @@ export default function Launcher() {
                                         : "",
                                     "- n8n 워크플로 생성 요청은 접수됐지만 아직 완료되지 않았습니다.",
                                     "- 잠시 후 자동 재시도하거나, n8n 상태를 먼저 확인하세요.",
+                                    "- 참고: 캔버스의 Test 대기 상태와 별개로, 자동 실행은 production 경로로 시도됩니다.",
                                 ]
                                     .filter(Boolean)
                                     .join("\n"),
                             },
                         ]);
-                    } else if (opStatus === "requested" || opStatus === "created") {
+                    } else if (
+                        opStatus === "requested" ||
+                        opStatus === "provisioning" ||
+                        opStatus === "created"
+                    ) {
                         setProvisioningUiState(id, "provisioning", {
                             opId: trackedProvisionOpId,
                             detail: opStatus,
@@ -2019,6 +2031,7 @@ export default function Launcher() {
             refetch,
             removeWatchRecommendation,
             setProvisioningUiState,
+            triggerSuccess,
         ]
     );
 
@@ -2144,7 +2157,7 @@ export default function Launcher() {
         setPendingDispatch(null);
         setDispatchBlockedReason(null);
         setDispatchBlockedUntilMs(null);
-        void dispatchPrompt(prompt, true);
+        void dispatchPromptRef.current?.(prompt, true);
     }, [pendingDispatch, dispatchNowMs]);
 
     useEffect(() => {
@@ -2746,6 +2759,9 @@ export default function Launcher() {
         }
     };
 
+    // Keep latest large-closure dispatcher without forcing useCallback on dispatchPrompt.
+    dispatchPromptRef.current = dispatchPrompt;
+
     const cancelPendingDispatch = useCallback(() => {
         if (!pendingDispatch) return;
         setPendingDispatch(null);
@@ -3134,6 +3150,8 @@ export default function Launcher() {
                                 provisionOpId != null ? `- provision_op_id: \`${provisionOpId}\`` : "",
                                 `- n8n 편집기: ${workflowUrl}`,
                                 "- n8n 화면을 열어 생성 결과를 바로 확인하세요.",
+                                "- 백엔드가 활성화 + 자동 실행(webhook/execute)을 시도합니다.",
+                                "- 실행 기록은 n8n의 Executions 탭에서 확인하세요.",
                             ]
                                 .filter(Boolean)
                                 .join("\n"),
@@ -3189,6 +3207,7 @@ export default function Launcher() {
                             provisionStatus ? `- provision_status: \`${provisionStatus}\`` : "",
                             editorOpenNote,
                             "- workflow URL 생성 중입니다. 준비되면 해당 워크플로 편집기를 자동으로 엽니다.",
+                            "- 생성 후 백엔드가 자동 실행(webhook/execute)을 시도합니다.",
                         ].join("\n"),
                     },
                 ]);

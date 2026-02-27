@@ -2222,8 +2222,7 @@ impl OpenAILLMClient {
 
             // Parse SSE lines
             for line in chunk_str.lines() {
-                if line.starts_with("data: ") {
-                    let data = &line[6..];
+                if let Some(data) = line.strip_prefix("data: ") {
                     if data == "[DONE]" {
                         break;
                     }

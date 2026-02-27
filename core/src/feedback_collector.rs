@@ -49,6 +49,12 @@ pub struct FeedbackCollector {
     suppressed_patterns: Vec<String>, // 억제된 패턴 ID 목록
 }
 
+impl Default for FeedbackCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FeedbackCollector {
     pub fn new() -> Self {
         Self {

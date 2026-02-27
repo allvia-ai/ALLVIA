@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaticCheckIssue {
@@ -150,7 +150,7 @@ fn is_ignored_dir(name: &str) -> bool {
     )
 }
 
-fn display_path(root: &Path, path: &PathBuf) -> String {
+fn display_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| path.to_string_lossy().to_string())

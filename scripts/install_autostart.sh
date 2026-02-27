@@ -6,6 +6,8 @@ PLIST_PATH="$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
 CORE_DIR="$(cd "$(dirname "$0")/../core" && pwd)"
 BINARY_PATH="$CORE_DIR/target/release/local_os_agent"
 LOG_DIR="$HOME/.local-os-agent"
+API_ALLOW_NO_KEY_VALUE="${STEER_API_ALLOW_NO_KEY_INSTALL:-0}"
+RUNTIME_PROFILE_VALUE="${STEER_RUNTIME_PROFILE_INSTALL:-prod}"
 
 # Colors
 GREEN='\033[0;32m'
@@ -54,13 +56,15 @@ cat <<EOF > "$PLIST_PATH"
         <key>RUST_LOG</key>
         <string>info</string>
         <key>STEER_API_ALLOW_NO_KEY</key>
-        <string>1</string>
+        <string>${API_ALLOW_NO_KEY_VALUE}</string>
+        <key>STEER_RUNTIME_PROFILE</key>
+        <string>${RUNTIME_PROFILE_VALUE}</string>
         <key>STEER_DISABLE_EVENT_TAP</key>
         <string>1</string>
         <key>STEER_COLLECTOR_HANDOFF_AUTOCONSUME</key>
         <string>0</string>
         <key>STEER_PREFLIGHT_SCREEN_CAPTURE</key>
-        <string>0</string>
+        <string>1</string>
         <key>PATH</key>
         <string>$PATH:/usr/local/bin:/opt/homebrew/bin</string>
     </dict>

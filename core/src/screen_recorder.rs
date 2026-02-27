@@ -8,6 +8,12 @@ pub struct ScreenRecorder {
     output_dir: PathBuf,
 }
 
+impl Default for ScreenRecorder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ScreenRecorder {
     pub fn new() -> Self {
         // Default to saving in .steer/recordings
@@ -49,7 +55,7 @@ impl ScreenRecorder {
         // -y: Overwrite if exists
         // Log level quiet to avoid spam
         let child = Command::new("ffmpeg")
-            .args(&[
+            .args([
                 "-f",
                 "avfoundation",
                 "-r",

@@ -62,7 +62,7 @@ fn action_kind(action: &AgentAction) -> &'static str {
 
 fn parse_list(raw: &str) -> Vec<String> {
     raw.split(',')
-        .map(|s| normalize_pattern(s))
+        .map(normalize_pattern)
         .filter(|s| !s.is_empty())
         .collect()
 }

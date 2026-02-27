@@ -389,11 +389,7 @@ impl ActionRunner {
             return false;
         }
 
-        let normalized = compact
-            .replace('×', "*")
-            .replace('x', "*")
-            .replace('X', "*")
-            .replace(' ', "");
+        let normalized = compact.replace(['×', 'x', 'X'], "*").replace(' ', "");
         if normalized.chars().any(|c| c.is_ascii_alphabetic()) {
             return false;
         }
@@ -1293,7 +1289,7 @@ impl ActionRunner {
             "if _bodyLen <= 2 then",
             "return \"empty_body|\" & beforeOutgoing & \"|\" & beforeOutgoing & \"|\" & _recipient & \"|\" & _subject & \"|\" & _draftId & \"|\" & _bodyLen",
             "end if",
-            "if markerHint is not \"\" and (_bodyText does not contain markerHint) then",
+            "if strictDraftCheck and markerHint is not \"\" and (_bodyText does not contain markerHint) then",
             "set fallbackMsg to missing value",
             "repeat with idx from beforeOutgoing to 1 by -1",
             "set candidate to item idx of outgoing messages",
@@ -1357,7 +1353,7 @@ impl ActionRunner {
             "end try",
             "end if",
             "end if",
-            "if markerHint is \"\" and subjectHint is not \"\" and _bodyLen <= 2 then",
+            "if strictDraftCheck and markerHint is \"\" and subjectHint is not \"\" and _bodyLen <= 2 then",
             "if strictDraftCheck then",
             "return \"empty_body|\" & beforeOutgoing & \"|\" & beforeOutgoing & \"|\" & _recipient & \"|\" & _subject & \"|\" & _draftId & \"|\" & _bodyLen",
             "end if",
@@ -1445,12 +1441,6 @@ impl ActionRunner {
             "end try",
             "end repeat",
             "if draftStillExists is false then return \"sent_confirmed|\" & beforeOutgoing & \"|\" & afterOutgoing & \"|\" & checkRecipient & \"|\" & checkSubject & \"|\" & _draftId & \"|\" & _bodyLen",
-            "end if",
-            "if my sent_message_exists(checkSubject, checkRecipient, markerHint) then",
-            "return \"sent_confirmed|\" & beforeOutgoing & \"|\" & afterOutgoing & \"|\" & checkRecipient & \"|\" & checkSubject & \"|\" & _draftId & \"|\" & _bodyLen",
-            "end if",
-            "if markerHint is not \"\" and my sent_message_exists(checkSubject, checkRecipient, \"\") then",
-            "return \"sent_confirmed|\" & beforeOutgoing & \"|\" & afterOutgoing & \"|\" & checkRecipient & \"|\" & checkSubject & \"|\" & _draftId & \"|\" & _bodyLen",
             "end if",
             "end repeat",
             "end tell",
@@ -1852,6 +1842,7 @@ impl ActionRunner {
             "if fd is missing value then set fd to item 1 of folders of ac",
             "end if",
             "end if",
+            "end if",
             "set targetNote to missing value",
             "if markerText is not \"\" then",
             "try",
@@ -2109,6 +2100,59 @@ impl ActionRunner {
     }
 
     fn notion_paragraph_blocks(content: &str) -> Vec<serde_json::Value> {
+        fn text_segment(content: &str, link: Option<&str>) -> serde_json::Value {
+            let mut text_obj = json!({ "content": content });
+            if let Some(url) = link {
+                text_obj["link"] = json!({ "url": url });
+            }
+            json!({
+                "type": "text",
+                "text": text_obj
+            })
+        }
+
+        fn rich_text_with_links(line: &str) -> Vec<serde_json::Value> {
+            let mut rich: Vec<serde_json::Value> = Vec::new();
+            let Ok(url_re) = regex::Regex::new(r"https?://\S+") else {
+                return vec![text_segment(line, None)];
+            };
+
+            let mut last = 0usize;
+            for m in url_re.find_iter(line) {
+                if m.start() > last {
+                    let prefix = &line[last..m.start()];
+                    if !prefix.is_empty() {
+                        rich.push(text_segment(prefix, None));
+                    }
+                }
+
+                let raw = m.as_str();
+                let trimmed = raw.trim_end_matches(|c: char| {
+                    matches!(c, ')' | ']' | '}' | '.' | ',' | ';' | ':' | '!' | '?')
+                });
+                let suffix = &raw[trimmed.len()..];
+                if !trimmed.is_empty() {
+                    rich.push(text_segment(trimmed, Some(trimmed)));
+                }
+                if !suffix.is_empty() {
+                    rich.push(text_segment(suffix, None));
+                }
+                last = m.end();
+            }
+
+            if last < line.len() {
+                let tail = &line[last..];
+                if !tail.is_empty() {
+                    rich.push(text_segment(tail, None));
+                }
+            }
+
+            if rich.is_empty() {
+                rich.push(text_segment(line, None));
+            }
+            rich
+        }
+
         let mut blocks: Vec<serde_json::Value> = Vec::new();
         for line in content.lines().take(80) {
             let trimmed = line.trim();
@@ -2120,10 +2164,7 @@ impl ActionRunner {
                 "object": "block",
                 "type": "paragraph",
                 "paragraph": {
-                    "rich_text": [{
-                        "type": "text",
-                        "text": { "content": clipped }
-                    }]
+                    "rich_text": rich_text_with_links(&clipped)
                 }
             }));
         }
@@ -2134,10 +2175,7 @@ impl ActionRunner {
                     "object": "block",
                     "type": "paragraph",
                     "paragraph": {
-                        "rich_text": [{
-                            "type": "text",
-                            "text": { "content": clipped }
-                        }]
+                        "rich_text": rich_text_with_links(&clipped)
                     }
                 }));
             }
@@ -2251,7 +2289,7 @@ impl ActionRunner {
             ),
             (&["건강", "의료", "health", "medicine"], "건강"),
         ];
-        for (needles, topic) in topic_map.iter().copied() {
+        for (needles, topic) in topic_map {
             if needles.iter().any(|needle| lower.contains(needle)) {
                 return topic.to_string();
             }
@@ -2279,6 +2317,20 @@ impl ActionRunner {
         }
 
         "latest".to_string()
+    }
+
+    fn infer_news_item_count(goal: &str) -> usize {
+        let count_re = regex::Regex::new(r"(?i)\b([1-9]|10)\s*(?:개|items?|articles?)").ok();
+        if let Some(re) = count_re {
+            if let Some(caps) = re.captures(goal) {
+                if let Some(raw) = caps.get(1) {
+                    if let Ok(parsed) = raw.as_str().parse::<usize>() {
+                        return parsed.clamp(3, 10);
+                    }
+                }
+            }
+        }
+        5
     }
 
     async fn fetch_google_ai_news(topic: &str, limit: usize) -> Result<Vec<AiNewsItem>> {
@@ -2355,6 +2407,32 @@ impl ActionRunner {
     }
 
     fn build_ai_news_digest(topic: &str, items: &[AiNewsItem], marker: Option<&str>) -> String {
+        fn local_timestamp_string() -> String {
+            chrono::Local::now()
+                .format("%Y-%m-%d %H:%M:%S %:z")
+                .to_string()
+        }
+
+        fn normalize_pub_date_to_local(raw: &str) -> String {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return String::new();
+            }
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(trimmed) {
+                return dt
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M:%S %:z")
+                    .to_string();
+            }
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+                return dt
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M:%S %:z")
+                    .to_string();
+            }
+            trimmed.to_string()
+        }
+
         let topic = if topic.trim().is_empty() {
             "최신"
         } else {
@@ -2362,17 +2440,17 @@ impl ActionRunner {
         };
         let mut lines = vec![
             format!("{} 뉴스 기사 요약 (실기사 기반)", topic),
-            format!(
-                "작성시각(UTC): {}",
-                chrono::Utc::now().format("%Y-%m-%d %H:%M")
-            ),
+            format!("작성시각(Local): {}", local_timestamp_string()),
             "".to_string(),
         ];
         for (idx, item) in items.iter().enumerate() {
             lines.push(format!("{}. {}", idx + 1, item.title));
             lines.push(format!("링크: {}", item.link));
             if !item.published_at.trim().is_empty() {
-                lines.push(format!("게시일: {}", item.published_at));
+                lines.push(format!(
+                    "게시일(Local): {}",
+                    normalize_pub_date_to_local(&item.published_at)
+                ));
             }
             lines.push("요약:".to_string());
             lines.push(format!("- 핵심: {}", item.summary));
@@ -2391,76 +2469,147 @@ impl ActionRunner {
         lines.join("\n")
     }
 
-    fn build_n8n_scope_workflow(name: &str, marker: &str) -> serde_json::Value {
+    fn build_n8n_scope_workflow(
+        name: &str,
+        marker: &str,
+        goal_prompt: Option<&str>,
+    ) -> serde_json::Value {
         let marker_value = if marker.trim().is_empty() {
             "RUN_SCOPE_TEST_03".to_string()
         } else {
             marker.trim().to_string()
         };
-        let query_value = "trending latest news".to_string();
-        serde_json::json!({
-            "name": name,
-            "nodes": [
-                {
-                    "id": uuid::Uuid::new_v4().to_string(),
-                    "name": "Manual Trigger",
-                    "type": "n8n-nodes-base.manualTrigger",
-                    "typeVersion": 1,
-                    "position": [0, 0]
-                },
-                {
-                    "id": uuid::Uuid::new_v4().to_string(),
-                    "name": "Set Scope Marker",
-                    "type": "n8n-nodes-base.set",
-                    "typeVersion": 2,
-                    "position": [260, 0],
-                    "parameters": {
-                        "keepOnlySet": true,
-                        "values": {
-                            "string": [
-                                { "name": "marker", "value": marker_value },
-                                { "name": "query", "value": query_value }
-                            ]
-                        }
-                    }
-                },
-                {
-                    "id": uuid::Uuid::new_v4().to_string(),
-                    "name": "Fetch News RSS",
-                    "type": "n8n-nodes-base.httpRequest",
-                    "typeVersion": 4,
-                    "position": [560, 0],
-                    "parameters": {
-                        "url": "https://news.google.com/rss/search?q=trending+latest+news",
-                        "options": {},
-                        "responseFormat": "string"
-                    }
-                },
-                {
-                    "id": uuid::Uuid::new_v4().to_string(),
-                    "name": "Extract Top 3 Headlines",
-                    "type": "n8n-nodes-base.code",
-                    "typeVersion": 2,
-                    "position": [860, 0],
-                    "parameters": {
-                        "jsCode": "const first = $input.first();\\nconst xml = first.json.data || first.json.body || '';\\nconst markerFromSet = (() => {\\n  try {\\n    return $('Set Scope Marker').first().json.marker || '';\\n  } catch (e) {\\n    return '';\\n  }\\n})();\\nconst marker = first.json.marker || markerFromSet || '';\\nconst clean = (v) => (v || '').replace(/<!\\\\[CDATA\\\\[|\\\\]\\\\]>/g, '').trim();\\nconst items = [...xml.matchAll(/<item>([\\\\s\\\\S]*?)<\\\\/item>/g)].slice(0, 3).map((m, idx) => {\\n  const block = m[1] || '';\\n  const title = clean((block.match(/<title>([\\\\s\\\\S]*?)<\\\\/title>/) || [])[1]);\\n  const link = clean((block.match(/<link>([\\\\s\\\\S]*?)<\\\\/link>/) || [])[1]);\\n  return { rank: idx + 1, title, link };\\n});\\nreturn [{ json: { marker, article_count: items.length, articles: items } }];"
+        let mut prompt_seed_parts = Vec::new();
+        if let Some(goal_text) = goal_prompt {
+            let trimmed = goal_text.trim();
+            if !trimmed.is_empty() {
+                prompt_seed_parts.push(trimmed.to_string());
+            }
+        }
+        prompt_seed_parts.push(format!("scope_marker={}", marker_value));
+        let prompt_seed = prompt_seed_parts.join("\n");
+        crate::n8n_api::build_orchestrator_fallback_workflow(
+            name,
+            Some(prompt_seed.as_str()),
+            "scope_bootstrap",
+        )
+    }
+
+    fn extract_latest_n8n_workflow_id(history: &[String]) -> Option<String> {
+        for entry in history.iter().rev() {
+            if let Some(pos) = entry.to_lowercase().find("n8n workflow created:") {
+                let rest = entry[(pos + "n8n workflow created:".len())..].trim();
+                let id = rest
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_matches(|c: char| {
+                        c == '(' || c == ')' || c == ',' || c == '"' || c == '\''
+                    })
+                    .to_string();
+                if !id.is_empty() {
+                    return Some(id);
+                }
+            }
+            if let Some(pos) = entry.to_lowercase().find("workflow_id=") {
+                let mut id = String::new();
+                for ch in entry[(pos + "workflow_id=".len())..].chars() {
+                    if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                        id.push(ch);
+                    } else {
+                        break;
                     }
                 }
-            ],
-            "connections": {
-                "Manual Trigger": {
-                    "main": [[{ "node": "Set Scope Marker", "type": "main", "index": 0 }]]
-                },
-                "Set Scope Marker": {
-                    "main": [[{ "node": "Fetch News RSS", "type": "main", "index": 0 }]]
-                },
-                "Fetch News RSS": {
-                    "main": [[{ "node": "Extract Top 3 Headlines", "type": "main", "index": 0 }]]
+                if !id.is_empty() {
+                    return Some(id);
                 }
-            },
-            "settings": { "saveManualExecutions": true },
-            "active": false
-        })
+            }
+        }
+        None
+    }
+
+    fn is_n8n_success_status(status: &str) -> bool {
+        matches!(
+            status.trim().to_ascii_lowercase().as_str(),
+            "success" | "completed"
+        )
+    }
+
+    fn is_n8n_failure_status(status: &str) -> bool {
+        matches!(
+            status.trim().to_ascii_lowercase().as_str(),
+            "error" | "failed" | "failure" | "crashed" | "cancelled" | "canceled" | "timeout"
+        )
+    }
+
+    async fn wait_for_n8n_execution_success(
+        n8n: &crate::n8n_api::N8nApi,
+        workflow_id: &str,
+        execution_id_hint: Option<&str>,
+    ) -> Result<crate::n8n_api::ExecutionResult> {
+        let timeout_sec = std::env::var("STEER_N8N_ACTION_EXECUTION_WAIT_SEC")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|v| v.clamp(10, 900))
+            .unwrap_or(120);
+        let poll_ms = std::env::var("STEER_N8N_ACTION_EXECUTION_POLL_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|v| v.clamp(300, 10_000))
+            .unwrap_or(1_500);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_sec);
+        let hinted = execution_id_hint
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string());
+
+        let mut last_seen: Option<crate::n8n_api::ExecutionResult> = None;
+        while std::time::Instant::now() <= deadline {
+            let executions = n8n.list_executions(workflow_id, 20).await?;
+            let selected = if let Some(hint) = hinted.as_deref() {
+                executions.into_iter().find(|e| e.id == hint)
+            } else {
+                executions.into_iter().next()
+            };
+
+            if let Some(exec) = selected {
+                if exec.finished {
+                    if Self::is_n8n_success_status(&exec.status) {
+                        return Ok(exec);
+                    }
+                    return Err(anyhow::anyhow!(
+                        "n8n execution finished with non-success status: workflow_id={} execution_id={} status={}",
+                        workflow_id,
+                        exec.id,
+                        exec.status
+                    ));
+                }
+                if Self::is_n8n_failure_status(&exec.status) {
+                    return Err(anyhow::anyhow!(
+                        "n8n execution entered failure status before finish: workflow_id={} execution_id={} status={}",
+                        workflow_id,
+                        exec.id,
+                        exec.status
+                    ));
+                }
+                last_seen = Some(exec);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
+        }
+
+        if let Some(last) = last_seen {
+            return Err(anyhow::anyhow!(
+                "n8n execution completion timeout: workflow_id={} execution_id={} status={} finished={}",
+                workflow_id,
+                last.id,
+                last.status,
+                last.finished
+            ));
+        }
+        Err(anyhow::anyhow!(
+            "n8n execution completion timeout: workflow_id={} (no execution observed)",
+            workflow_id
+        ))
     }
 
     async fn notion_write_text(title: &str, content: &str) -> Result<NotionWriteResult> {
@@ -2488,7 +2637,16 @@ impl ActionRunner {
             .unwrap_or_default();
 
         if !database_id.is_empty() {
-            let created_page_id = client.create_page(&database_id, &title, body).await?;
+            // Use rich_text blocks with explicit link objects so article URLs stay clickable
+            // even when writing into a database-backed page.
+            let blocks = Self::notion_paragraph_blocks(body);
+            let created_page_id = if blocks.is_empty() {
+                client.create_page(&database_id, &title, body).await?
+            } else {
+                client
+                    .create_database_page_with_children(&database_id, &title, &blocks)
+                    .await?
+            };
             let page_url = format!("https://www.notion.so/{}", created_page_id.replace('-', ""));
             return Ok(NotionWriteResult {
                 page_id: created_page_id,
@@ -2629,8 +2787,7 @@ impl ActionRunner {
 
     fn sanitize_evidence_value(value: &str) -> String {
         value
-            .replace('\n', " ")
-            .replace('\r', " ")
+            .replace(['\n', '\r'], " ")
             .replace('|', "/")
             .trim()
             .to_string()
@@ -2664,15 +2821,12 @@ impl ActionRunner {
         key: &str,
         recent_window: Option<usize>,
     ) -> bool {
-        let iter = session.steps.iter().rev();
-        let mut inspected = 0usize;
-        for step in iter {
+        for (inspected, step) in session.steps.iter().rev().enumerate() {
             if let Some(limit) = recent_window {
                 if inspected >= limit {
                     break;
                 }
             }
-            inspected += 1;
             if step.status != "success" {
                 continue;
             }
@@ -2849,6 +3003,19 @@ impl ActionRunner {
                     })
                     .unwrap_or_else(|| "run_scope_test_03".to_string());
                 Some(format!("n8n_create_workflow:{}", marker))
+            }
+            "n8n_execute_workflow" => {
+                let workflow_id = plan["workflow_id"]
+                    .as_str()
+                    .map(|v| v.trim().to_lowercase())
+                    .filter(|v| !v.is_empty())
+                    .or_else(|| {
+                        Self::extract_latest_n8n_workflow_id(history)
+                            .map(|v| v.trim().to_lowercase())
+                            .filter(|v| !v.is_empty())
+                    })
+                    .unwrap_or_else(|| "latest".to_string());
+                Some(format!("n8n_execute_workflow:{}", workflow_id))
             }
             "shortcut" | "key" => {
                 let raw_key = plan["key"].as_str().unwrap_or("").to_string();
@@ -3095,6 +3262,7 @@ impl ActionRunner {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute(
         plan: &serde_json::Value,
         driver: &mut VisualDriver,
@@ -3393,6 +3561,16 @@ impl ActionRunner {
                     history.push(format!("READ_RESULT: {}", preview));
                 }
             }
+            "report" => {
+                let message = plan["message"].as_str().unwrap_or("Progress update");
+                description = format!("Reported progress: {}", message);
+                session.add_message("tool", message);
+                action_data = Some(json!({
+                    "proof": "report",
+                    "message_len": message.chars().count()
+                }));
+                action_status_override = Some("success");
+            }
             "type" => {
                 let mut text = plan["text"].as_str().unwrap_or("").to_string();
                 let mut forced_app = false;
@@ -3424,11 +3602,7 @@ impl ActionRunner {
                     .unwrap_or_else(|| front_app.clone());
                 if !app_name.trim().is_empty() {
                     if front_app.eq_ignore_ascii_case("Calculator") {
-                        let mut cleaned = text
-                            .replace('×', "*")
-                            .replace('x', "*")
-                            .replace('X', "*")
-                            .replace(' ', "");
+                        let mut cleaned = text.replace(['×', 'x', 'X'], "*").replace(' ', "");
 
                         if cleaned.chars().all(|c| c.is_ascii_digit()) {
                             if let Some(num) = last_read_number.as_ref() {
@@ -4324,8 +4498,20 @@ impl ActionRunner {
                             .unwrap_or_else(|| Self::mail_outgoing_count().unwrap_or(-1));
                         let policy_error =
                             Self::enforce_mail_send_policy(Some(goal), &send_result).err();
-                        if policy_error.is_none() && send_result.status == "sent_confirmed" {
-                            description = "Mail send completed".to_string();
+                        let require_sent_confirmed = Self::bool_env_with_default(
+                            "STEER_OUTBOUND_MAIL_REQUIRE_SENT_CONFIRMED",
+                            true,
+                        );
+                        if policy_error.is_none()
+                            && (send_result.status == "sent_confirmed"
+                                || (!require_sent_confirmed
+                                    && send_result.status == "sent_pending"))
+                        {
+                            description = if send_result.status == "sent_confirmed" {
+                                "Mail send completed".to_string()
+                            } else {
+                                "Mail send queued (pending confirmation)".to_string()
+                            };
                             action_status_override = Some("success");
                         } else if let Some(policy_err) = policy_error.as_ref() {
                             description =
@@ -4506,7 +4692,8 @@ impl ActionRunner {
                     let marker = Self::preferred_run_scope_marker(Some(goal)).unwrap_or_default();
                     if Self::goal_targets_ai_news_to_notion(goal) {
                         let topic = Self::infer_news_topic_from_goal(goal);
-                        if let Ok(items) = Self::fetch_google_ai_news(&topic, 3).await {
+                        let item_count = Self::infer_news_item_count(goal);
+                        if let Ok(items) = Self::fetch_google_ai_news(&topic, item_count).await {
                             if items.len() >= 3 {
                                 content = Self::build_ai_news_digest(
                                     &topic,
@@ -4521,7 +4708,7 @@ impl ActionRunner {
                                     title = format!(
                                         "{} 뉴스 요약 {}",
                                         topic,
-                                        chrono::Utc::now().format("%Y-%m-%d %H:%M")
+                                        chrono::Local::now().format("%Y-%m-%d %H:%M")
                                     );
                                 }
                             }
@@ -4546,7 +4733,8 @@ impl ActionRunner {
                                 "page_id": result.page_id,
                                 "page_url": result.page_url,
                                 "title": result.title,
-                                "content_len": content.chars().count()
+                                "content_len": content.chars().count(),
+                                "content_preview": content.chars().take(1600).collect::<String>()
                             }));
                             if let Some(data) = action_data.as_ref() {
                                 Self::log_evidence(
@@ -4607,7 +4795,7 @@ impl ActionRunner {
                         chrono::Local::now().format("%m%d-%H%M%S")
                     );
                 }
-                let workflow = Self::build_n8n_scope_workflow(&name, &marker);
+                let workflow = Self::build_n8n_scope_workflow(&name, &marker, Some(goal));
                 match crate::n8n_api::N8nApi::from_env() {
                     Ok(n8n) => match n8n.create_workflow(&name, &workflow, false).await {
                         Ok(workflow_id) => {
@@ -4663,6 +4851,112 @@ impl ActionRunner {
                     Err(e) => {
                         description = format!("n8n_create_workflow failed: {}", e);
                         action_status_override = Some("failed");
+                    }
+                }
+            }
+            "n8n_execute_workflow" => {
+                crate::load_env_with_fallback();
+                let workflow_id = plan["workflow_id"]
+                    .as_str()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+                    .or_else(|| Self::extract_latest_n8n_workflow_id(history))
+                    .unwrap_or_default();
+                if workflow_id.is_empty() {
+                    description =
+                        "n8n_execute_workflow failed: workflow_id is missing (no history match)"
+                            .to_string();
+                    action_status_override = Some("failed");
+                } else {
+                    match crate::n8n_api::N8nApi::from_env() {
+                        Ok(n8n) => match n8n.execute_workflow(&workflow_id).await {
+                            Ok(exec) => {
+                                let mut final_exec = exec.clone();
+                                if exec.finished {
+                                    if !Self::is_n8n_success_status(&exec.status) {
+                                        description = format!(
+                                            "n8n_execute_workflow failed: workflow_id={} execution_id={} status={}",
+                                            workflow_id, exec.id, exec.status
+                                        );
+                                        action_status_override = Some("failed");
+                                    }
+                                } else {
+                                    let execution_id = exec.id.trim().to_string();
+                                    match Self::wait_for_n8n_execution_success(
+                                        &n8n,
+                                        &workflow_id,
+                                        if execution_id.is_empty() {
+                                            None
+                                        } else {
+                                            Some(execution_id.as_str())
+                                        },
+                                    )
+                                    .await
+                                    {
+                                        Ok(done_exec) => {
+                                            final_exec = done_exec;
+                                        }
+                                        Err(e) => {
+                                            description =
+                                                format!("n8n_execute_workflow failed: {}", e);
+                                            action_status_override = Some("failed");
+                                        }
+                                    }
+                                }
+                                if action_status_override != Some("failed") {
+                                    description = format!(
+                                        "n8n execution completed: workflow_id={} execution_id={} status={}",
+                                        workflow_id, final_exec.id, final_exec.status
+                                    );
+                                    action_status_override = Some("success");
+                                    action_data = Some(json!({
+                                        "proof": "n8n_execution_completed",
+                                        "workflow_id": workflow_id,
+                                        "execution_id": final_exec.id,
+                                        "execution_status": final_exec.status,
+                                        "execution_finished": final_exec.finished
+                                    }));
+                                    if let Some(data) = action_data.as_ref() {
+                                        Self::log_evidence(
+                                            "n8n",
+                                            "execution",
+                                            &[
+                                                ("status", "completed".to_string()),
+                                                (
+                                                    "workflow_id",
+                                                    data.get("workflow_id")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("")
+                                                        .to_string(),
+                                                ),
+                                                (
+                                                    "execution_id",
+                                                    data.get("execution_id")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("")
+                                                        .to_string(),
+                                                ),
+                                                (
+                                                    "execution_status",
+                                                    data.get("execution_status")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("")
+                                                        .to_string(),
+                                                ),
+                                            ],
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                description = format!("n8n_execute_workflow failed: {}", e);
+                                action_status_override = Some("failed");
+                            }
+                        },
+                        Err(e) => {
+                            description = format!("n8n_execute_workflow failed: {}", e);
+                            action_status_override = Some("failed");
+                        }
                     }
                 }
             }
@@ -4945,8 +5239,27 @@ impl ActionRunner {
                             }));
                         }
                         Err(e) => {
-                            description = format!("Copy failed (textedit scripted): {}", e);
-                            action_status_override = Some("failed");
+                            let err_text = e.to_string();
+                            if err_text.to_lowercase().contains("marker not found") {
+                                let step = SmartStep::new(
+                                    UiAction::KeyboardShortcut(
+                                        "c".to_string(),
+                                        vec!["command".to_string()],
+                                    ),
+                                    "Copy",
+                                );
+                                driver.add_step(step);
+                                description =
+                                    "Copied selection (textedit shortcut fallback)".to_string();
+                                action_status_override = Some("success");
+                                action_data = Some(json!({
+                                    "proof": "textedit_shortcut_copy_fallback",
+                                    "reason": err_text
+                                }));
+                            } else {
+                                description = format!("Copy failed (textedit scripted): {}", e);
+                                action_status_override = Some("failed");
+                            }
                         }
                     }
                 } else {
@@ -5319,6 +5632,7 @@ impl ActionRunner {
                 | "telegram_send"
                 | "notion_write"
                 | "n8n_create_workflow"
+                | "n8n_execute_workflow"
         );
 
         if status != "success" && (hard_fail_action || strict_fail_all_actions) {
@@ -5603,6 +5917,54 @@ mod tests {
         assert_eq!(
             ActionRunner::infer_news_topic_from_goal("스포츠 뉴스 5개 선정해서 노션에 정리해줘"),
             "스포츠"
+        );
+    }
+
+    #[test]
+    fn infer_news_item_count_respects_goal_count_and_default() {
+        assert_eq!(
+            ActionRunner::infer_news_item_count("최근 ai 트렌드 중요한거 5개 llm으로 요약해서 노션에 정리해줘"),
+            5
+        );
+        assert_eq!(
+            ActionRunner::infer_news_item_count("AI 뉴스 요약해서 노션에 정리해줘"),
+            5
+        );
+    }
+
+    #[test]
+    fn notion_blocks_embed_clickable_url_links() {
+        let blocks = ActionRunner::notion_paragraph_blocks("링크: https://example.com/a?b=1");
+        assert!(!blocks.is_empty());
+        let rich = blocks[0]["paragraph"]["rich_text"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let has_link = rich.iter().any(|seg| {
+            seg["text"]["link"]["url"]
+                .as_str()
+                .map(|u| u == "https://example.com/a?b=1")
+                .unwrap_or(false)
+        });
+        assert!(has_link, "expected a clickable rich_text link segment");
+    }
+
+    #[test]
+    fn notion_blocks_strip_trailing_punctuation_from_link_target() {
+        let blocks = ActionRunner::notion_paragraph_blocks("원문: https://example.com/path.");
+        let rich = blocks[0]["paragraph"]["rich_text"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let has_clean_link = rich.iter().any(|seg| {
+            seg["text"]["link"]["url"]
+                .as_str()
+                .map(|u| u == "https://example.com/path")
+                .unwrap_or(false)
+        });
+        assert!(
+            has_clean_link,
+            "expected trailing punctuation to be excluded from url"
         );
     }
 }

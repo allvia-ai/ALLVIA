@@ -255,12 +255,8 @@ async fn process_buffer(
 
         // 2. Hybrid Intelligence (Router)
         // Rule: Use AI if budget exists and pattern is strong.
-        // [TEMP FIX] Always use Cloud LLM until Ollama integration is complete.
-        // Original routing: let (use_local, preferred_model) = llm.route_task(&pattern.description, has_pii);
-
         let has_pii = false;
-        let (_use_local, preferred_model) = llm.route_task(&pattern.description, has_pii);
-        let use_local = false; // [TEMP] Force Cloud LLM
+        let (use_local, preferred_model) = llm.route_task(&pattern.description, has_pii);
 
         println!(
             "🤖 [Analyzer] Hybrid Intelligence: Routing to {} (Model: {})",
@@ -274,8 +270,9 @@ async fn process_buffer(
 
         let proposal_result = if use_local {
             // Local Inference (Ollama) - Not yet implemented
-            println!("   -> Skipping generation (Local LLM implementation pending in next step)");
-            continue;
+            println!("   -> Local route selected but unavailable; falling back to Cloud path.");
+            llm.generate_recommendation_from_pattern(&pattern.description, &pattern.sample_events)
+                .await
         } else {
             // Cloud Inference (OpenAI)
             // Re-use existing method

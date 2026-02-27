@@ -127,6 +127,11 @@ fn normalize_action_name(raw: &str) -> String {
             "telegram_send".to_string()
         }
         "notion_create" => "notion_write".to_string(),
+        "n8n_execute"
+        | "execute_n8n"
+        | "execute_n8n_workflow"
+        | "run_n8n_workflow"
+        | "n8n_run_workflow" => "n8n_execute_workflow".to_string(),
         other => other.to_string(),
     }
 }
@@ -396,6 +401,11 @@ pub fn normalize_action(plan: &Value) -> ActionValidation {
                 obj.insert("marker".to_string(), Value::String(marker));
             }
         }
+        "n8n_execute_workflow" => {
+            if let Some(workflow_id) = get_string_any(obj, &["workflow_id", "id", "workflow"]) {
+                obj.insert("workflow_id".to_string(), Value::String(workflow_id));
+            }
+        }
         "transfer" => {
             let from = get_string_any(obj, &["from"]);
             let to = get_string_any(obj, &["to"]);
@@ -554,5 +564,17 @@ mod tests {
             "notion_write"
         );
         assert_eq!(result.normalized["content"].as_str().unwrap(), "body");
+    }
+
+    #[test]
+    fn normalize_n8n_execute_alias() {
+        let plan = json!({"action": "run_n8n_workflow", "id": "wf_123"});
+        let result = normalize_action(&plan);
+        assert!(result.error.is_none());
+        assert_eq!(
+            result.normalized["action"].as_str().unwrap(),
+            "n8n_execute_workflow"
+        );
+        assert_eq!(result.normalized["workflow_id"].as_str().unwrap(), "wf_123");
     }
 }

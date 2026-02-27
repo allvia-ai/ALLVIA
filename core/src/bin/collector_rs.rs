@@ -104,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
     let port = std::env::var("STEER_COLLECTOR_PORT")
         .ok()
         .and_then(|v| v.parse::<u16>().ok())
-        .unwrap_or(8080);
+        .unwrap_or(9100);
 
     let privacy_salt = std::env::var("PRIVACY_SALT").unwrap_or_else(|_| "default_salt".to_string());
     let ingest_token = std::env::var("STEER_COLLECTOR_TOKEN")

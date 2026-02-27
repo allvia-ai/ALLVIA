@@ -45,11 +45,9 @@ impl Sessionizer {
 
             // Gap Check
             if let Some(last) = last_ts_val {
-                if ts - last >= self.gap_seconds {
-                    if !current_chunk.is_empty() {
-                        sessions.push(self.build_session(&current_chunk));
-                        current_chunk.clear();
-                    }
+                if ts - last >= self.gap_seconds && !current_chunk.is_empty() {
+                    sessions.push(self.build_session(&current_chunk));
+                    current_chunk.clear();
                 }
             }
 

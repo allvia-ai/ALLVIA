@@ -16,6 +16,12 @@ pub struct PolicyEngine {
     pub write_lock: bool,
 }
 
+impl Default for PolicyEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PolicyEngine {
     pub fn new() -> Self {
         Self { write_lock: true } // Default Locked
@@ -95,10 +101,10 @@ fn is_shell_command_allowed(command: &str, cwd: Option<&str>) -> bool {
     }
 
     let analysis = shell_analysis::analyze_shell_command(trimmed);
-    if analysis.has_substitution && env_bool("SHELL_ALLOW_SUBSTITUTION", false) == false {
+    if analysis.has_substitution && !env_bool("SHELL_ALLOW_SUBSTITUTION", false) {
         return false;
     }
-    if analysis.has_composites && env_bool("SHELL_ALLOW_COMPOSITES", false) == false {
+    if analysis.has_composites && !env_bool("SHELL_ALLOW_COMPOSITES", false) {
         return false;
     }
 

@@ -61,6 +61,12 @@ pub struct PatternDetector {
     llm_client: Option<std::sync::Arc<dyn LLMClient>>,
 }
 
+impl Default for PatternDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PatternDetector {
     pub fn new() -> Self {
         let llm_client = crate::llm_gateway::OpenAILLMClient::new()
@@ -177,13 +183,7 @@ impl PatternDetector {
 
         sequences
             .into_iter()
-            .filter(|(k, (count, _))| {
-                if k.starts_with("flow:") {
-                    *count >= self.config.min_occurrences
-                } else {
-                    *count >= self.config.min_occurrences
-                }
-            })
+            .filter(|(_, (count, _))| *count >= self.config.min_occurrences)
             .map(|(key, (count, samples))| {
                 let is_flow = key.starts_with("flow:");
                 let description = if is_flow {
@@ -351,9 +351,7 @@ impl PatternDetector {
                     .unwrap_or("");
 
                 // 2. Filter for App Switches
-                if (event_type == "app_switch" || event_type == "system.open")
-                    && timestamp_str.is_some()
-                {
+                if event_type == "app_switch" || event_type == "system.open" {
                     let app_name = val
                         .get("payload")
                         .or_else(|| val.get("data"))
@@ -362,7 +360,10 @@ impl PatternDetector {
                         .unwrap_or("");
 
                     if !app_name.is_empty() {
-                        if let Ok(dt) = DateTime::parse_from_rfc3339(timestamp_str.unwrap()) {
+                        let Some(ts) = timestamp_str else {
+                            continue;
+                        };
+                        if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
                             let dt_utc: DateTime<Utc> = dt.with_timezone(&Utc);
                             let weekday = dt_utc.weekday().num_days_from_monday(); // 0=Mon
                             let hour = dt_utc.hour();

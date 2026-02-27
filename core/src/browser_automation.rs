@@ -55,6 +55,12 @@ pub struct BrowserAutomation {
     last_snapshot_id: Option<String>,
 }
 
+impl Default for BrowserAutomation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BrowserAutomation {
     pub fn new() -> Self {
         Self {
@@ -247,39 +253,37 @@ impl BrowserAutomation {
             }
         }
 
-        if refs.is_empty() {
-            if peekaboo_cli::is_available() {
-                let front_app = CrossAppBridge::get_frontmost_app().ok();
-                if let Ok(snapshot) = peekaboo_cli::take_snapshot(front_app.as_deref()) {
-                    self.element_refs.clear();
-                    self.ref_counter = 0;
-                    self.last_snapshot_refs.clear();
-                    self.last_snapshot_source = SnapshotSource::Peekaboo;
-                    self.last_snapshot_id = snapshot.snapshot_id.clone();
+        if refs.is_empty() && peekaboo_cli::is_available() {
+            let front_app = CrossAppBridge::get_frontmost_app().ok();
+            if let Ok(snapshot) = peekaboo_cli::take_snapshot(front_app.as_deref()) {
+                self.element_refs.clear();
+                self.ref_counter = 0;
+                self.last_snapshot_refs.clear();
+                self.last_snapshot_source = SnapshotSource::Peekaboo;
+                self.last_snapshot_id = snapshot.snapshot_id.clone();
 
-                    for elem in snapshot.elements {
-                        let bounds = elem.bounds.map(|(x, y, w, h)| Bounds {
-                            x,
-                            y,
-                            width: w,
-                            height: h,
-                        });
-                        let elem_ref = ElementRef {
-                            id: elem.id.clone(),
-                            role: elem.role.clone(),
-                            name: elem.name.clone(),
-                            bounds,
-                        };
-                        self.element_refs.insert(elem.id.clone(), elem_ref.clone());
-                        self.last_snapshot_refs.push(elem_ref.clone());
-                        refs.push(elem_ref);
-                    }
-                    println!(
-                        "📸 [Browser] Snapshot captured via Peekaboo: {} elements",
-                        refs.len()
-                    );
-                    return Ok(refs);
+                for elem in snapshot.elements {
+                    let bounds = elem.bounds.map(|(x, y, w, h)| Bounds {
+                        x,
+                        y,
+                        width: w,
+                        height: h,
+                    });
+                    let elem_ref = ElementRef {
+                        id: elem.id.clone(),
+                        role: elem.role.clone(),
+                        name: elem.name.clone(),
+                        bounds,
+                    };
+                    self.element_refs.insert(elem.id.clone(), elem_ref.clone());
+                    self.last_snapshot_refs.push(elem_ref.clone());
+                    refs.push(elem_ref);
                 }
+                println!(
+                    "📸 [Browser] Snapshot captured via Peekaboo: {} elements",
+                    refs.len()
+                );
+                return Ok(refs);
             }
         }
 
@@ -527,22 +531,6 @@ pub fn get_browser_automation() -> std::sync::MutexGuard<'static, BrowserAutomat
     BROWSER_AUTOMATION.lock().unwrap()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_bounds_center() {
-        let bounds = Bounds {
-            x: 100,
-            y: 200,
-            width: 50,
-            height: 30,
-        };
-        assert_eq!(bounds.center(), (125, 215));
-    }
-}
-
 // =====================================================
 // LEGACY API COMPATIBILITY (for execution_controller.rs)
 // =====================================================
@@ -637,4 +625,20 @@ pub fn extract_flight_summary() -> Result<String> {
 /// Extract shopping summary - legacy API (stub)
 pub fn extract_shopping_summary() -> Result<String> {
     Ok("Shopping summary extraction: Use take_snapshot() + find_by_name()".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bounds_center() {
+        let bounds = Bounds {
+            x: 100,
+            y: 200,
+            width: 50,
+            height: 30,
+        };
+        assert_eq!(bounds.center(), (125, 215));
+    }
 }

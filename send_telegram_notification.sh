@@ -67,12 +67,14 @@ validate_report_message() {
     local has_workflow_header
     local has_result_header
     local has_success_word
+    local has_failure_word
 
     has_status=0
     has_evidence_header=0
     has_workflow_header=0
     has_result_header=0
     has_success_word=0
+    has_failure_word=0
     if printf '%s\n' "$text" | grep -Eq "^상태:[[:space:]]*(✅|❌)"; then
         has_status=1
     fi
@@ -82,11 +84,14 @@ validate_report_message() {
     if printf '%s\n' "$text" | grep -Eq "^🔄[[:space:]]*워크플로우"; then
         has_workflow_header=1
     fi
-    if printf '%s\n' "$text" | grep -Eq "^✅[[:space:]]*결과"; then
+    if printf '%s\n' "$text" | grep -Eq "^[✅❌][[:space:]]*결과"; then
         has_result_header=1
     fi
     if printf '%s\n' "$text" | grep -Eq "문제 없음 -> 성공|완료 판정되었습니다"; then
         has_success_word=1
+    fi
+    if printf '%s\n' "$text" | grep -Eq "실패 요약|주요 실패원인|재실행 가이드|실패 판정"; then
+        has_failure_word=1
     fi
     evidence_count="$(printf '%s\n' "$text" | grep -Ec "^- ")"
     evidence_count="${evidence_count:-0}"
@@ -95,8 +100,8 @@ validate_report_message() {
     if [ "$has_status" -eq 1 ] && [ "$has_evidence_header" -eq 1 ] && [ "$evidence_count" -ge 3 ]; then
         return 0
     fi
-    # Compact success format (workflow + result) is also valid.
-    if [ "$has_workflow_header" -eq 1 ] && [ "$has_result_header" -eq 1 ] && [ "$has_success_word" -eq 1 ]; then
+    # Compact report format (workflow + result) is valid for success/failure.
+    if [ "$has_workflow_header" -eq 1 ] && [ "$has_result_header" -eq 1 ] && { [ "$has_success_word" -eq 1 ] || [ "$has_failure_word" -eq 1 ]; }; then
         return 0
     fi
 

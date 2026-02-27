@@ -1278,12 +1278,7 @@ fn discover_shared_steer_db() -> Option<PathBuf> {
         candidates.push(cwd.join("..").join("core").join("steer.db"));
     }
 
-    for path in candidates {
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    None
+    candidates.into_iter().find(|path| path.is_file())
 }
 
 fn ensure_column_exists(
@@ -1541,6 +1536,7 @@ fn compute_confidence(
     support as f64 * (1.0 + recency_bonus) * (1.0 + periodicity_bonus)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_handoff_payload(
     conn: &Connection,
     rules: &HandoffPrivacyRules,

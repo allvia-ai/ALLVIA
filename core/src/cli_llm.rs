@@ -20,6 +20,7 @@ pub enum LLMProvider {
 }
 
 impl LLMProvider {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "codex" => Some(Self::Codex),
@@ -141,7 +142,7 @@ impl CLILLMClient {
         let use_stdin = match self.provider {
             LLMProvider::Codex => {
                 let model = Self::codex_model();
-                cmd.args(&[
+                cmd.args([
                     "exec",
                     "-m",
                     &model,
@@ -159,12 +160,12 @@ impl CLILLMClient {
                 // We must use positional argument with --sandbox.
                 // ARG_MAX is ~1MB on macOS, usually sufficient for resized screenshots (100-400KB).
                 cmd.arg("--sandbox");
-                cmd.args(&["--output-format", "json"]);
+                cmd.args(["--output-format", "json"]);
                 cmd.arg(prompt);
                 false
             }
             LLMProvider::Claude => {
-                cmd.args(&["--dangerously-skip-permissions", "-p", "-"]);
+                cmd.args(["--dangerously-skip-permissions", "-p", "-"]);
                 true
             }
         };
@@ -363,7 +364,7 @@ impl CLILLMClient {
         let use_stdin = match self.provider {
             LLMProvider::Codex => {
                 let model = Self::codex_model();
-                cmd.args(&[
+                cmd.args([
                     "exec",
                     "-m",
                     &model,
@@ -382,7 +383,7 @@ impl CLILLMClient {
                 false
             }
             LLMProvider::Claude => {
-                cmd.args(&["--dangerously-skip-permissions", "-p", "-"]);
+                cmd.args(["--dangerously-skip-permissions", "-p", "-"]);
                 true
             }
         };

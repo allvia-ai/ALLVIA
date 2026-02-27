@@ -59,6 +59,12 @@ pub struct TemplateMatcher {
     templates: Vec<Template>,
 }
 
+impl Default for TemplateMatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TemplateMatcher {
     pub fn new() -> Self {
         use crate::pattern_detector::PatternType::*;
@@ -339,6 +345,6 @@ mod tests {
         assert!(proposal.is_some());
         let p = proposal.unwrap();
         assert_eq!(p.title, "Email Follow-Up Reminder");
-        assert!(p.evidence.len() > 0);
+        assert!(!p.evidence.is_empty());
     }
 }

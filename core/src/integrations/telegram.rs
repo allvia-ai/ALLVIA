@@ -10,8 +10,6 @@ pub struct TelegramBot {
 }
 
 impl TelegramBot {
-    const MAX_SEND_ATTEMPTS: u32 = 4;
-
     pub fn new(token: &str, chat_id: &str) -> Self {
         Self {
             token: token.to_string(),
@@ -53,7 +51,7 @@ impl TelegramBot {
             &self.chat_id,
             message,
             parse_mode,
-            Self::MAX_SEND_ATTEMPTS,
+            telegram_transport::DEFAULT_MAX_SEND_ATTEMPTS,
         )
         .await
     }

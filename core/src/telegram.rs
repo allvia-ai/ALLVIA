@@ -40,7 +40,13 @@ struct Chat {
 #[derive(Serialize, Deserialize, Debug)]
 struct GetUpdatesResponse {
     ok: bool,
-    result: Vec<Update>,
+    result: Option<Vec<Update>>,
+}
+
+#[derive(Deserialize, Debug)]
+struct TelegramApiStatusResponse {
+    ok: bool,
+    description: Option<String>,
 }
 
 pub struct TelegramBot {
@@ -52,13 +58,91 @@ pub struct TelegramBot {
     tx_analyzer: Option<mpsc::Sender<String>>,
 }
 
+#[derive(Debug, Default, Clone)]
+struct RunResultContext {
+    links: Vec<String>,
+    highlights: Vec<String>,
+}
+
 impl TelegramBot {
+    fn env_truthy_default(key: &str, default_value: bool) -> bool {
+        match std::env::var(key) {
+            Ok(v) => matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            ),
+            Err(_) => default_value,
+        }
+    }
+
+    fn is_webhook_conflict_error(msg: &str) -> bool {
+        let lower = msg.to_ascii_lowercase();
+        (lower.contains("409") && lower.contains("conflict"))
+            || (lower.contains("webhook") && lower.contains("active"))
+            || lower.contains("can't use getupdates")
+    }
+
     fn task_timeout_sec() -> u64 {
         std::env::var("STEER_TELEGRAM_TASK_TIMEOUT_SEC")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map(|v| v.clamp(30, 1800))
             .unwrap_or(240)
+    }
+
+    fn infer_n8n_digest_request(message: &str) -> Option<String> {
+        if let Some(explicit) = crate::ai_digest::extract_explicit_n8n_request(message) {
+            return Some(explicit);
+        }
+        if !Self::env_truthy_default("STEER_TELEGRAM_AUTO_ROUTE_AI_DIGEST", true) {
+            return None;
+        }
+        if !crate::ai_digest::looks_like_ai_digest_request(message) {
+            return None;
+        }
+        if crate::ai_digest::resolve_program_webhook_url().is_err() {
+            return None;
+        }
+        let cleaned = crate::ai_digest::strip_local_execution_prefix(message);
+        if cleaned.trim().is_empty() {
+            Some(crate::ai_digest::default_request_text().to_string())
+        } else {
+            Some(cleaned)
+        }
+    }
+
+    async fn delete_webhook(&self, drop_pending_updates: bool) -> Result<()> {
+        let drop_param = if drop_pending_updates {
+            "true"
+        } else {
+            "false"
+        };
+        let url = format!(
+            "https://api.telegram.org/bot{}/deleteWebhook?drop_pending_updates={}",
+            self.token, drop_param
+        );
+        let resp = self.client.get(&url).send().await?;
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "deleteWebhook failed (status={}): {}",
+                status,
+                body_text
+            ));
+        }
+        let parsed: TelegramApiStatusResponse = serde_json::from_str(&body_text).map_err(|e| {
+            anyhow::anyhow!("deleteWebhook parse failed: {} (body={})", e, body_text)
+        })?;
+        if !parsed.ok {
+            return Err(anyhow::anyhow!(
+                "deleteWebhook returned ok=false: {}",
+                parsed
+                    .description
+                    .unwrap_or_else(|| "unknown error".to_string())
+            ));
+        }
+        Ok(())
     }
 
     fn run_semaphore() -> Arc<Semaphore> {
@@ -121,7 +205,16 @@ impl TelegramBot {
 
     pub async fn start_polling(self: Arc<Self>) {
         info!("🤖 Telegram Bot started. Waiting for messages...");
+        let auto_clear_webhook =
+            Self::env_truthy_default("STEER_TELEGRAM_CLEAR_WEBHOOK_ON_POLL", true);
+        if auto_clear_webhook {
+            match self.delete_webhook(false).await {
+                Ok(_) => info!("ℹ️ Telegram webhook cleared for long polling."),
+                Err(e) => error!("⚠️ Telegram webhook clear failed: {}", e),
+            }
+        }
         let mut offset = 0;
+        let mut last_webhook_reset: Option<std::time::Instant> = None;
 
         loop {
             match self.get_updates(offset).await {
@@ -135,9 +228,9 @@ impl TelegramBot {
                                     let bot_clone = self.clone();
                                     let chat_id = msg.chat.id;
                                     let text_clone = text.clone();
-                                    let route_to_n8n =
-                                        crate::ai_digest::extract_explicit_n8n_request(&text)
-                                            .is_some();
+                                    let n8n_request =
+                                        Self::infer_n8n_digest_request(&text);
+                                    let route_to_n8n = n8n_request.is_some();
                                     let run_sem = Self::run_semaphore();
                                     let queued = run_sem.available_permits() == 0;
 
@@ -170,14 +263,10 @@ impl TelegramBot {
                                             }
                                         };
 
-                                        if let Some(request_text) =
-                                            crate::ai_digest::extract_explicit_n8n_request(
-                                                &text_clone,
-                                            )
-                                        {
+                                        if let Some(request_text) = n8n_request {
                                             let reply =
                                                 match crate::ai_digest::trigger_program_webhook(
-                                                    &request_text,
+                                                    request_text.trim(),
                                                     None,
                                                 )
                                                 .await
@@ -235,10 +324,14 @@ impl TelegramBot {
                                                         &outcome.run_id,
                                                     )
                                                     .unwrap_or_default();
+                                                let result_context =
+                                                    Self::collect_result_context(&session_key);
                                                 let reply = Self::build_run_report(
                                                     &outcome,
                                                     &stage_runs,
                                                     &assertions,
+                                                    &goal_text,
+                                                    &result_context,
                                                 );
                                                 let _ = bot_clone
                                                     .send_message_chunked(chat_id, &reply)
@@ -270,6 +363,19 @@ impl TelegramBot {
                                         "🚫 Ignored message from unauthorized user: {:?}",
                                         msg.from
                                     );
+                                    let _ = self
+                                        .send_message(
+                                            msg.chat.id,
+                                            "⛔️ 허용된 사용자만 이 봇을 사용할 수 있습니다.",
+                                        )
+                                        .await
+                                        .map_err(|e| {
+                                            error!(
+                                                "⚠️ Telegram unauthorized notice send failed: {}",
+                                                e
+                                            );
+                                            e
+                                        });
                                 }
                             }
                         }
@@ -277,6 +383,25 @@ impl TelegramBot {
                 }
                 Err(e) => {
                     let msg = e.to_string();
+                    if auto_clear_webhook && Self::is_webhook_conflict_error(&msg) {
+                        let should_retry_reset = last_webhook_reset
+                            .map(|ts| ts.elapsed() >= Duration::from_secs(30))
+                            .unwrap_or(true);
+                        if should_retry_reset {
+                            match self.delete_webhook(true).await {
+                                Ok(_) => info!(
+                                    "ℹ️ Telegram webhook conflict recovered (deleteWebhook drop_pending_updates=true)."
+                                ),
+                                Err(reset_err) => error!(
+                                    "⚠️ Telegram webhook conflict recovery failed: {}",
+                                    reset_err
+                                ),
+                            }
+                            last_webhook_reset = Some(std::time::Instant::now());
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        continue;
+                    }
                     // Long-poll timeout can happen on unstable networks.
                     // Treat it as a soft timeout so next poll starts quickly.
                     if msg.to_ascii_lowercase().contains("timed out") {
@@ -298,14 +423,29 @@ impl TelegramBot {
             self.token, offset, self.poll_timeout_sec
         );
         let resp = self.client.get(&url).send().await?;
-        if !resp.status().is_success() {
-            return Err(anyhow::anyhow!("Telegram API Error: {}", resp.status()));
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "Telegram API Error: {} ({})",
+                status,
+                body_text
+            ));
         }
-        let body: GetUpdatesResponse = resp.json().await?;
+        let body: GetUpdatesResponse = serde_json::from_str(&body_text).map_err(|e| {
+            anyhow::anyhow!(
+                "Telegram getUpdates decode failed: {} (body={})",
+                e,
+                body_text
+            )
+        })?;
         if !body.ok {
-            return Err(anyhow::anyhow!("Telegram API returned ok=false"));
+            return Err(anyhow::anyhow!(
+                "Telegram API returned ok=false: {}",
+                body_text
+            ));
         }
-        Ok(body.result)
+        Ok(body.result.unwrap_or_default())
     }
 
     pub async fn send_message(&self, chat_id: i64, text: &str) -> Result<()> {
@@ -336,6 +476,8 @@ impl TelegramBot {
         outcome: &RunGoalOutcome,
         stage_runs: &[crate::db::TaskStageRunRecord],
         assertions: &[crate::db::TaskStageAssertionRecord],
+        goal: &str,
+        result_context: &RunResultContext,
     ) -> String {
         fn truncate_chars(s: &str, max_chars: usize) -> String {
             let mut out = String::new();
@@ -350,6 +492,32 @@ impl TelegramBot {
         }
 
         let summary = outcome.summary.clone().unwrap_or_else(|| "n/a".to_string());
+
+        if outcome.business_complete {
+            let mut lines = Vec::new();
+            lines.push("상태: ✅ 성공".to_string());
+            lines.push(format!("요청: {}", truncate_chars(goal.trim(), 120)));
+            if !summary.is_empty() && summary != "n/a" {
+                lines.push(format!("결과: {}", truncate_chars(&summary, 160)));
+            }
+            if !result_context.highlights.is_empty() {
+                lines.push("핵심 요약:".to_string());
+                for item in result_context.highlights.iter().take(5) {
+                    lines.push(format!("- {}", truncate_chars(item, 240)));
+                }
+            }
+            if !result_context.links.is_empty() {
+                lines.push("노션 링크:".to_string());
+                for link in result_context.links.iter().take(4) {
+                    lines.push(format!("- {}", link));
+                }
+            }
+            lines.push(format!("run_id: {}", outcome.run_id));
+            lines.push("다음 조치:".to_string());
+            lines.push("- 추가 요청 실행 가능".to_string());
+            return lines.join("\n");
+        }
+
         let mut latest_stage_map: BTreeMap<(i64, String), crate::db::TaskStageRunRecord> =
             BTreeMap::new();
         for stage in stage_runs {
@@ -432,11 +600,11 @@ impl TelegramBot {
         } else if failed_assertions.is_empty() {
             lines.push(format!("검증: assertions 통과 ({})", assertions.len()));
         } else {
-            lines.push(format!(
-                "검증: assertions 실패 {}/{}",
-                failed_assertions.len(),
-                assertions.len()
-            ));
+        lines.push(format!(
+            "검증: assertions 실패 {}/{}",
+            failed_assertions.len(),
+            assertions.len()
+        ));
             lines.push("실패 근거:".to_string());
             for assertion in failed_assertions.iter().take(6) {
                 let evidence = assertion.evidence.clone().unwrap_or_default();
@@ -460,6 +628,13 @@ impl TelegramBot {
             }
         }
 
+        if !result_context.links.is_empty() {
+            lines.push("결과 링크:".to_string());
+            for link in result_context.links.iter().take(4) {
+                lines.push(format!("- {}", link));
+            }
+        }
+
         lines.push("다음 조치:".to_string());
         if outcome.business_complete {
             lines.push("- 추가 요청 실행 가능".to_string());
@@ -469,6 +644,157 @@ impl TelegramBot {
         }
 
         lines.join("\n")
+    }
+
+    fn collect_result_context(session_key: &str) -> RunResultContext {
+        if session_key.trim().is_empty() {
+            return RunResultContext::default();
+        }
+        let _ = crate::session_store::init_session_store();
+        let guard = match crate::session_store::get_session_store() {
+            Ok(g) => g,
+            Err(_) => return RunResultContext::default(),
+        };
+        let store = match guard.as_ref() {
+            Some(s) => s,
+            None => return RunResultContext::default(),
+        };
+        let session = match store.get_latest_by_key(session_key) {
+            Some(s) => s,
+            None => return RunResultContext::default(),
+        };
+        Self::extract_result_context_from_steps(&session.steps)
+    }
+
+    fn extract_result_context_from_steps(
+        steps: &[crate::session_store::SessionStep],
+    ) -> RunResultContext {
+        let mut ctx = RunResultContext {
+            links: Self::extract_result_links_from_steps(steps),
+            highlights: Vec::new(),
+        };
+
+        for step in steps.iter().rev() {
+            if !step.action_type.eq_ignore_ascii_case("notion_write") {
+                continue;
+            }
+            if let Some(data) = step.data.as_ref() {
+                if let Some(preview) = data.get("content_preview").and_then(|v| v.as_str()) {
+                    ctx.highlights = Self::extract_news_highlights_from_preview(preview);
+                }
+            }
+            break;
+        }
+
+        ctx
+    }
+
+    fn extract_result_links_from_steps(
+        steps: &[crate::session_store::SessionStep],
+    ) -> Vec<String> {
+        fn push_http_link(out: &mut Vec<String>, raw: &str) {
+            let candidate = raw
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'' || c == '`');
+            if !(candidate.starts_with("https://") || candidate.starts_with("http://")) {
+                return;
+            }
+            if !out.iter().any(|v| v.eq_ignore_ascii_case(candidate)) {
+                out.push(candidate.to_string());
+            }
+        }
+
+        let mut links = Vec::new();
+        for step in steps.iter().rev() {
+            if let Some(data) = step.data.as_ref() {
+                for key in ["page_url", "workflow_url", "execution_url", "run_url"] {
+                    if let Some(url) = data.get(key).and_then(|v| v.as_str()) {
+                        push_http_link(&mut links, url);
+                    }
+                }
+            }
+
+            if let Some(url) = step.description.strip_prefix("Notion page created: ") {
+                push_http_link(&mut links, url);
+            }
+        }
+        links
+    }
+
+    fn extract_news_highlights_from_preview(preview: &str) -> Vec<String> {
+        fn trim_title_line(line: &str) -> Option<String> {
+            let trimmed = line.trim();
+            let (num, rest) = trimmed.split_once('.')?;
+            if !num.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            let title = rest.trim();
+            if title.is_empty() {
+                None
+            } else {
+                Some(title.to_string())
+            }
+        }
+
+        fn shorten(s: &str, max_chars: usize) -> String {
+            let mut out = String::new();
+            for (idx, ch) in s.chars().enumerate() {
+                if idx >= max_chars {
+                    out.push_str("...");
+                    break;
+                }
+                out.push(ch);
+            }
+            out
+        }
+
+        let lines: Vec<&str> = preview.lines().collect();
+        let mut highlights = Vec::new();
+        let mut idx = 0usize;
+
+        while idx < lines.len() && highlights.len() < 5 {
+            let current = lines[idx].trim();
+            let Some(title) = trim_title_line(current) else {
+                idx += 1;
+                continue;
+            };
+
+            let mut link = String::new();
+            let mut core = String::new();
+            let mut j = idx + 1;
+            while j < lines.len() {
+                let next = lines[j].trim();
+                if next.is_empty() || trim_title_line(next).is_some() {
+                    break;
+                }
+                if link.is_empty() {
+                    if let Some(v) = next.strip_prefix("링크:") {
+                        link = v.trim().to_string();
+                    }
+                }
+                if core.is_empty() {
+                    if let Some(v) = next.strip_prefix("- 핵심:") {
+                        core = v.trim().to_string();
+                    }
+                }
+                j += 1;
+            }
+
+            let mut bullet = title;
+            if !core.is_empty() {
+                bullet.push_str(" — ");
+                bullet.push_str(&core);
+            }
+            if !link.is_empty() {
+                bullet.push_str(" (");
+                bullet.push_str(&link);
+                bullet.push(')');
+            }
+            highlights.push(shorten(&bullet, 260));
+            idx = j.max(idx + 1);
+        }
+
+        highlights
     }
 
     pub async fn improve_message(&self, raw_text: &str) -> String {
@@ -536,5 +862,84 @@ impl TelegramBot {
             (None, _) => true,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TelegramBot;
+    use chrono::Utc;
+    use serde_json::json;
+
+    #[test]
+    fn webhook_conflict_detector_matches_telegram_conflict_messages() {
+        assert!(TelegramBot::is_webhook_conflict_error(
+            "Telegram API Error: 409 Conflict: terminated by other getUpdates request"
+        ));
+        assert!(TelegramBot::is_webhook_conflict_error(
+            "Conflict: can't use getUpdates method while webhook is active"
+        ));
+        assert!(!TelegramBot::is_webhook_conflict_error(
+            "Telegram API Error: 401 Unauthorized"
+        ));
+    }
+
+    #[test]
+    fn extract_result_context_from_steps_includes_notion_page_url() {
+        let steps = vec![crate::session_store::SessionStep {
+            step_index: 0,
+            action_type: "notion_write".to_string(),
+            description: "Notion page created: https://www.notion.so/abcd1234".to_string(),
+            status: "success".to_string(),
+            timestamp: Utc::now(),
+            data: Some(json!({
+                "page_id": "abcd1234",
+                "page_url": "https://www.notion.so/abcd1234",
+                "content_preview": "AI 뉴스 기사 요약\n1. 제목 A\n링크: https://example.com/a\n요약:\n- 핵심: 요약 A"
+            })),
+        }];
+        let ctx = TelegramBot::extract_result_context_from_steps(&steps);
+        assert_eq!(ctx.links, vec!["https://www.notion.so/abcd1234".to_string()]);
+        assert!(!ctx.highlights.is_empty());
+    }
+
+    #[test]
+    fn infer_n8n_digest_request_auto_routes_news_to_notion() {
+        std::env::remove_var("STEER_TELEGRAM_AUTO_ROUTE_AI_DIGEST");
+        std::env::set_var(
+            "STEER_AI_DIGEST_PROGRAM_WEBHOOK_URL",
+            "http://127.0.0.1:5678/webhook/test/programtrigger/ai-digest-program",
+        );
+        let routed = TelegramBot::infer_n8n_digest_request(
+            "최근 ai 트렌드 중요한거 5개 llm으로 요약해서 노션에 정리해줘",
+        );
+        assert!(routed.is_some());
+        std::env::remove_var("STEER_AI_DIGEST_PROGRAM_WEBHOOK_URL");
+    }
+
+    #[test]
+    fn build_run_report_includes_result_links_section() {
+        let outcome = crate::controller::planner::RunGoalOutcome {
+            run_id: "surf_test_1".to_string(),
+            planner_complete: true,
+            execution_complete: true,
+            business_complete: true,
+            status: "business_completed".to_string(),
+            summary: Some("ok".to_string()),
+        };
+        let ctx = super::RunResultContext {
+            links: vec!["https://www.notion.so/abcd1234".to_string()],
+            highlights: vec!["제목 A — 요약 A (https://example.com/a)".to_string()],
+        };
+        let report = TelegramBot::build_run_report(
+            &outcome,
+            &[],
+            &[],
+            "최근 ai 트렌드 중요한거 5개 llm으로 요약해서 노션에 정리해줘",
+            &ctx,
+        );
+        assert!(report.contains("노션 링크:"));
+        assert!(report.contains("https://www.notion.so/abcd1234"));
+        assert!(report.contains("핵심 요약:"));
     }
 }

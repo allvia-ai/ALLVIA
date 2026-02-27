@@ -77,7 +77,7 @@ pub async fn ensure_running() -> bool {
     eprintln!(
         "🦙 [llama_local] Starting llama-server on port {} with {}...",
         port,
-        model_path.split('/').last().unwrap_or(&model_path)
+        model_path.split('/').next_back().unwrap_or(&model_path)
     );
 
     // GPU layers: -1 = offload all layers to Metal

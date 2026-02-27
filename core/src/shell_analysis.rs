@@ -35,12 +35,10 @@ fn split_segments(command: &str) -> Vec<String> {
     let mut chars = command.chars().peekable();
 
     while let Some(ch) = chars.next() {
-        if ch == '&' {
-            if chars.peek() == Some(&'&') {
-                chars.next();
-                push_segment(&mut segments, &mut buffer);
-                continue;
-            }
+        if ch == '&' && chars.peek() == Some(&'&') {
+            chars.next();
+            push_segment(&mut segments, &mut buffer);
+            continue;
         }
         if ch == '|' {
             if chars.peek() == Some(&'|') {

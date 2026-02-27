@@ -84,6 +84,12 @@ fn should_fallback_to_native_type(err_text: &str) -> bool {
         || lower.contains("not allowed to send keystrokes")
 }
 
+impl Default for VisualDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VisualDriver {
     pub fn new() -> Self {
         Self { steps: Vec::new() }
@@ -210,22 +216,19 @@ impl VisualDriver {
 
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-            match Self::capture_image_internal() {
-                Ok(new_img) => {
-                    let diff = Self::calculate_diff(&prev_img, &new_img);
-                    if diff < threshold {
-                        consecutive_stable_frames += 1;
-                        if consecutive_stable_frames >= required_stable_frames {
-                            info!("      ⚡️ UI Settled (Ready).");
-                            return Ok(true);
-                        }
-                    } else {
-                        consecutive_stable_frames = 0;
-                        info!("      🌊 UI Moving ({:.1}% diff)...", diff * 100.0);
+            if let Ok(new_img) = Self::capture_image_internal() {
+                let diff = Self::calculate_diff(&prev_img, &new_img);
+                if diff < threshold {
+                    consecutive_stable_frames += 1;
+                    if consecutive_stable_frames >= required_stable_frames {
+                        info!("      ⚡️ UI Settled (Ready).");
+                        return Ok(true);
                     }
-                    prev_img = new_img;
+                } else {
+                    consecutive_stable_frames = 0;
+                    info!("      🌊 UI Moving ({:.1}% diff)...", diff * 100.0);
                 }
-                Err(_) => {}
+                prev_img = new_img;
             }
         }
     }

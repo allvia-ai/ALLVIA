@@ -101,25 +101,25 @@ pub fn verify_shell_action(action: &ShellAction, result: &str, workdir: &str) ->
                 reason: "build_success".to_string(),
             });
         } else if item.starts_with("files_exist:") {
-            let path = item.splitn(2, ':').nth(1).unwrap_or("");
+            let path = item.split_once(':').map(|x| x.1).unwrap_or("");
             verdicts.push(VerifyVerdict {
                 ok: files_exist(workdir, path),
                 reason: format!("files_exist:{}", path),
             });
         } else if item.starts_with("files_not_empty:") {
-            let path = item.splitn(2, ':').nth(1).unwrap_or("");
+            let path = item.split_once(':').map(|x| x.1).unwrap_or("");
             verdicts.push(VerifyVerdict {
                 ok: files_not_empty(workdir, path),
                 reason: format!("files_not_empty:{}", path),
             });
         } else if item.starts_with("files_no_hidden:") {
-            let path = item.splitn(2, ':').nth(1).unwrap_or("");
+            let path = item.split_once(':').map(|x| x.1).unwrap_or("");
             verdicts.push(VerifyVerdict {
                 ok: files_no_hidden(workdir, path),
                 reason: format!("files_no_hidden:{}", path),
             });
         } else if item.starts_with("files_match_listing:") {
-            let path = item.splitn(2, ':').nth(1).unwrap_or("");
+            let path = item.split_once(':').map(|x| x.1).unwrap_or("");
             verdicts.push(VerifyVerdict {
                 ok: files_match_listing(workdir, path),
                 reason: format!("files_match_listing:{}", path),

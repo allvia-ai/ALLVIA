@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 CORE_DIR="$ROOT_DIR/core"
 BIN_PATH="$CORE_DIR/target/debug/local_os_agent"
+RUNTIME_PROFILE="${STEER_RUNTIME_PROFILE:-dev}"
 
 LOG_DIR="$HOME/.local-os-agent"
 LOG_PATH="$LOG_DIR/manual_agent.log"
@@ -14,6 +15,18 @@ LOCK_DIR="$HOME/.steer/locks"
 
 API_STATUS_URL="http://127.0.0.1:5680/api/status"
 API_PREFLIGHT_URL="http://127.0.0.1:5680/api/agent/preflight"
+
+resolve_api_allow_no_key() {
+  if [[ "$RUNTIME_PROFILE" == "prod" ]]; then
+    if [[ -z "${STEER_API_KEY:-}" ]]; then
+      echo "❌ prod profile requires STEER_API_KEY"
+      exit 1
+    fi
+    echo "0"
+    return
+  fi
+  echo "${STEER_API_ALLOW_NO_KEY:-1}"
+}
 
 fail_with_logs() {
   echo "❌ Runtime recovery failed."
@@ -58,11 +71,19 @@ stop_conflicting_processes() {
 
   pkill -f "[l]ocal_os_agent" 2>/dev/null || true
   pkill -f "/target/.*/core($| )" 2>/dev/null || true
+  sleep 2
+  pkill -9 -f "[l]ocal_os_agent" 2>/dev/null || true
+  pkill -9 -f "/target/.*/core($| )" 2>/dev/null || true
 
   local port_pids
   port_pids="$(lsof -ti tcp:5680 2>/dev/null || true)"
   if [[ -n "$port_pids" ]]; then
     kill $port_pids 2>/dev/null || true
+    sleep 1
+    port_pids="$(lsof -ti tcp:5680 2>/dev/null || true)"
+    if [[ -n "$port_pids" ]]; then
+      kill -9 $port_pids 2>/dev/null || true
+    fi
   fi
   sleep 1
 }
@@ -94,15 +115,16 @@ cleanup_stale_locks
 echo "[4/6] Starting local agent in background..."
 mkdir -p "$LOG_DIR"
 : >"$LOG_PATH"
+API_ALLOW_NO_KEY="$(resolve_api_allow_no_key)"
 if command -v setsid >/dev/null 2>&1; then
   nohup setsid env \
-    STEER_API_ALLOW_NO_KEY=1 \
+    STEER_API_ALLOW_NO_KEY="$API_ALLOW_NO_KEY" \
     STEER_DISABLE_EVENT_TAP=1 \
     STEER_COLLECTOR_HANDOFF_AUTOCONSUME=0 \
     "$BIN_PATH" >"$LOG_PATH" 2>&1 < /dev/null &
 else
   nohup env \
-    STEER_API_ALLOW_NO_KEY=1 \
+    STEER_API_ALLOW_NO_KEY="$API_ALLOW_NO_KEY" \
     STEER_DISABLE_EVENT_TAP=1 \
     STEER_COLLECTOR_HANDOFF_AUTOCONSUME=0 \
     "$BIN_PATH" >"$LOG_PATH" 2>&1 < /dev/null &

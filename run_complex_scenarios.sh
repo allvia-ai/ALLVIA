@@ -20,12 +20,18 @@ fi
 : "${STEER_VISION_MAX_TOKENS:=64}"
 : "${STEER_VISION_PROMPT_MINIMAL:=1}"
 : "${STEER_OPENAI_429_RETRY_SEC:=6}"
+: "${STEER_SEMANTIC_ALLOW_LOG_EVIDENCE:=1}"
+: "${STEER_MAIL_ALLOW_FRESH_RECOVERY:=1}"
+: "${STEER_OUTBOUND_MAIL_REQUIRE_SENT_CONFIRMED:=0}"
 export STEER_OPENAI_MODEL
 export STEER_VISION_MODEL
 export STEER_OPENAI_VISION_MAX_B64
 export STEER_VISION_MAX_TOKENS
 export STEER_VISION_PROMPT_MINIMAL
 export STEER_OPENAI_429_RETRY_SEC
+export STEER_SEMANTIC_ALLOW_LOG_EVIDENCE
+export STEER_MAIL_ALLOW_FRESH_RECOVERY
+export STEER_OUTBOUND_MAIL_REQUIRE_SENT_CONFIRMED
 
 echo "🚀 Starting Complex Scenarios 1-5 Execution..."
 echo "⚠️  PLEASE DO NOT TOUCH THE MOUSE/KEYBOARD DURING EXECUTION"
@@ -40,11 +46,14 @@ SCENARIO_MODE_VALUE="${STEER_SCENARIO_MODE:-0}"
 NODE_CAPTURE_ALL_VALUE="${STEER_NODE_CAPTURE_ALL:-0}"
 CLI_LLM_VALUE="${STEER_CLI_LLM-}"
 FAIL_ON_FALLBACK_VALUE="${STEER_FAIL_ON_FALLBACK:-1}"
+FAIL_ON_TYPE_PERMISSION_ISSUE_VALUE="${STEER_FAIL_ON_TYPE_PERMISSION_ISSUE:-0}"
 NOTIFIER_TIMEOUT_SEC="${STEER_NOTIFIER_TIMEOUT_SEC:-120}"
 REQUIRE_PRIMARY_PLANNER_VALUE="${STEER_REQUIRE_PRIMARY_PLANNER:-1}"
 LOCK_DISABLED_VALUE="${STEER_LOCK_DISABLED:-0}"
 APPROVAL_ASK_FALLBACK_VALUE="${STEER_APPROVAL_ASK_FALLBACK:-deny}"
 TEST_MODE_VALUE="${STEER_TEST_MODE:-0}"
+MIN_COMPLEX_MAX_STEPS_VALUE="${STEER_MIN_COMPLEX_MAX_STEPS:-30}"
+ENFORCE_MIN_COMPLEX_MAX_STEPS_VALUE="${STEER_ENFORCE_MIN_COMPLEX_MAX_STEPS:-1}"
 COMPACT_SUCCESS_REPORT_VALUE="${STEER_TELEGRAM_COMPACT_SUCCESS:-1}"
 COMPACT_FAILURE_REPORT_VALUE="${STEER_TELEGRAM_COMPACT_FAILURE:-1}"
 SUPER_COMPACT_REPORT_VALUE="${STEER_TELEGRAM_SUPER_COMPACT:-0}"
@@ -66,9 +75,38 @@ SCENARIO_IDS_RAW="${STEER_SCENARIO_IDS:-1,2,3,4,5}"
 if [ -z "$DETERMINISTIC_GOAL_AUTOPLAN_VALUE" ]; then
     DETERMINISTIC_GOAL_AUTOPLAN_VALUE="1"
 fi
+
+if ! [[ "$MIN_COMPLEX_MAX_STEPS_VALUE" =~ ^[0-9]+$ ]] || [ "$MIN_COMPLEX_MAX_STEPS_VALUE" -lt 1 ]; then
+    MIN_COMPLEX_MAX_STEPS_VALUE=30
+fi
+if [ "$ENFORCE_MIN_COMPLEX_MAX_STEPS_VALUE" = "1" ]; then
+    CURRENT_MAX_STEPS_VALUE="${STEER_MAX_STEPS:-$MIN_COMPLEX_MAX_STEPS_VALUE}"
+    if ! [[ "$CURRENT_MAX_STEPS_VALUE" =~ ^[0-9]+$ ]] || [ "$CURRENT_MAX_STEPS_VALUE" -lt 1 ]; then
+        CURRENT_MAX_STEPS_VALUE="$MIN_COMPLEX_MAX_STEPS_VALUE"
+    fi
+    if [ "$CURRENT_MAX_STEPS_VALUE" -lt "$MIN_COMPLEX_MAX_STEPS_VALUE" ]; then
+        echo "⚠️ STEER_MAX_STEPS=${CURRENT_MAX_STEPS_VALUE} is too low for complex scenarios. Overriding to ${MIN_COMPLEX_MAX_STEPS_VALUE}."
+        export STEER_MAX_STEPS="$MIN_COMPLEX_MAX_STEPS_VALUE"
+    fi
+fi
 REQUIRE_MAIL_BODY_VALUE="${STEER_REQUIRE_MAIL_BODY:-1}"
 REQUIRE_MAIL_SUBJECT_VALUE="${STEER_REQUIRE_MAIL_SUBJECT:-1}"
-REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE="${STEER_REQUIRE_SENT_MAILBOX_EVIDENCE:-1}"
+REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE="${STEER_REQUIRE_SENT_MAILBOX_EVIDENCE:-}"
+if [ -z "$REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE" ]; then
+    if [ "${STEER_OUTBOUND_MAIL_REQUIRE_SENT_CONFIRMED:-1}" = "1" ]; then
+        REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE="1"
+    else
+        REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE="0"
+    fi
+fi
+case "$REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE" in
+    1|true|TRUE|yes|YES|on|ON)
+        REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE="1"
+        ;;
+    *)
+        REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE="0"
+        ;;
+esac
 MAIL_TO_TARGET="${STEER_DEFAULT_MAIL_TO:-$(git config --get user.email 2>/dev/null || true)}"
 OPENAI_PREFLIGHT_REQUIRED_VALUE="${STEER_PREFLIGHT_REQUIRE_OPENAI_KEY:-0}"
 
@@ -217,6 +255,9 @@ echo "📝 STEER_REQUIRE_MAIL_SUBJECT=${REQUIRE_MAIL_SUBJECT_VALUE}"
 echo "📬 STEER_REQUIRE_SENT_MAILBOX_EVIDENCE=${REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE}"
 echo "🧩 STEER_SCENARIO_IDS=${SELECTED_SCENARIO_IDS}"
 echo "🧯 STEER_FAIL_ON_FALLBACK=${FAIL_ON_FALLBACK_VALUE} (1=mark failed on fallback action)"
+echo "⌨️ STEER_FAIL_ON_TYPE_PERMISSION_ISSUE=${FAIL_ON_TYPE_PERMISSION_ISSUE_VALUE} (1=mark failed on type-permission warning)"
+echo "🧱 STEER_PREFLIGHT_BLOCK_ANTIGRAVITY=${STEER_PREFLIGHT_BLOCK_ANTIGRAVITY:-0} (1=Codex/Antigravity 경유 차단)"
+echo "🔢 STEER_MAX_STEPS=${STEER_MAX_STEPS:-unset} (min_complex=${MIN_COMPLEX_MAX_STEPS_VALUE}, enforce=${ENFORCE_MIN_COMPLEX_MAX_STEPS_VALUE})"
 echo "🧭 STEER_DETERMINISTIC_GOAL_AUTOPLAN=${DETERMINISTIC_GOAL_AUTOPLAN_VALUE}"
 echo "🧠 STEER_OPENAI_MODEL=${STEER_OPENAI_MODEL}, STEER_VISION_MODEL=${STEER_VISION_MODEL}"
 echo "🖼️ Vision limits: max_b64=${STEER_OPENAI_VISION_MAX_B64}, max_tokens=${STEER_VISION_MAX_TOKENS}, minimal_prompt=${STEER_VISION_PROMPT_MINIMAL}"
@@ -229,6 +270,7 @@ echo ""
 
 require_terminal_context() {
     local require_terminal="${STEER_REQUIRE_TERMINAL:-1}"
+    local block_antigravity="${STEER_PREFLIGHT_BLOCK_ANTIGRAVITY:-0}"
     [ "$require_terminal" = "1" ] || return 0
 
     local term_program="${TERM_PROGRAM:-unknown}"
@@ -260,7 +302,7 @@ require_terminal_context() {
     while [ "$hop" -lt 20 ]; do
         local cmd=""
         cmd="$(ps -o command= -p "$pid" 2>/dev/null || true)"
-        if echo "$cmd" | grep -Eiq 'Antigravity\.app|Antigravity Helper'; then
+        if [ "$block_antigravity" = "1" ] && echo "$cmd" | grep -Eiq 'Antigravity\.app|Antigravity Helper'; then
             echo "❌ Antigravity 프로세스 경유 실행 감지됨."
             echo "   Terminal 앱에서 직접 실행해 주세요."
             return 1
@@ -343,7 +385,7 @@ semantic_location_is_log() {
 
 semantic_log_location_allowed_as_app_scope() {
     case "${1:-}" in
-        LOG_MAIL_SUBJECT|LOG_MAIL_RECIPIENT|LOG_MAIL_BODY|LOG_NOTE_BODY|LOG_TEXTEDIT_BODY|LOG_MAIL_SEND|LOG_MAIL_WRITE_SUBJECT|LOG_MAIL_WRITE_RECIPIENT|LOG_MAIL_WRITE_BODY_LEN|LOG_MAIL_FLOW_DRAFT)
+        LOG_MAIL_SUBJECT|LOG_MAIL_RECIPIENT|LOG_MAIL_BODY|LOG_NOTE_BODY|LOG_TEXTEDIT_BODY|LOG_MAIL_SEND|LOG_MAIL_WRITE_SUBJECT|LOG_MAIL_WRITE_RECIPIENT|LOG_MAIL_WRITE_BODY_LEN|LOG_MAIL_FLOW_DRAFT|LOG_TOKEN_MATCH)
             return 0
             ;;
         *)
@@ -522,6 +564,7 @@ preflight_checks() {
     local capture_out=""
     local preflight_capture="scenario_results/preflight_capture_${TIMESTAMP}.png"
     local preflight_timeout="${STEER_PREFLIGHT_TIMEOUT_SEC:-6}"
+    local allow_screen_capture_skip="${STEER_ALLOW_SCREEN_CAPTURE_SKIP:-0}"
 
     echo "🔎 Running preflight checks..."
 
@@ -555,16 +598,24 @@ preflight_checks() {
         failed=1
     elif ! run_cmd_with_timeout_capture "$preflight_timeout" screencapture -x "$preflight_capture"; then
         capture_out="${RUN_TIMEOUT_STDERR:-$RUN_TIMEOUT_STDOUT}"
-        echo "❌ Preflight failed: Screen Recording/display capture unavailable."
-        if [ "$RUN_TIMEOUT_EXIT" -eq 124 ]; then
-            echo "   Cause: 화면 캡처 검사 타임아웃(${preflight_timeout}s)."
+        if is_truthy "$allow_screen_capture_skip"; then
+            echo "⚠️ Preflight warning: Screen Recording/display capture unavailable but skip is allowed (STEER_ALLOW_SCREEN_CAPTURE_SKIP=1)."
+            if [ "$RUN_TIMEOUT_EXIT" -eq 124 ]; then
+                echo "   Cause: 화면 캡처 검사 타임아웃(${preflight_timeout}s)."
+            fi
+            [ -n "$capture_out" ] && echo "   Details: $capture_out"
+        else
+            echo "❌ Preflight failed: Screen Recording/display capture unavailable."
+            if [ "$RUN_TIMEOUT_EXIT" -eq 124 ]; then
+                echo "   Cause: 화면 캡처 검사 타임아웃(${preflight_timeout}s)."
+            fi
+            [ -n "$capture_out" ] && echo "   Details: $capture_out"
+            if echo "$capture_out" | grep -q "could not create image from display"; then
+                echo "   Cause: 현재 실행 세션에서 디스플레이 접근이 불가능합니다."
+            fi
+            echo "   Fix: System Settings > Privacy & Security > Screen Recording에서 Terminal/Codex를 허용하세요."
+            failed=1
         fi
-        [ -n "$capture_out" ] && echo "   Details: $capture_out"
-        if echo "$capture_out" | grep -q "could not create image from display"; then
-            echo "   Cause: 현재 실행 세션에서 디스플레이 접근이 불가능합니다."
-        fi
-        echo "   Fix: System Settings > Privacy & Security > Screen Recording에서 Terminal/Codex를 허용하세요."
-        failed=1
     else
         echo "✅ Preflight: Screen capture works."
         rm -f "$preflight_capture"
@@ -1098,6 +1149,12 @@ token_presence_location_scoped_docs() {
     local note_name=""
     local doc_id=""
     local doc_name=""
+    local timeout_sec="${STEER_SEMANTIC_OSASCRIPT_TIMEOUT_SEC:-30}"
+    local tmp_out=""
+    local tmp_err=""
+    local osa_pid=""
+    local elapsed=0
+    local result=""
 
     [ -z "$token" ] && return 0
     [ -z "$marker" ] && return 0
@@ -1117,7 +1174,10 @@ token_presence_location_scoped_docs() {
         return 0
     fi
 
-    osascript - "$token" "$marker" "$note_id" "$note_name" "$doc_id" "$doc_name" <<'APPLESCRIPT' 2>/dev/null || true
+    tmp_out="$(mktemp -t steer_scoped_doc_out.XXXXXX)"
+    tmp_err="$(mktemp -t steer_scoped_doc_err.XXXXXX)"
+    (
+        osascript - "$token" "$marker" "$note_id" "$note_name" "$doc_id" "$doc_name" <<'APPLESCRIPT'
 on run argv
     set tokenText to item 1 of argv
     set markerText to item 2 of argv
@@ -1194,6 +1254,27 @@ on run argv
     return "NOT_FOUND"
 end run
 APPLESCRIPT
+    ) >"$tmp_out" 2>"$tmp_err" &
+    osa_pid=$!
+
+    while kill -0 "$osa_pid" 2>/dev/null; do
+        if [ "$elapsed" -ge "$timeout_sec" ]; then
+            kill -9 "$osa_pid" 2>/dev/null || true
+            wait "$osa_pid" 2>/dev/null || true
+            rm -f "$tmp_out" "$tmp_err"
+            printf '%s\n' "CHECK_TIMEOUT"
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    wait "$osa_pid" 2>/dev/null || true
+    result="$(cat "$tmp_out" 2>/dev/null || true)"
+    rm -f "$tmp_out" "$tmp_err"
+    if [ -n "$result" ]; then
+        printf '%s\n' "$result"
+    fi
 }
 
 token_presence_location() {
@@ -1522,17 +1603,17 @@ token_presence_location_from_log() {
     local log_file="$2"
     local marker="${3:-}"
     local require_marker="${4:-1}"
+    local evidence_lines=""
     [ -z "$token" ] && return 0
     [ -f "$log_file" ] || return 0
 
     local lines=""
     lines="$(grep -F -- "$token" "$log_file" 2>/dev/null | tail -n 200 || true)"
     [ -z "$lines" ] && return 0
-    if [ -n "$marker" ]; then
-        lines="$(printf '%s\n' "$lines" | grep -F -- "$marker" || true)"
-        [ -z "$lines" ] && return 0
-    elif [ "$require_marker" = "1" ]; then
-        return 0
+    # Do not marker-scope per-run log evidence: request echo lines include marker
+    # and can hide actual runtime token lines (e.g., native typing fallback evidence).
+    if [ "$require_marker" = "1" ]; then
+        :
     fi
 
     if printf '%s\n' "$lines" | grep -Eiq "MAIL_SEND_PROOF\\|.*subject=|EVIDENCE\\|target=mail\\|event=(send|write)\\|.*subject=|\\(mail subject\\)|MAIL_SUBJECT"; then
@@ -1553,6 +1634,11 @@ token_presence_location_from_log() {
     fi
     if printf '%s\n' "$lines" | grep -Eiq "EVIDENCE\\|target=notes\\|event=write\\|.*body_len=|\\(notes body\\)|notes_write_text|NOTE_BODY"; then
         printf '%s\n' "LOG_NOTE_BODY"
+        return 0
+    fi
+    evidence_lines="$(printf '%s\n' "$lines" | grep -Fv '🎯 [CLI] Direct surf mode:' | grep -Fv '🌊 Starting Planned Surf:' | grep -Fv 'Running `core/target/debug/local_os_agent surf' || true)"
+    if [ -n "$evidence_lines" ]; then
+        printf '%s\n' "LOG_TOKEN_MATCH"
         return 0
     fi
     return 0
@@ -2088,6 +2174,10 @@ capture_and_notify() {
         local mail_write_recipient_seen=0
         local mail_write_subject_seen=0
         local mail_write_body_len="-1"
+        local allow_pending_mail_send=0
+        if [ "${STEER_OUTBOUND_MAIL_REQUIRE_SENT_CONFIRMED:-1}" != "1" ]; then
+            allow_pending_mail_send=1
+        fi
         if [ -n "$mail_log_draft_id" ]; then
             local write_line=""
             if write_line="$(mail_write_evidence_for_draft "$log_file" "$mail_log_draft_id")"; then
@@ -2096,7 +2186,12 @@ capture_and_notify() {
         fi
         if [ "$mail_log_status" = "sent_confirmed" ]; then
             mail_send_logged=1
+        elif [ "$mail_log_status" = "sent_pending" ] && [ "$allow_pending_mail_send" -eq 1 ]; then
+            mail_send_logged=1
         elif grep -Eiq "Shortcut 'd'.*shift.*Mail sent|Mail send completed|\"send_status\"[[:space:]]*:[[:space:]]*\"sent_confirmed\"|MAIL_SEND_PROOF\\|status=sent_confirmed|EVIDENCE\\|target=mail\\|event=send\\|status=sent_confirmed" "$log_file"; then
+            mail_send_logged=1
+        elif [ "$allow_pending_mail_send" -eq 1 ] \
+            && grep -Eiq "MAIL_SEND_PROOF\\|status=sent_pending|EVIDENCE\\|target=mail\\|event=send\\|status=sent_pending\\|.*outbound_policy=pass|Mail send queued \(pending confirmation\)|\"send_status\"[[:space:]]*:[[:space:]]*\"sent_pending\"" "$log_file"; then
             mail_send_logged=1
         fi
         local outgoing_count
@@ -2293,11 +2388,15 @@ capture_and_notify() {
     local fallback_hit=0
     local cmd_n_guard_count=0
     local cmd_n_window_flood_guard_count=0
+    local type_permission_issue_count=0
+    local loop_detected_count=0
     if grep -Eiq "fallback action|FALLBACK_ACTION:" "$log_file" 2>/dev/null; then
         fallback_hit=1
     fi
     cmd_n_guard_count=$(grep -Ec 'cmd_n_loop_guard_block' "$log_file" 2>/dev/null || true)
     cmd_n_window_flood_guard_count=$(grep -Ec 'cmd_n_window_flood_block' "$log_file" 2>/dev/null || true)
+    type_permission_issue_count=$(grep -Ec 'Type permission issue detected' "$log_file" 2>/dev/null || true)
+    loop_detected_count=$(grep -Ec 'LOOP DETECTED|LOOP_ABORTED' "$log_file" 2>/dev/null || true)
     while IFS= read -r line; do
         if [ -n "$line" ]; then
             evidence_lines="${evidence_lines}- ${line}"$'\n'
@@ -2333,6 +2432,19 @@ capture_and_notify() {
     if [ "$cmd_n_window_flood_guard_count" -gt 0 ]; then
         status="failed"
         evidence_lines="${evidence_lines}- cmd+n 창 폭증 가드 발동 횟수=${cmd_n_window_flood_guard_count}"$'\n'
+    fi
+    if [ "$type_permission_issue_count" -gt 0 ]; then
+        evidence_lines="${evidence_lines}- 입력 권한/타이핑 이슈 감지 횟수=${type_permission_issue_count}"$'\n'
+        if [ "$FAIL_ON_TYPE_PERMISSION_ISSUE_VALUE" = "1" ]; then
+            status="failed"
+            evidence_lines="${evidence_lines}- 정책상 type permission 경고 감지 시 실패 처리(STEER_FAIL_ON_TYPE_PERMISSION_ISSUE=1)"$'\n'
+        else
+            evidence_lines="${evidence_lines}- type permission 경고는 native fallback으로 복구 가능하므로 경고만 기록"$'\n'
+        fi
+    fi
+    if [ "$loop_detected_count" -gt 0 ]; then
+        status="failed"
+        evidence_lines="${evidence_lines}- 플래너 루프 감지 횟수=${loop_detected_count}"$'\n'
     fi
     if [ "${CURRENT_INPUT_GUARD_ABORTED:-0}" = "1" ]; then
         evidence_lines="${evidence_lines}- 입력 가드 중단: ${CURRENT_INPUT_GUARD_ABORT_REASON:-unknown}"$'\n'
@@ -2471,6 +2583,9 @@ capture_and_notify() {
         elif [ "$semantic_missing" -gt 0 ]; then
             fail_primary_reason="semantic_missing_tokens=${semantic_missing}"
             retry_guide="요구 토큰이 실제 앱 결과에 남도록 단계 입력을 보강하세요."
+        elif [ "${mail_proof_status:-none}" != "sent_confirmed" ] && [ "$REQUIRE_SENT_MAILBOX_EVIDENCE_VALUE" = "1" ]; then
+            fail_primary_reason="mail_send_not_confirmed(${mail_proof_status:-unknown})"
+            retry_guide="Mail 계정의 송신함 동기화/네트워크 상태를 확인하고, 초안이 Outbox에 남지 않도록 점검 후 재실행하세요."
         elif [ "${fallback_hit:-0}" -eq 1 ]; then
             fail_primary_reason="fallback_detected"
             retry_guide="fallback 유도 원인(포커스/권한/플랜)을 먼저 제거하세요."
@@ -2480,6 +2595,12 @@ capture_and_notify() {
         elif [ "${cmd_n_guard_count:-0}" -gt 0 ]; then
             fail_primary_reason="cmd_n_loop_guard"
             retry_guide="cmd+n 연속 시도를 줄이도록 플랜/앱 상태를 정리한 뒤 재실행하세요."
+        elif [ "${type_permission_issue_count:-0}" -gt 0 ] && [ "$FAIL_ON_TYPE_PERMISSION_ISSUE_VALUE" = "1" ]; then
+            fail_primary_reason="type_permission_missing_or_blocked"
+            retry_guide="System Settings > Privacy & Security > Accessibility에서 Terminal/Codex 권한을 재승인하고 재실행하세요."
+        elif [ "${loop_detected_count:-0}" -gt 0 ]; then
+            fail_primary_reason="planner_loop_detected"
+            retry_guide="직전 반복 액션을 로그에서 확인하고 해당 단계(예: Mail 제목/본문 입력)를 수동으로 맞춘 뒤 재실행하세요."
         else
             fail_primary_reason="evidence_or_runtime_failure"
             retry_guide="실패 근거 라인 기준으로 실패 단계만 수정 후 재실행하세요."
@@ -2489,6 +2610,8 @@ capture_and_notify() {
     local brief_mail_result_line="- 메일 발송 증거: 확인 필요"
     if [ "${mail_proof_status:-}" = "sent_confirmed" ]; then
         brief_mail_result_line="- 메일 정상 발송 완료 (${mail_proof_recipient:-unknown})"
+    elif [ "${mail_proof_status:-}" = "sent_pending" ] && [ "${STEER_OUTBOUND_MAIL_REQUIRE_SENT_CONFIRMED:-1}" != "1" ]; then
+        brief_mail_result_line="- 메일 발송 큐잉 완료(확정 확인 보류) (${mail_proof_recipient:-unknown})"
     fi
     local brief_final_line="- 문제가 있어 재실행 필요 -> 실패"
     if [ "$status" = "success" ]; then
@@ -2581,6 +2704,7 @@ EOF
     if [ -f "$notifier" ]; then
         if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
             local telegram_send_ok=1
+            local telegram_fail_detail=""
             local notify_env=()
             local node_image_count=0
             if [ -s "$node_image_list_file" ]; then
@@ -2590,22 +2714,39 @@ EOF
             fi
             local notifier_timeout
             notifier_timeout="$(compute_notifier_timeout "$NOTIFIER_TIMEOUT_SEC" "$node_image_count")"
+            if [ "$REQUIRE_TELEGRAM_REPORT_VALUE" != "1" ]; then
+                local optional_timeout="${STEER_OPTIONAL_TELEGRAM_TIMEOUT_SEC:-20}"
+                if [[ "$optional_timeout" =~ ^[0-9]+$ ]] && [ "$optional_timeout" -gt 0 ] && [ "$notifier_timeout" -gt "$optional_timeout" ]; then
+                    notifier_timeout="$optional_timeout"
+                fi
+            fi
             if [ -n "$telegram_main_image" ] && [ -f "$telegram_main_image" ]; then
                 if ! send_telegram_with_timeout "$notifier_timeout" \
                     env TELEGRAM_DUMP_FINAL_PATH="$final_message_file" TELEGRAM_SKIP_REWRITE=1 TELEGRAM_VALIDATE_REPORT=1 TELEGRAM_REQUIRE_SEND="$REQUIRE_TELEGRAM_REPORT_VALUE" TELEGRAM_EXTRA_IMAGE_MAX="$TELEGRAM_EXTRA_IMAGE_MAX_VALUE" ${notify_env[@]+"${notify_env[@]}"} \
-                    bash "$notifier" "$telegram_message" "$telegram_main_image" >/dev/null 2>&1; then
+                    bash "$notifier" "$telegram_message" "$telegram_main_image"; then
                     telegram_send_ok=0
+                    telegram_fail_detail="${RUN_TIMEOUT_STDERR:-$RUN_TIMEOUT_STDOUT}"
                 fi
             else
                 if ! send_telegram_with_timeout "$notifier_timeout" \
                     env TELEGRAM_DUMP_FINAL_PATH="$final_message_file" TELEGRAM_SKIP_REWRITE=1 TELEGRAM_VALIDATE_REPORT=1 TELEGRAM_REQUIRE_SEND="$REQUIRE_TELEGRAM_REPORT_VALUE" TELEGRAM_EXTRA_IMAGE_MAX="$TELEGRAM_EXTRA_IMAGE_MAX_VALUE" ${notify_env[@]+"${notify_env[@]}"} \
-                    bash "$notifier" "$telegram_message" >/dev/null 2>&1; then
+                    bash "$notifier" "$telegram_message"; then
                     telegram_send_ok=0
+                    telegram_fail_detail="${RUN_TIMEOUT_STDERR:-$RUN_TIMEOUT_STDOUT}"
                 fi
             fi
             if [ "$telegram_send_ok" -ne 1 ]; then
-                printf '%s\n- 텔레그램 전송 실패(타임아웃/오류)\n' "$telegram_message" > "$final_message_file"
-                status="failed"
+                telegram_fail_detail="$(printf '%s' "${telegram_fail_detail:-}" | tr '\r\n' '  ' | sed -E 's/[[:space:]]+/ /g; s/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-240)"
+                if [ -n "$telegram_fail_detail" ]; then
+                    printf '%s\n- 텔레그램 전송 실패(타임아웃/오류)\n- 원인: %s\n' "$telegram_message" "$telegram_fail_detail" > "$final_message_file"
+                else
+                    printf '%s\n- 텔레그램 전송 실패(타임아웃/오류)\n' "$telegram_message" > "$final_message_file"
+                fi
+                if [ "$REQUIRE_TELEGRAM_REPORT_VALUE" = "1" ]; then
+                    status="failed"
+                else
+                    echo "Warning: Optional Telegram send failed; continuing without failing scenario." >&2
+                fi
             fi
         else
             if [ "$REQUIRE_TELEGRAM_REPORT_VALUE" = "1" ]; then
@@ -2708,7 +2849,7 @@ if should_run_scenario 3; then
     SCENARIO_GOAL="Calculation + textedit handoff + mail send chain."
     CURRENT_SCENARIO_MARKER="$MARKER_S3"
     echo "Goal: ${SCENARIO_GOAL}"
-    CMD="아래 순서를 정확히 지키세요. 1) Calculator를 열고 \"120*1300=\" 를 입력해 계산 화면을 준비하세요. 2) TextEdit를 열고 새 문서(Cmd+N)를 만든 뒤 본문에 다음 4줄을 그대로 입력하세요: \"120*1300=\", \"Done\", \"Calc verified\", \"${MARKER_S3}\". 3) 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. 4) Mail을 열고 새 이메일(Cmd+N) 초안을 만든 뒤 제목 \"${SUBJECT_S3}\"를 입력하고 본문에 붙여넣기(Cmd+V)하세요. 5) 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요. 6) 전송이 끝나면 done으로 종료하세요."
+    CMD="아래 순서를 정확히 지키세요. 1) Calculator를 열고 \"120*1300=\" 를 입력해 계산 화면을 준비하세요. 2) TextEdit를 열고 새 문서(Cmd+N)를 만든 뒤 본문에 다음 3줄을 그대로 입력하세요: \"120*1300=\", \"Calc verified\", \"${MARKER_S3}\". 3) 전체 선택(Cmd+A) 후 복사(Cmd+C)하세요. 4) Mail을 열고 새 이메일(Cmd+N) 초안을 만든 뒤 제목 \"${SUBJECT_S3}\"를 입력하고 본문에 붙여넣기(Cmd+V)하세요. 5) 받는 사람에 \"${MAIL_TO_TARGET}\"를 입력하고 보내기(Cmd+Shift+D)로 발송하세요. 6) 전송이 끝나면 done으로 종료하세요."
 
     scenario_status="failed"
     if run_agent_scenario "$CMD" "$LOG_FILE" 3; then

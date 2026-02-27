@@ -552,7 +552,7 @@ async fn main() -> anyhow::Result<()> {
             // Ensure log directory exists
             let home = std::env::var("HOME").unwrap_or("/".to_string());
             let log_dir = std::path::Path::new(&home).join(".steer/logs");
-            if let Ok(_) = std::fs::create_dir_all(&log_dir) {
+            if std::fs::create_dir_all(&log_dir).is_ok() {
                 let log_file = log_dir.join("crash.log");
                 if let Ok(mut file) = std::fs::OpenOptions::new()
                     .create(true)
@@ -815,26 +815,8 @@ async fn main() -> anyhow::Result<()> {
         println!("👀 Watching for active application changes...");
     }
 
-    let mut telegram_listener_started = false;
-    if env_flag("STEER_TELEGRAM_POLLING") {
-        if let Some(llm) = llm_client.clone() {
-            if let Some(bot) =
-                local_os_agent::telegram::TelegramBot::from_env(llm, Some(log_tx.clone()))
-            {
-                println!("🤖 Telegram polling enabled (STEER_TELEGRAM_POLLING=1).");
-                tokio::spawn(async move {
-                    std::sync::Arc::new(bot).start_polling().await;
-                });
-                telegram_listener_started = true;
-            } else {
-                println!(
-                    "⚠️  STEER_TELEGRAM_POLLING=1 but TELEGRAM_BOT_TOKEN is missing; listener not started."
-                );
-            }
-        } else {
-            println!("⚠️  STEER_TELEGRAM_POLLING=1 but LLM is unavailable; listener not started.");
-        }
-    }
+    // Telegram listener startup is centralized in api_server::start_api_server
+    // to avoid duplicate long-polling loops.
 
     let mut policy = policy::PolicyEngine::new(); // Starts LOCKED
     let mut res_mon = monitor::ResourceMonitor::new();
@@ -1421,23 +1403,22 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             "telegram_listen" | "telegram-listen" => {
-                if telegram_listener_started {
-                    println!("ℹ️  Telegram listener is already running.");
-                    continue;
-                }
                 if let Some(llm) = llm_client.clone() {
-                    if let Some(bot) =
-                        local_os_agent::telegram::TelegramBot::from_env(llm, Some(log_tx.clone()))
-                    {
-                        println!("🤖 Telegram listener started.");
-                        tokio::spawn(async move {
-                            std::sync::Arc::new(bot).start_polling().await;
-                        });
-                        telegram_listener_started = true;
-                    } else {
-                        println!(
-                            "⚠️  Telegram listener requires TELEGRAM_BOT_TOKEN (optional: TELEGRAM_USER_ID)."
-                        );
+                    match api_server::try_spawn_telegram_listener(llm) {
+                        Ok(api_server::TelegramListenerStartOutcome::Started) => {
+                            println!("🤖 Telegram listener started.");
+                        }
+                        Ok(api_server::TelegramListenerStartOutcome::AlreadyRunning) => {
+                            println!("ℹ️  Telegram listener is already running.");
+                        }
+                        Err("missing_telegram_token") => {
+                            println!(
+                                "⚠️  Telegram listener requires TELEGRAM_BOT_TOKEN (optional: TELEGRAM_USER_ID)."
+                            );
+                        }
+                        Err(_) => {
+                            println!("❌ Telegram listener start failed (unknown error).");
+                        }
                     }
                 } else {
                     println!("⚠️  LLM Client not available.");

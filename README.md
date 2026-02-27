@@ -33,14 +33,18 @@ cp .env.example .env
 cargo build --release
 
 # 4. 실행 (Accessibility 권한 필요)
-export STEER_API_ALLOW_NO_KEY=1
+# 개발 로컬 모드(무키): dev/test에서만
+STEER_RUNTIME_PROFILE=dev STEER_API_ALLOW_NO_KEY=1
 ./target/release/local_os_agent
 
 # UI 데모 모드(백그라운드 간섭 최소화)
-STEER_API_ALLOW_NO_KEY=1 STEER_DISABLE_EVENT_TAP=1 ./target/release/local_os_agent
+STEER_RUNTIME_PROFILE=dev STEER_API_ALLOW_NO_KEY=1 STEER_DISABLE_EVENT_TAP=1 ./target/release/local_os_agent
 
 # 복구 + 백그라운드 재기동(권장)
 ./scripts/recover_runtime.sh
+
+# 운영 모드(권장): API 키 필수, no-key 비활성
+STEER_RUNTIME_PROFILE=prod STEER_API_KEY=your_key ./target/release/local_os_agent
 ```
 
 ## 📦 Release
@@ -84,13 +88,14 @@ This restarts the core process automatically if a crash occurs.
 
 ## 🐳 n8n 실행 모드 (macOS 권장)
 
-기본 런타임은 Docker입니다.
+기본 런타임은 `manual`입니다.
 
-- 기본값: `STEER_N8N_RUNTIME=docker`
-- 대체값: `STEER_N8N_RUNTIME=npx` 또는 `STEER_N8N_RUNTIME=manual`
-- Docker 자동기동: `STEER_N8N_AUTO_START=1` (docker 모드 기본값)
+- 기본값: `STEER_N8N_RUNTIME=manual`
+- 대체값: `STEER_N8N_RUNTIME=docker` 또는 `STEER_N8N_RUNTIME=npx`
+- Docker 자동기동: `STEER_N8N_AUTO_START=1` (docker 모드에서만 권장)
 - Docker compose 파일 경로 override: `STEER_N8N_COMPOSE_FILE=/abs/path/docker-compose.yml`
 - Docker 모드에서는 CLI fallback 기본 비활성 (`STEER_N8N_ALLOW_CLI_FALLBACK=0`)
+- 단순/빈 워크플로우는 기본 실패 처리 (`STEER_N8N_ALLOW_SIMPLE_WORKFLOW_FALLBACK=0`)
 - `npx --tunnel`은 테스트/CI 전용 기본 정책입니다.
   - 사용: `STEER_N8N_USE_TUNNEL=1`
   - 비테스트 허용(명시 opt-in): `STEER_N8N_ALLOW_NPX_TUNNEL_NON_TEST=1`

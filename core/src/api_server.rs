@@ -36,12 +36,66 @@ static TELEGRAM_LISTENER_STARTED: OnceLock<AtomicBool> = OnceLock::new();
 static API_SERVER_STARTED_AT: OnceLock<String> = OnceLock::new();
 static INFLIGHT_PROVISION_OPS: OnceLock<Mutex<HashSet<i64>>> = OnceLock::new();
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramListenerStartOutcome {
+    Started,
+    AlreadyRunning,
+}
+
 fn inflight_agent_executions() -> &'static Mutex<HashSet<String>> {
     INFLIGHT_AGENT_EXECUTIONS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 fn telegram_listener_started_flag() -> &'static AtomicBool {
     TELEGRAM_LISTENER_STARTED.get_or_init(|| AtomicBool::new(false))
+}
+
+pub fn try_spawn_telegram_listener(
+    llm: std::sync::Arc<dyn llm_gateway::LLMClient>,
+) -> Result<TelegramListenerStartOutcome, &'static str> {
+    let started_flag = telegram_listener_started_flag();
+    if started_flag
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(TelegramListenerStartOutcome::AlreadyRunning);
+    }
+
+    let bot = match crate::telegram::TelegramBot::from_env(llm, None) {
+        Some(v) => v,
+        None => {
+            started_flag.store(false, Ordering::SeqCst);
+            return Err("missing_telegram_token");
+        }
+    };
+
+    tokio::spawn(async move {
+        std::sync::Arc::new(bot).start_polling().await;
+        telegram_listener_started_flag().store(false, Ordering::SeqCst);
+    });
+
+    Ok(TelegramListenerStartOutcome::Started)
+}
+
+fn is_truthy_env_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn has_nonempty_env(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn telegram_polling_requested() -> bool {
+    match std::env::var("STEER_TELEGRAM_POLLING") {
+        Ok(value) => is_truthy_env_value(&value),
+        Err(_) => has_nonempty_env("TELEGRAM_BOT_TOKEN"),
+    }
 }
 
 fn inflight_provision_ops() -> &'static Mutex<HashSet<i64>> {
@@ -55,65 +109,68 @@ fn spawn_workflow_provision_recovery_loop(
         // Startup kick to recover pending ops from previous process first.
         let _ = db::reconcile_workflow_provision_ops(50);
         loop {
-            match db::list_workflow_provision_ops(25, Some("requested"), None) {
-                Ok(requested_ops) => {
-                    for op in requested_ops {
-                        let claim_token = match op
-                            .claim_token
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|v| v.starts_with("provisioning:"))
-                        {
-                            Some(v) => v.to_string(),
-                            None => {
-                                let _ = db::mark_workflow_provision_failed(
-                                    op.id,
-                                    "workflow provisioning op missing valid claim token",
-                                );
+            for status in ["requested", "provisioning"] {
+                match db::list_workflow_provision_ops(25, Some(status), None) {
+                    Ok(ops) => {
+                        for op in ops {
+                            let claim_token = match op
+                                .claim_token
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|v| v.starts_with("provisioning:"))
+                            {
+                                Some(v) => v.to_string(),
+                                None => {
+                                    let _ = db::mark_workflow_provision_failed(
+                                        op.id,
+                                        "workflow provisioning op missing valid claim token",
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            let should_spawn =
+                                if let Ok(mut guard) = inflight_provision_ops().lock() {
+                                    guard.insert(op.id)
+                                } else {
+                                    false
+                                };
+                            if !should_spawn {
                                 continue;
                             }
-                        };
 
-                        let should_spawn = if let Ok(mut guard) = inflight_provision_ops().lock() {
-                            guard.insert(op.id)
-                        } else {
-                            false
-                        };
-                        if !should_spawn {
-                            continue;
+                            let llm_for_op = llm_client.clone();
+                            tokio::spawn(async move {
+                                let preclaim = recommendation_executor::PreclaimedProvisioning {
+                                    claim_token: Some(claim_token),
+                                    provision_op_id: op.id,
+                                    force_recreate: false,
+                                };
+                                if let Err(error) =
+                                    recommendation_executor::execute_approved_recommendation_with_preclaim(
+                                        op.recommendation_id,
+                                        llm_for_op,
+                                        preclaim,
+                                    )
+                                    .await
+                                {
+                                    eprintln!(
+                                        "⚠️ Provision recovery failed: op_id={} recommendation_id={} status={} error={}",
+                                        op.id, op.recommendation_id, status, error
+                                    );
+                                }
+                                if let Ok(mut guard) = inflight_provision_ops().lock() {
+                                    guard.remove(&op.id);
+                                }
+                            });
                         }
-
-                        let llm_for_op = llm_client.clone();
-                        tokio::spawn(async move {
-                            let preclaim = recommendation_executor::PreclaimedProvisioning {
-                                claim_token: Some(claim_token),
-                                provision_op_id: op.id,
-                                force_recreate: false,
-                            };
-                            if let Err(error) =
-                                recommendation_executor::execute_approved_recommendation_with_preclaim(
-                                    op.recommendation_id,
-                                    llm_for_op,
-                                    preclaim,
-                                )
-                                .await
-                            {
-                                eprintln!(
-                                    "⚠️ Provision recovery failed: op_id={} recommendation_id={} error={}",
-                                    op.id, op.recommendation_id, error
-                                );
-                            }
-                            if let Ok(mut guard) = inflight_provision_ops().lock() {
-                                guard.remove(&op.id);
-                            }
-                        });
                     }
-                }
-                Err(error) => {
-                    eprintln!(
-                        "⚠️ Failed to list requested workflow provision ops: {}",
-                        error
-                    );
+                    Err(error) => {
+                        eprintln!(
+                            "⚠️ Failed to list workflow provision ops (status={}): {}",
+                            status, error
+                        );
+                    }
                 }
             }
 
@@ -251,16 +308,12 @@ pub struct AgentExecuteRequest {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum AgentExecutionProfile {
+    #[default]
     Strict,
     Test,
     Fast,
-}
-
-impl Default for AgentExecutionProfile {
-    fn default() -> Self {
-        Self::Strict
-    }
 }
 
 impl AgentExecutionProfile {
@@ -779,8 +832,32 @@ pub async fn start_api_server(
 ) -> anyhow::Result<()> {
     API_SERVER_STARTED_AT.get_or_init(|| chrono::Utc::now().to_rfc3339());
 
-    if crate::env_flag("STEER_TELEGRAM_POLLING") {
-        telegram_listener_started_flag().store(true, Ordering::SeqCst);
+    let telegram_polling_explicit = std::env::var("STEER_TELEGRAM_POLLING").ok();
+    if telegram_polling_requested() {
+        if let Some(llm) = llm_client.clone() {
+            match try_spawn_telegram_listener(llm) {
+                Ok(TelegramListenerStartOutcome::Started) => {
+                    if telegram_polling_explicit.is_some() {
+                        println!("🤖 Telegram polling enabled (STEER_TELEGRAM_POLLING=1).");
+                    } else {
+                        println!(
+                            "🤖 Telegram polling auto-enabled (Telegram credentials detected)."
+                        );
+                    }
+                }
+                Ok(TelegramListenerStartOutcome::AlreadyRunning) => {
+                    println!("ℹ️ Telegram listener already running.");
+                }
+                Err("missing_telegram_token") => {
+                    println!(
+                        "⚠️  STEER_TELEGRAM_POLLING=1 but TELEGRAM_BOT_TOKEN is missing; listener not started."
+                    );
+                }
+                Err(_) => {}
+            }
+        } else {
+            println!("⚠️  STEER_TELEGRAM_POLLING=1 but LLM is unavailable; listener not started.");
+        }
     }
 
     match db::mark_orphaned_inflight_task_runs_failed() {
@@ -1170,7 +1247,7 @@ fn parse_primary_mail_recipient(raw: &str) -> Option<String> {
         }
 
         let normalized = cleaned
-            .trim_end_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ':' | ')' | '('))
+            .trim_end_matches(['.', ',', ';', ':', ')', '('])
             .to_ascii_lowercase();
         if normalized.contains('@') && normalized.contains('.') {
             Some(normalized)
@@ -1428,15 +1505,31 @@ async fn agent_preflight_handler() -> Json<AgentPreflightResponse> {
             }
         }
     } else {
-        checks.push(AgentPreflightCheckItem {
-            key: "screen_capture".to_string(),
-            label: "Screen Capture".to_string(),
-            ok: true,
-            expected: None,
-            actual: Some("skipped".to_string()),
-            message: "Screen capture check disabled by env (STEER_PREFLIGHT_SCREEN_CAPTURE=0)"
-                .to_string(),
-        });
+        let skip_allowed = env_truthy_default("STEER_TEST_MODE", false)
+            || env_truthy_default("STEER_ALLOW_SCREEN_CAPTURE_SKIP", false);
+        if !skip_allowed {
+            all_ok = false;
+            checks.push(AgentPreflightCheckItem {
+                key: "screen_capture".to_string(),
+                label: "Screen Capture".to_string(),
+                ok: false,
+                expected: Some("STEER_PREFLIGHT_SCREEN_CAPTURE=1 (default)".to_string()),
+                actual: Some("disabled_by_env".to_string()),
+                message:
+                    "화면 캡처 체크가 비활성화되어 있어 실행 신뢰성을 보장할 수 없습니다. STEER_PREFLIGHT_SCREEN_CAPTURE=1로 복구하거나 테스트 모드에서만 skip 하세요."
+                        .to_string(),
+            });
+        } else {
+            checks.push(AgentPreflightCheckItem {
+                key: "screen_capture".to_string(),
+                label: "Screen Capture".to_string(),
+                ok: true,
+                expected: None,
+                actual: Some("skipped".to_string()),
+                message: "Screen capture check skipped by env (test/allowlist mode only)."
+                    .to_string(),
+            });
+        }
     }
 
     if env_truthy_default("STEER_PREFLIGHT_FOCUS_HANDOFF", true) {
@@ -2476,36 +2569,25 @@ async fn handle_chat(
                 })
             }
         };
-        let bot = match crate::telegram::TelegramBot::from_env(llm, None) {
-            Some(v) => v,
-            None => {
-                return Json(ChatResponse {
-                    response: "❌ TELEGRAM_BOT_TOKEN이 없어 listener를 시작할 수 없습니다."
-                        .to_string(),
-                    command: Some("telegram_listener_start".to_string()),
-                })
-            }
-        };
-
-        if started_flag
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Json(ChatResponse {
+        return match try_spawn_telegram_listener(llm) {
+            Ok(TelegramListenerStartOutcome::Started) => Json(ChatResponse {
+                response: "🤖 Telegram listener 시작됨 (long polling)".to_string(),
+                command: Some("telegram_listener_start".to_string()),
+            }),
+            Ok(TelegramListenerStartOutcome::AlreadyRunning) => Json(ChatResponse {
                 response: "ℹ️ Telegram listener가 이미 실행 중입니다.".to_string(),
                 command: Some("telegram_listener_start".to_string()),
-            });
-        }
-
-        tokio::spawn(async move {
-            std::sync::Arc::new(bot).start_polling().await;
-            telegram_listener_started_flag().store(false, Ordering::SeqCst);
-        });
-
-        return Json(ChatResponse {
-            response: "🤖 Telegram listener 시작됨 (long polling)".to_string(),
-            command: Some("telegram_listener_start".to_string()),
-        });
+            }),
+            Err("missing_telegram_token") => Json(ChatResponse {
+                response: "❌ TELEGRAM_BOT_TOKEN이 없어 listener를 시작할 수 없습니다.".to_string(),
+                command: Some("telegram_listener_start".to_string()),
+            }),
+            Err(_) => Json(ChatResponse {
+                response: "❌ Telegram listener 시작 중 알 수 없는 오류가 발생했습니다."
+                    .to_string(),
+                command: Some("telegram_listener_start".to_string()),
+            }),
+        };
     }
 
     // Issue #4 Fix: n8n restart command
@@ -2795,7 +2877,7 @@ async fn handle_chat(
                             let cron = p.get("cron").and_then(|v| v.as_str()).unwrap_or("* * * * *");
 
                             // Validate Cron
-                            if std::str::FromStr::from_str(&cron as &str).map(|_: cron::Schedule| ()).is_err() {
+                            if std::str::FromStr::from_str(cron as &str).map(|_: cron::Schedule| ()).is_err() {
                                 format!("❌ 잘못된 Cron 표현식입니다: {}", cron)
                             } else {
                                 let prompt = p.get("prompt").and_then(|v| v.as_str()).unwrap_or("Check status");
@@ -2969,7 +3051,8 @@ fn n8n_editor_base_url() -> String {
         }
     }
 
-    let api = std::env::var("N8N_API_URL")
+    let api = std::env::var("STEER_N8N_API_URL")
+        .or_else(|_| std::env::var("N8N_API_URL"))
         .ok()
         .map(|v| v.trim().trim_end_matches('/').to_string())
         .filter(|v| !v.is_empty())
@@ -4793,9 +4876,7 @@ fn latest_evidence_field(
 fn latest_legacy_mail_send_field(logs: &[String], field: &str) -> Option<String> {
     let run_scope_id = current_run_scope_id(logs);
     logs.iter().rev().find_map(|line| {
-        let Some(fields) = parse_pipe_fields_with_prefix(line, "mail_send_proof|") else {
-            return None;
-        };
+        let fields = parse_pipe_fields_with_prefix(line, "mail_send_proof|")?;
         if !evidence_fields_match_run_scope(&fields, run_scope_id.as_deref()) {
             return None;
         }
@@ -5700,6 +5781,7 @@ fn completion_score_pass_threshold() -> u8 {
         .unwrap_or(75)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_completion_score(
     status: &str,
     planner_complete: bool,

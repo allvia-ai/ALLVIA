@@ -126,7 +126,7 @@ pub fn get_active_window_context() -> Result<(String, String)> {
 
     let output = run(script)?;
     let parts: Vec<&str> = output.split("|||").collect();
-    let title = parts.get(0).unwrap_or(&"").trim().to_string();
+    let title = parts.first().unwrap_or(&"").trim().to_string();
     let url = parts.get(1).unwrap_or(&"").trim().to_string();
 
     Ok((title, url))

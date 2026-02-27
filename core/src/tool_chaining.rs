@@ -197,7 +197,7 @@ impl CrossAppBridge {
 
         let started = Instant::now();
         loop {
-            if let Some(_) = child.try_wait()? {
+            if (child.try_wait()?).is_some() {
                 return Ok(child.wait_with_output()?);
             }
             if started.elapsed() >= Duration::from_millis(timeout_ms) {
