@@ -100,6 +100,193 @@ This restarts the core process automatically if a crash occurs.
   - 사용: `STEER_N8N_USE_TUNNEL=1`
   - 비테스트 허용(명시 opt-in): `STEER_N8N_ALLOW_NPX_TUNNEL_NON_TEST=1`
 
+## 🏗️아키텍쳐
+```mermaid
+graph LR
+    classDef input fill:#4A90D9,stroke:#2C5F8A,color:#fff,stroke-width:2px
+    classDef orch fill:#E74C3C,stroke:#C0392B,color:#fff,stroke-width:3px
+    classDef sec fill:#C0392B,stroke:#96281B,color:#fff,stroke-width:2px
+    classDef brain fill:#9B59B6,stroke:#8E44AD,color:#fff,stroke-width:2px
+    classDef ctrl fill:#E67E22,stroke:#D35400,color:#fff,stroke-width:2px
+    classDef exec fill:#27AE60,stroke:#1E8449,color:#fff,stroke-width:2px
+    classDef sensor fill:#2980B9,stroke:#1F618D,color:#fff,stroke-width:2px
+    classDef data fill:#34495E,stroke:#2C3E50,color:#fff,stroke-width:2px
+    classDef pattern fill:#F39C12,stroke:#D68910,color:#fff,stroke-width:2px
+    classDef ext fill:#16A085,stroke:#0E6655,color:#fff,stroke-width:2px
+    classDef monitor fill:#F39C12,stroke:#D68910,color:#fff,stroke-width:2px
+
+    %% ═══════════════════════════════════════
+    %% 상단: 명령 → 실행 파이프라인
+    %% ═══════════════════════════════════════
+
+    subgraph INPUT["🖥️ User Input"]
+        TAURI["Tauri Desktop<br/>(React + Vite)"]
+        TELEGRAM["Telegram Bot"]
+        CLI["CLI / Web UI"]
+    end
+
+    subgraph API["🔐 API Server"]
+        AXUM["Axum REST API"]
+        AUTH["Auth Middleware"]
+    end
+
+    subgraph ORCH["🧠 Orchestrator"]
+        ORCHESTRATOR["Intent Router<br/>4-way 분류"]
+        SLOT["Slot Filler"]
+        NL_AUTO["NL Automation"]
+    end
+
+    subgraph SEC["🛡️ Zero-Trust Security"]
+        CHATGATE["Chat Gate<br/>입력 검증"]
+        POLICY["Policy Engine<br/>Safe / Caution / Critical"]
+        APPROVAL["Approval Gate<br/>+ Write Lock"]
+        OUTBOUND["Outbound Policy"]
+        PRIVACY["Privacy Guard<br/>PII 마스킹"]
+    end
+
+    subgraph LLM_LAYER["🤖 LLM Gateway"]
+        GATEWAY["LLM Router"]
+        LOCAL["Local LLM<br/>(Ollama)"]
+        CLOUD_LLM["Cloud LLM<br/>(GPT-4o)"]
+        PRUNING["Context Pruning"]
+    end
+
+    subgraph CTRL["⚙️ Controller"]
+        PLANNER["Planner<br/>계획 수립"]
+        SUPERVISOR["Supervisor<br/>실행 감독"]
+        LOOP_DET["Loop Detector"]
+    end
+
+    subgraph EXEC["🚀 Executor"]
+        SHELL["Shell Executor"]
+        BROWSER["Browser Auto"]
+        VISUAL["Visual Driver"]
+        SUBAGENT["Sub-Agent"]
+    end
+
+    %% 상단 흐름 연결
+    INPUT --> AXUM --> AUTH --> ORCHESTRATOR
+    ORCHESTRATOR --> SLOT --> GATEWAY
+    ORCHESTRATOR --> CHATGATE
+    CHATGATE --> POLICY --> APPROVAL
+    GATEWAY --> LOCAL
+    GATEWAY --> CLOUD_LLM
+    GATEWAY --> PRUNING
+    GATEWAY --> PLANNER
+    PLANNER --> SUPERVISOR
+    SUPERVISOR --> SHELL
+    SUPERVISOR --> BROWSER
+    SUPERVISOR --> VISUAL
+    SUPERVISOR --> SUBAGENT
+
+    %% Closed-Loop
+    EXEC -.->|"🔄 Closed-Loop<br/>결과 검증"| POLICY
+
+    %% Orchestrator 4-way 분류
+    ORCHESTRATOR -->|"OS"| EXEC
+    ORCHESTRATOR -->|"Workflow"| WF_ENGINE
+    ORCHESTRATOR -->|"Research"| GATEWAY
+
+    %% ═══════════════════════════════════════
+    %% 하단: 학습 → 자동화 파이프라인
+    %% ═══════════════════════════════════════
+
+    subgraph SENSORS["🔍 OS Sensors"]
+        FOREGROUND["Foreground<br/>윈도우 감지"]
+        IDLE["Idle Sensor<br/>유휴 감지"]
+        FILE_W["File Watcher"]
+        RECEIVER["HTTP / Pipe<br/>Receiver"]
+    end
+
+    subgraph COLLECT["� Data Pipeline"]
+        NORMALIZE["Normalize"]
+        PRIVACY_F["Privacy Filter"]
+        COLLECTOR["Collector<br/>(Python + Rust)"]
+        SESSION["Sessionizer"]
+        ROUTINE["Routine Builder"]
+    end
+
+    subgraph STORAGE["💾 Storage"]
+        SQLITE[("SQLite<br/>steer.db")]
+        EVENTS["events_v2"]
+        SESSIONS["sessions"]
+        ROUTINES["routines"]
+    end
+
+    subgraph ANALYSIS["📈 Pattern Analysis"]
+        DETECTOR["Pattern Detector<br/>반복 행동 감지"]
+        RECOMMEND["Recommendation<br/>Engine"]
+        SCHEDULER["Scheduler<br/>(Cron)"]
+    end
+
+    subgraph WF_ENGINE["🔗 Workflow Engine"]
+        N8N["n8n API<br/>워크플로우 CRUD"]
+        WF_SCHEMA["Workflow Schema"]
+        AI_DIGEST["AI Digest"]
+        MCP["MCP Client"]
+    end
+
+    subgraph EXTERNAL["🌐 External Services"]
+        GOOGLE["Google<br/>Calendar · Gmail"]
+        NOTION["Notion"]
+        N8N_SRV["n8n Server<br/>(Docker)"]
+        OPENAI["OpenAI API"]
+    end
+
+    subgraph MONITOR["📡 Monitoring"]
+        SYS_MON["System Monitor"]
+        DIAG["Diagnostic Events<br/>감사 로그"]
+        FEEDBACK["Feedback<br/>Collector"]
+        QUALITY["Quality Scorer"]
+    end
+
+    %% 하단 흐름 연결
+    SENSORS --> NORMALIZE --> PRIVACY_F --> COLLECTOR
+    COLLECTOR --> SESSION --> ROUTINE
+    COLLECTOR --> SQLITE
+    SQLITE --- EVENTS --> SESSIONS --> ROUTINES
+
+    ROUTINES --> DETECTOR --> RECOMMEND --> SCHEDULER
+    SCHEDULER --> N8N
+    N8N --> WF_SCHEMA
+    N8N --> N8N_SRV
+    AI_DIGEST --> N8N
+    MCP --> GOOGLE
+    MCP --> NOTION
+
+    %% 모니터링 연결
+    EXEC --> DIAG
+    EXEC --> SYS_MON
+    EXEC --> QUALITY
+    AXUM --> FEEDBACK
+
+    %% ═══════════════════════════════════════
+    %% 순환 연결 (핵심!)
+    %% ═══════════════════════════════════════
+    EXEC ==>|"실행 이벤트 수집"| SENSORS
+    RECOMMEND ==>|"자동화 제안"| ORCHESTRATOR
+
+    %% 보안 연결
+    COLLECT --> PRIVACY
+    EXEC --> OUTBOUND
+
+    %% 스타일 적용
+    class TAURI,TELEGRAM,CLI input
+    class AXUM,AUTH monitor
+    class ORCHESTRATOR,SLOT,NL_AUTO orch
+    class CHATGATE,POLICY,APPROVAL,OUTBOUND,PRIVACY sec
+    class GATEWAY,LOCAL,CLOUD_LLM,PRUNING brain
+    class PLANNER,SUPERVISOR,LOOP_DET ctrl
+    class SHELL,BROWSER,VISUAL,SUBAGENT exec
+    class FOREGROUND,IDLE,FILE_W,RECEIVER sensor
+    class NORMALIZE,PRIVACY_F,COLLECTOR,SESSION,ROUTINE sensor
+    class SQLITE,EVENTS,SESSIONS,ROUTINES data
+    class DETECTOR,RECOMMEND,SCHEDULER pattern
+    class N8N,WF_SCHEMA,AI_DIGEST,MCP ext
+    class GOOGLE,NOTION,N8N_SRV,OPENAI ext
+    class SYS_MON,DIAG,FEEDBACK,QUALITY monitor
+```
+
 빠른 시작:
 
 ```bash
