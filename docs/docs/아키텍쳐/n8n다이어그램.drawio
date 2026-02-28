@@ -1,0 +1,228 @@
+<mxfile host="app.diagrams.net" agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36" version="29.5.2">
+  <diagram name="페이지-1" id="UBXV0ngfO-X5sxRSmDNu">
+    <mxGraphModel dx="3840" dy="2307" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="r5vpahnVyGNFqb2338aV-1" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="📊 실행 결과" vertex="1">
+          <mxGeometry height="128" width="1087" x="1152" y="1330" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-2" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="🌐 외부 서비스 연동 (n8n 노드)" vertex="1">
+          <mxGeometry height="128" width="1112" x="20" y="1330" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-3" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="🔴 n8n Server (Docker)" vertex="1">
+          <mxGeometry height="329" width="1473" x="69" y="927" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-4" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="⚙️ AllvIa Workflow Engine" vertex="1">
+          <mxGeometry height="833" width="858" x="1562" y="246" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-5" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="🎯 워크플로우 트리거 소스" vertex="1">
+          <mxGeometry height="152" width="1276" x="1188" y="20" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-6" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Pattern Detector&#xa;(pattern_detector.rs)&#xa;반복 패턴 감지" vertex="1">
+          <mxGeometry height="102" width="212" x="1973" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-7" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="AI Digest&#xa;(ai_digest.rs)&#xa;뉴스·정보 수집 요청" vertex="1">
+          <mxGeometry height="102" width="193" x="2235" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-8" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Scheduler&#xa;(scheduler.rs)&#xa;Cron 예약 실행" vertex="1">
+          <mxGeometry height="102" width="162" x="1632" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-9" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="사용자 직접 요청&#xa;(Chat UI / Telegram)" vertex="1">
+          <mxGeometry height="78" width="208" x="1315" y="57" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-10" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Recommendation Engine&#xa;(recommendation.rs)&#xa;자동화 추천" vertex="1">
+          <mxGeometry height="102" width="236" x="1704" y="447" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-11" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Recommendation Executor&#xa;(recommendation_executor.rs)" vertex="1">
+          <mxGeometry height="78" width="260" x="1730" y="623" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-12" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Workflow Intake&#xa;(workflow_intake.rs)&#xa;Collector→Core Handoff" vertex="1">
+          <mxGeometry height="102" width="236" x="1603" y="271" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-13" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Workflow Schema&#xa;(workflow_schema.rs)&#xa;n8n JSON 스키마 생성" vertex="1">
+          <mxGeometry height="102" width="218" x="1751" y="751" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-14" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="n8n API Client&#xa;(n8n_api.rs)&#xa;워크플로우 CRUD" vertex="1">
+          <mxGeometry height="102" width="177" x="2015" y="952" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-15" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="n8n Core Engine&#xa;(Self-hosted Docker)" vertex="1">
+          <mxGeometry height="78" width="207" x="104" y="1153" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-16" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="워크플로우 실행기" vertex="1">
+          <mxGeometry height="54" width="183" x="743" y="1165" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-17" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Webhook Trigger" vertex="1">
+          <mxGeometry height="54" width="178" x="300" y="976" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-18" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Cron Trigger" vertex="1">
+          <mxGeometry height="54" width="147" x="1360" y="976" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-19" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="📅 Google Calendar&#xa;일정 생성·조회" vertex="1">
+          <mxGeometry height="78" width="205" x="55" y="1355" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-20" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="📧 Gmail&#xa;메일 발송·분류" vertex="1">
+          <mxGeometry height="78" width="159" x="310" y="1355" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-21" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="📝 Notion&#xa;페이지 생성·업데이트" vertex="1">
+          <mxGeometry height="78" width="203" x="519" y="1355" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-22" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="💬 Slack&#xa;알림 전송" vertex="1">
+          <mxGeometry height="78" width="124" x="772" y="1355" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-23" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="🔗 Webhook&#xa;외부 API 호출" vertex="1">
+          <mxGeometry height="78" width="151" x="946" y="1355" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-24" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Telegram 리포트&#xa;실행 결과 자동 송출" vertex="1">
+          <mxGeometry height="78" width="192" x="1187" y="1355" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-25" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Diagnostic Events&#xa;감사 로그 (JSONL)" vertex="1">
+          <mxGeometry height="78" width="185" x="1429" y="1355" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-26" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Dashboard&#xa;실행 상태 표시" vertex="1">
+          <mxGeometry height="78" width="158" x="2046" y="1355" as="geometry" />
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-27" edge="1" parent="1" source="r5vpahnVyGNFqb2338aV-6" style="curved=1;startArrow=none;endArrow=block;exitX=0.01;exitY=1;entryX=0.75;entryY=0;rounded=0;" target="r5vpahnVyGNFqb2338aV-10" value="반복 패턴 발견">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1923" y="172" />
+              <mxPoint x="1923" y="410" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-28" edge="1" parent="1" source="r5vpahnVyGNFqb2338aV-7" style="curved=1;startArrow=none;endArrow=block;exitX=0.5;exitY=1;entryX=1;entryY=0.21;rounded=0;" target="r5vpahnVyGNFqb2338aV-14" value="토픽 요청">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="2332" y="927" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-29" edge="1" parent="1" source="r5vpahnVyGNFqb2338aV-8" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.69;entryX=0.84;entryY=0;rounded=0;" target="r5vpahnVyGNFqb2338aV-11" value="Cron 시간 도달">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="2035" y="172" />
+              <mxPoint x="2035" y="586" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-30" edge="1" parent="1" source="r5vpahnVyGNFqb2338aV-9" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.83;entryX=0.5;entryY=0;rounded=0;" target="r5vpahnVyGNFqb2338aV-12" value="워크플로우 요청">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1721" y="172" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-31" edge="1" parent="1" source="r5vpahnVyGNFqb2338aV-10" style="curved=1;startArrow=none;endArrow=block;exitX=0.5;exitY=1;entryX=0.42;entryY=0;rounded=0;" target="r5vpahnVyGNFqb2338aV-11" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1822" y="586" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-32" edge="1" parent="1" source="r5vpahnVyGNFqb2338aV-12" style="curved=1;startArrow=none;endArrow=block;exitX=0.5;exitY=1;entryX=0.25;entryY=0;rounded=0;" target="r5vpahnVyGNFqb2338aV-10" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1721" y="410" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-33" edge="1" parent="1" source="r5vpahnVyGNFqb2338aV-11" style="curved=1;startArrow=none;endArrow=block;exitX=0.5;exitY=1;entryX=0.5;entryY=0;rounded=0;" target="r5vpahnVyGNFqb2338aV-13" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-34" edge="1" parent="1" source="r5vpahnVyGNFqb2338aV-13" style="curved=1;startArrow=none;endArrow=block;exitX=0.5;exitY=1;entryX=0;entryY=0.23;rounded=0;" target="r5vpahnVyGNFqb2338aV-14" value="n8n JSON 생성">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1860" y="927" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-35" edge="1" parent="1" source="r5vpahnVyGNFqb2338aV-14" style="curved=1;startArrow=none;endArrow=block;exitX=0;exitY=0.65;entryX=0.5;entryY=0;rounded=0;" target="r5vpahnVyGNFqb2338aV-15" value="POST /workflows">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1654" y="1079" />
+              <mxPoint x="207" y="1116" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-36" edge="1" parent="1" source="r5vpahnVyGNFqb2338aV-14" style="curved=1;startArrow=none;endArrow=block;exitX=0;exitY=0.77;entryX=1;entryY=0.21;rounded=0;" target="r5vpahnVyGNFqb2338aV-16" value="POST /executions">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1859" y="1079" />
+              <mxPoint x="1276" y="1116" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-37" edge="1" parent="1" source="r5vpahnVyGNFqb2338aV-8" style="curved=1;startArrow=none;endArrow=block;exitX=0;exitY=0.72;entryX=0.5;entryY=0;rounded=0;" target="r5vpahnVyGNFqb2338aV-18" value="Cron 등록">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1433" y="172" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-38" edge="1" parent="1" source="r5vpahnVyGNFqb2338aV-17" style="curved=1;startArrow=none;endArrow=block;exitX=0.5;exitY=1;entryX=0;entryY=0.21;rounded=0;" target="r5vpahnVyGNFqb2338aV-16" value="외부 이벤트">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="389" y="1116" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-39" edge="1" parent="1" source="r5vpahnVyGNFqb2338aV-16" style="curved=1;startArrow=none;endArrow=block;exitX=0;exitY=0.66;entryX=0.5;entryY=0;rounded=0;" target="r5vpahnVyGNFqb2338aV-19" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="157" y="1256" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-40" edge="1" parent="1" source="r5vpahnVyGNFqb2338aV-16" style="curved=1;startArrow=none;endArrow=block;exitX=0;exitY=0.74;entryX=0.5;entryY=0;rounded=0;" target="r5vpahnVyGNFqb2338aV-20" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="389" y="1256" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-41" edge="1" parent="1" source="r5vpahnVyGNFqb2338aV-16" style="curved=1;startArrow=none;endArrow=block;exitX=0;exitY=1;entryX=0.5;entryY=0;rounded=0;" target="r5vpahnVyGNFqb2338aV-21" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="620" y="1256" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-42" edge="1" parent="1" source="r5vpahnVyGNFqb2338aV-16" style="curved=1;startArrow=none;endArrow=block;exitX=0.5;exitY=1;entryX=0.5;entryY=0;rounded=0;" target="r5vpahnVyGNFqb2338aV-22" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-43" edge="1" parent="1" source="r5vpahnVyGNFqb2338aV-16" style="curved=1;startArrow=none;endArrow=block;exitX=0.93;exitY=1;entryX=0.5;entryY=0;rounded=0;" target="r5vpahnVyGNFqb2338aV-23" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1021" y="1256" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-44" edge="1" parent="1" source="r5vpahnVyGNFqb2338aV-16" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.74;entryX=0.5;entryY=0;rounded=0;" target="r5vpahnVyGNFqb2338aV-24" value="실행 완료">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1283" y="1256" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-45" edge="1" parent="1" source="r5vpahnVyGNFqb2338aV-16" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.66;entryX=0.5;entryY=0;rounded=0;" target="r5vpahnVyGNFqb2338aV-25" value="로그 기록">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1522" y="1256" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="r5vpahnVyGNFqb2338aV-46" edge="1" parent="1" source="r5vpahnVyGNFqb2338aV-14" style="curved=1;startArrow=none;endArrow=block;exitX=0.58;exitY=1;entryX=0.5;entryY=0;rounded=0;" target="r5vpahnVyGNFqb2338aV-26" value="상태 업데이트">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="2125" y="1079" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

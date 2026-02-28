@@ -1,0 +1,247 @@
+<mxfile host="app.diagrams.net" agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36" version="29.5.2">
+  <diagram name="페이지-1" id="b6lZ1BvSospn4jUe_x9-">
+    <mxGraphModel grid="1" page="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-1" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Automation Output" vertex="1">
+          <mxGeometry height="228" width="949" x="2549" y="20" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-2" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="SQLite Storage" vertex="1">
+          <mxGeometry height="240" width="1755" x="1025" y="268" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-3" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Processing Pipeline" vertex="1">
+          <mxGeometry height="681" width="2137" x="363" y="528" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-4" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="OS Sensors" vertex="1">
+          <mxGeometry height="740" width="293" x="20" y="494" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-5" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Windows Foreground&#xa;(windows_foreground.py)" vertex="1">
+          <mxGeometry height="78" width="243" x="45" y="529" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-6" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Windows Idle&#xa;(windows_idle.py)" vertex="1">
+          <mxGeometry height="78" width="191" x="71" y="657" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-7" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="File Watcher&#xa;(file_watcher.py)" vertex="1">
+          <mxGeometry height="78" width="183" x="75" y="785" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-8" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="macOS Accessibility&#xa;(AX API)" vertex="1">
+          <mxGeometry height="78" width="201" x="66" y="913" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-9" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="HTTP Receiver" vertex="1">
+          <mxGeometry height="54" width="164" x="84" y="1041" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-10" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Pipe Receiver" vertex="1">
+          <mxGeometry height="54" width="157" x="88" y="1145" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-11" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="PII Masking&#xa;(PrivacyGuard)" vertex="1">
+          <mxGeometry height="78" width="166" x="388" y="849" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-12" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Normalize&#xa;(normalize.py)" vertex="1">
+          <mxGeometry height="78" width="165" x="603" y="849" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-13" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Priority Filter&#xa;(priority.py)" vertex="1">
+          <mxGeometry height="78" width="156" x="819" y="849" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-14" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Build Sessions&#xa;(build_sessions_rs)" vertex="1">
+          <mxGeometry height="78" width="194" x="1313" y="821" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-15" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Build Routines&#xa;(build_routines_rs)" vertex="1">
+          <mxGeometry height="78" width="195" x="1868" y="821" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-16" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Build Handoff&#xa;(build_handoff_rs)" vertex="1">
+          <mxGeometry height="78" width="192" x="2282" y="821" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-17" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="events_v2" vertex="1">
+          <mxGeometry height="54" width="131" x="1050" y="325" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-18" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="minute_aggregates&#xa;(5min)" vertex="1">
+          <mxGeometry height="78" width="196" x="1312" y="303" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-19" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="daily_summaries" vertex="1">
+          <mxGeometry height="54" width="179" x="1639" y="315" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-20" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="sessions" vertex="1">
+          <mxGeometry height="54" width="117" x="1670" y="419" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-21" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="routines" vertex="1">
+          <mxGeometry height="54" width="118" x="2114" y="351" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-22" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="handoff_queue" vertex="1">
+          <mxGeometry height="54" width="167" x="2581" y="361" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-23" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Pattern Detector" vertex="1">
+          <mxGeometry height="54" width="180" x="2574" y="55" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-24" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Recommendation Engine" vertex="1">
+          <mxGeometry height="54" width="236" x="2830" y="101" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-25" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Workflow JSON" vertex="1">
+          <mxGeometry height="54" width="168" x="3116" y="55" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-26" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="n8n Deploy" vertex="1">
+          <mxGeometry height="54" width="139" x="3334" y="55" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-27" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Cron Scheduler" vertex="1">
+          <mxGeometry height="54" width="168" x="3115" y="159" as="geometry" />
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-28" edge="1" parent="1" source="nhGrFSaznw1m1d_mlfI_-5" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.5;entryX=0.42;entryY=0;rounded=0;" target="nhGrFSaznw1m1d_mlfI_-11" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="363" y="568" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-29" edge="1" parent="1" source="nhGrFSaznw1m1d_mlfI_-6" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.5;entryX=0.37;entryY=0;rounded=0;" target="nhGrFSaznw1m1d_mlfI_-11" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="363" y="696" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-30" edge="1" parent="1" source="nhGrFSaznw1m1d_mlfI_-7" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.5;entryX=0.1;entryY=0;rounded=0;" target="nhGrFSaznw1m1d_mlfI_-11" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="363" y="824" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-31" edge="1" parent="1" source="nhGrFSaznw1m1d_mlfI_-8" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.5;entryX=0.1;entryY=1;rounded=0;" target="nhGrFSaznw1m1d_mlfI_-11" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="363" y="952" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-32" edge="1" parent="1" source="nhGrFSaznw1m1d_mlfI_-9" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.5;entryX=0.36;entryY=1;rounded=0;" target="nhGrFSaznw1m1d_mlfI_-11" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="363" y="1068" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-33" edge="1" parent="1" source="nhGrFSaznw1m1d_mlfI_-10" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.5;entryX=0.41;entryY=1;rounded=0;" target="nhGrFSaznw1m1d_mlfI_-11" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="363" y="1172" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-34" edge="1" parent="1" source="nhGrFSaznw1m1d_mlfI_-11" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;rounded=0;" target="nhGrFSaznw1m1d_mlfI_-12" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-35" edge="1" parent="1" source="nhGrFSaznw1m1d_mlfI_-12" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;rounded=0;" target="nhGrFSaznw1m1d_mlfI_-13" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-36" edge="1" parent="1" source="nhGrFSaznw1m1d_mlfI_-13" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.5;entryX=0.47;entryY=1;rounded=0;" target="nhGrFSaznw1m1d_mlfI_-17" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1025" y="888" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-37" edge="1" parent="1" source="nhGrFSaznw1m1d_mlfI_-17" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.41;entryX=0;entryY=0.5;rounded=0;" target="nhGrFSaznw1m1d_mlfI_-18" value="5min batch">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1247" y="342" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-38" edge="1" parent="1" source="nhGrFSaznw1m1d_mlfI_-18" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;rounded=0;" target="nhGrFSaznw1m1d_mlfI_-19" value="daily rollup">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-39" edge="1" parent="1" source="nhGrFSaznw1m1d_mlfI_-17" style="curved=1;startArrow=none;endArrow=block;exitX=0.84;exitY=1;entryX=0.42;entryY=0;rounded=0;" target="nhGrFSaznw1m1d_mlfI_-14" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1247" y="431" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-40" edge="1" parent="1" source="nhGrFSaznw1m1d_mlfI_-14" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.5;entryX=0.41;entryY=1;rounded=0;" target="nhGrFSaznw1m1d_mlfI_-20" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1573" y="860" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-41" edge="1" parent="1" source="nhGrFSaznw1m1d_mlfI_-20" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.5;entryX=0.44;entryY=0;rounded=0;" target="nhGrFSaznw1m1d_mlfI_-15" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1843" y="446" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-42" edge="1" parent="1" source="nhGrFSaznw1m1d_mlfI_-15" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.5;entryX=0.46;entryY=1;rounded=0;" target="nhGrFSaznw1m1d_mlfI_-21" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="2089" y="860" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-43" edge="1" parent="1" source="nhGrFSaznw1m1d_mlfI_-21" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.9;entryX=0.45;entryY=0;rounded=0;" target="nhGrFSaznw1m1d_mlfI_-16" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="2257" y="409" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-44" edge="1" parent="1" source="nhGrFSaznw1m1d_mlfI_-16" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;rounded=0;" target="nhGrFSaznw1m1d_mlfI_-22" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="2499" y="860" />
+              <mxPoint x="2524" y="388" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-45" edge="1" parent="1" source="nhGrFSaznw1m1d_mlfI_-21" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.23;entryX=0.44;entryY=1;rounded=0;" target="nhGrFSaznw1m1d_mlfI_-23" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="2257" y="357" />
+              <mxPoint x="2549" y="357" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-46" edge="1" parent="1" source="nhGrFSaznw1m1d_mlfI_-23" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.5;entryX=0.14;entryY=0;rounded=0;" target="nhGrFSaznw1m1d_mlfI_-24" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="2805" y="82" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-47" edge="1" parent="1" source="nhGrFSaznw1m1d_mlfI_-24" style="curved=1;startArrow=none;endArrow=block;exitX=0.85;exitY=0;entryX=0;entryY=0.5;rounded=0;" target="nhGrFSaznw1m1d_mlfI_-25" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="3090" y="82" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-48" edge="1" parent="1" source="nhGrFSaznw1m1d_mlfI_-25" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;rounded=0;" target="nhGrFSaznw1m1d_mlfI_-26" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-49" edge="1" parent="1" source="nhGrFSaznw1m1d_mlfI_-24" style="curved=1;startArrow=none;endArrow=block;exitX=0.78;exitY=1;entryX=0;entryY=0.5;rounded=0;" target="nhGrFSaznw1m1d_mlfI_-27" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="3090" y="186" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="nhGrFSaznw1m1d_mlfI_-50" edge="1" parent="1" source="nhGrFSaznw1m1d_mlfI_-22" style="curved=1;startArrow=none;endArrow=block;exitX=1;exitY=0.5;entryX=0.29;entryY=1;rounded=0;" target="nhGrFSaznw1m1d_mlfI_-24" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="2780" y="388" />
+              <mxPoint x="2805" y="207" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
