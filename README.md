@@ -575,6 +575,11 @@ Windows 서비스 실행(`scripts/run_core.ps1`)은 기본값이 `-CollectorImpl
 - 텔레그램 결과는 시연 기본값으로 초간단 요약 모드(`STEER_TELEGRAM_SUPER_COMPACT=1`)를 사용합니다.
 - 출력 파일은 `scenario_results/demo_videos`에 저장됩니다.
 
+---
+### 🌐 To read more, visit our website!
+https://allvia-ai.github.io/allvia-ai.io/
+
+
 ## 📜 라이선스
 
 MIT License
